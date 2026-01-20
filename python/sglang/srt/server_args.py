@@ -589,6 +589,9 @@ class ServerArgs:
     enable_nsa_prefill_context_parallel: bool = False
     enable_fused_qk_norm_rope: bool = False
 
+    # Context parallel used in prefill phase of Ascend
+    prefill_context_parallel_size: int = 1
+
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
@@ -4264,6 +4267,13 @@ class ServerArgs:
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
         parser.add_argument(
+            "--prefill-context-parallel-size",
+            "--pcp-size",
+            type=int,
+            default=ServerArgs.prefill_context_parallel_size,
+            help="The prefill context parallelism size.",
+        )
+        parser.add_argument(
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
@@ -4541,6 +4551,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+        args.pcp_size = args.prefill_context_parallel_size
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
@@ -4591,9 +4602,14 @@ class ServerArgs:
 
     def check_server_args(self):
         # Check parallel size constraints
-        assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        if not is_npu:
+            assert (
+                       self.tp_size * self.pp_size
+                   ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        else:
+            assert (
+                       self.tp_size * self.pp_size * self.prefill_context_parallel_size
+                   ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.pp_size > 1:
             assert (
