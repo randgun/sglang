@@ -1,7 +1,7 @@
 # temp NSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import List
+from typing import Any, List
 
 import torch
 import torch.nn.functional as F
@@ -64,6 +64,9 @@ class ContextParallelMetadata:
     kv_with_q_head_mask_idx: torch.Tensor = None
     kv_with_q_tail_nomask_idx: torch.Tensor = None
     kv_with_q_tail_mask_idx: torch.Tensor = None
+    head_attn_nomask_seqlens: torch.Tensor = None
+    tail_attn_nomask_seqlens: torch.Tensor = None
+    attn_mask_seqlens: torch.Tensor = None
 
 
 def can_cp_split(cur_cp_seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
@@ -322,65 +325,60 @@ def prepare_input_dp_with_cp_dsa(
                 )
             )
         )
-    
-    # ------------------------------------------------------------------
-    # 2. 关键修改: 融合 vLLM-Ascend 的掩码逻辑
-    # ------------------------------------------------------------------
-    
+        
     # 计算全局偏移量 (Offset)，用于定位每个 Chunk 在 Global Sequence 中的位置
     # split_list 例如: [100, 100, 100, 100] -> prefix_offsets: [0, 100, 200, 300, 400]
     prefix_offsets = [0] + list(accumulate(split_list))
     
     # 确定当前 Rank 负责的两个 Chunk ID (Head 和 Tail)
-    # 逻辑: Rank 0 -> Head Chunk 0, Tail Chunk 7 (假设 cp_size=4, total chunks=8)
     head_chunk_id = cp_rank
-    tail_chunk_id = cp_segment_num - 1 - cp_rank # 等同于 2*cp_size - 1 - cp_rank
+    tail_chunk_id = cp_segment_num - 1 - cp_rank
 
     # --- A. Head Chunk 的掩码信息 ---
-    # Global Start/End for Head Chunk
     head_start_global = prefix_offsets[head_chunk_id]
     head_end_global = prefix_offsets[head_chunk_id + 1]
     
-    # 1. NoMask (全可见): 位于当前 Head Chunk 之前的所有 Token
-    # 对应 vllm: kv_with_q_head_nomask_idx
-    kv_with_q_head_nomask_idx = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
-    
-    # 2. Mask (因果遮罩): 当前 Head Chunk 自己 (需要看自己，且遵循因果律)
-    # 对应 vllm: kv_with_q_head_mask_idx
-    kv_with_q_head_mask_idx = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
-
     # --- B. Tail Chunk 的掩码信息 ---
-    # Global Start/End for Tail Chunk
     tail_start_global = prefix_offsets[tail_chunk_id]
     tail_end_global = prefix_offsets[tail_chunk_id + 1]
-
-    # 3. NoMask (全可见): 位于当前 Tail Chunk 之前的所有 Token (包含中间所有的 Head/Tail chunks)
-    # 对应 vllm: kv_with_q_tail_nomask_idx
-    kv_with_q_tail_nomask_idx = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
-
-    # 4. Mask (因果遮罩): 当前 Tail Chunk 自己
-    # 对应 vllm: kv_with_q_tail_mask_idx
-    kv_with_q_tail_mask_idx = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
-
+    
     # ------------------------------------------------------------------
-    # 3. 兼容原有逻辑的变量赋值
+    # 3. 构造核心 Mask 参数 (Ascend NPU FlashAttn/NSA 专用)
     # ------------------------------------------------------------------
     
-    # 原有的 kv_len_prev 实际上就是 Head Mask 的起始位置 (即 Head NoMask 的长度)
+    # [新增] NoMask Lengths (标量)
+    # 在这个 offset 之前的所有 KV 都是 fully visible 的
+    head_attn_nomask_seqlens = head_start_global
+    tail_attn_nomask_seqlens = tail_start_global
+    
     kv_len_prev = head_start_global
-    # 原有的 kv_len_next 实际上就是 Tail Mask 的起始位置 (即 Tail NoMask 的长度)
     kv_len_next = tail_start_global
-
+    
     actual_seq_q_prev = split_list[head_chunk_id]
     actual_seq_q_next = split_list[tail_chunk_id]
 
-    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device=device, dtype=torch.int32)
-    kv_len_next_tensor = torch.tensor(kv_len_next).to(device=device, dtype=torch.int32)
-    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(device=device, dtype=torch.int32)
-    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(device=device, dtype=torch.int32)
+    # [新增] Attn Mask Seqlens (Tensor)
+    # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用 通常 Ascend 算子需要 int32 类型的 Tensor
+    attn_mask_seqlens_list = [actual_seq_q_prev, actual_seq_q_next]
+    attn_mask_seqlens_tensor = torch.tensor(
+        attn_mask_seqlens_list, dtype=torch.int32, device=device
+    )
+    
+    # Head Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
+    kv_with_q_head_nomask_idx = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
+    kv_with_q_head_mask_idx = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
+
+    # Tail Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
+    kv_with_q_tail_nomask_idx = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
+    kv_with_q_tail_mask_idx = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
+
+    kv_len_prev_tensor = torch.tensor(kv_len_prev, device=device, dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next, device=device, dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, device=device, dtype=torch.int32)
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, device=device, dtype=torch.int32)
 
     # ------------------------------------------------------------------
-    # 4. 构造 Metadata 对象，包含新增的 Index Tensors
+    # 6. 构造 Metadata 对象
     # ------------------------------------------------------------------
     cp_metadata = ContextParallelMetadata(
         split_list=split_list,
@@ -398,10 +396,13 @@ def prepare_input_dp_with_cp_dsa(
         actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
-        # [新增] Ascend NPU Mask 所需的 Index Tensors
+        # new param with mask
         kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx,
         kv_with_q_head_mask_idx=kv_with_q_head_mask_idx,
         kv_with_q_tail_nomask_idx=kv_with_q_tail_nomask_idx,
         kv_with_q_tail_mask_idx=kv_with_q_tail_mask_idx,
+        head_attn_nomask_seqlens=head_attn_nomask_seqlens,
+        tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
+        attn_mask_seqlens=attn_mask_seqlens_tensor,
     )
     return cp_metadata
