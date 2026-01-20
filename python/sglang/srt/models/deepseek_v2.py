@@ -3321,11 +3321,16 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
+        elif self.enable_prefill_cp:
+            self.pcp_rank = get_pcp_rank()
+            self.pcp_size = get_pcp_size()
         else:
             self.cp_rank = self.cp_size = None
+            self.pcp_rank = self.pcp_size = None
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
@@ -3399,6 +3404,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                    device=input_ids.device,
+                )
+        elif self.enable_prefill_cp:
+            cur_cp_seq_len = len(input_ids) // (self.pcp_size * 2)
+            if can_cp_split(cur_cp_seq_len, self.pcp_size, True, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    torch.tensor(len(input_ids)),
+                    self.pcp_rank,
+                    self.pcp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    device=input_ids.device,
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):

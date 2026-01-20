@@ -40,6 +40,9 @@ def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
 def is_nsa_enable_prefill_cp():
     return get_global_server_args().enable_nsa_prefill_context_parallel
 
+def is_enable_prefill_cp():
+    return get_global_server_args().prefill_context_parallel_size > 1
+
 
 @dataclass
 class ContextParallelMetadata:
@@ -243,6 +246,7 @@ def prepare_input_dp_with_cp_dsa(
     cp_rank,
     cp_size,
     seqs_len,
+    device,
 ):
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4):
@@ -325,11 +329,11 @@ def prepare_input_dp_with_cp_dsa(
                 )
             )
         )
-        
+
     # 计算全局偏移量 (Offset)，用于定位每个 Chunk 在 Global Sequence 中的位置
     # split_list 例如: [100, 100, 100, 100] -> prefix_offsets: [0, 100, 200, 300, 400]
     prefix_offsets = [0] + list(accumulate(split_list))
-    
+
     # 确定当前 Rank 负责的两个 Chunk ID (Head 和 Tail)
     head_chunk_id = cp_rank
     tail_chunk_id = cp_segment_num - 1 - cp_rank
@@ -337,34 +341,33 @@ def prepare_input_dp_with_cp_dsa(
     # --- A. Head Chunk 的掩码信息 ---
     head_start_global = prefix_offsets[head_chunk_id]
     head_end_global = prefix_offsets[head_chunk_id + 1]
-    
+
     # --- B. Tail Chunk 的掩码信息 ---
     tail_start_global = prefix_offsets[tail_chunk_id]
     tail_end_global = prefix_offsets[tail_chunk_id + 1]
-    
+
     # ------------------------------------------------------------------
     # 3. 构造核心 Mask 参数 (Ascend NPU FlashAttn/NSA 专用)
     # ------------------------------------------------------------------
-    
+
     # [新增] NoMask Lengths (标量)
     # 在这个 offset 之前的所有 KV 都是 fully visible 的
     head_attn_nomask_seqlens = head_start_global
     tail_attn_nomask_seqlens = tail_start_global
-    
+
     kv_len_prev = head_start_global
     kv_len_next = tail_start_global
-    
+
     actual_seq_q_prev = split_list[head_chunk_id]
     actual_seq_q_next = split_list[tail_chunk_id]
 
     # [新增] Attn Mask Seqlens (Tensor)
     # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用 通常 Ascend 算子需要 int32 类型的 Tensor
-    device = "cuda"
     attn_mask_seqlens_list = [actual_seq_q_prev, actual_seq_q_next]
     attn_mask_seqlens_tensor = torch.tensor(
         attn_mask_seqlens_list, dtype=torch.int32, device=device
     )
-    
+
     # Head Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
     kv_with_q_head_nomask_idx = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
     kv_with_q_head_mask_idx = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
