@@ -322,6 +322,8 @@ def handle_attention_ascend(attn, forward_batch):
     ):
         if hasattr(attn, "indexer"):
             return AttnForwardMethod.DSA_NPU
+        elif attn.get("pcp_size", 1) > 1:
+            return AttnForwardMethod.MLA_NPU
         else:
             return AttnForwardMethod.MHA_NPU
     else:
