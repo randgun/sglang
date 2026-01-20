@@ -359,6 +359,7 @@ def prepare_input_dp_with_cp_dsa(
 
     # [新增] Attn Mask Seqlens (Tensor)
     # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用 通常 Ascend 算子需要 int32 类型的 Tensor
+    device = "cuda"
     attn_mask_seqlens_list = [actual_seq_q_prev, actual_seq_q_next]
     attn_mask_seqlens_tensor = torch.tensor(
         attn_mask_seqlens_list, dtype=torch.int32, device=device
