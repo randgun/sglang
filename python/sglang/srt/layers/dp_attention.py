@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+import torch.nn.functional as F
 
 from sglang.srt.distributed import (
     GroupCoordinator,
@@ -16,6 +17,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
+    get_pcp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -573,3 +575,39 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+### pcp
+def pcp_ag_rerange_output(input_tensor, pcp_size, forward_batch):
+    # step 1: padding tensor to same length
+    max_len = forward_batch.pcp_metadata.max_rank_len[0]
+    pad_size = max_len - input_tensor.shape[0]
+    if pad_size > 0:
+        input_tensor = F.pad(input_tensor, (0, 0, 0, pad_size), mode="constant", value=0)
+    
+    # step 2: all gather tensor
+    all_shuffled_tensor = torch.empty(
+        max_len * pcp_size,
+        input_tensor.shape[1],
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+
+    get_pcp_group().all_gather_into_tensor(
+        all_shuffled_tensor, input_tensor
+    )
+
+    # step 3: re-range tensor
+    splitted_tensor = list(
+        torch.split(all_shuffled_tensor, forward_batch.pcp_metadata.max_rank_len, dim=0)
+    )
+    outputs = torch.cat(
+        [
+            splitted_tensor[index][:per_rank_len]
+            for index, per_rank_len in enumerate(
+                forward_batch.pcp_metadata.per_rank_actual_token
+            )
+        ],
+        dim=0,
+    )
+    return outputs

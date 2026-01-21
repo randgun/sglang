@@ -80,6 +80,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    pcp_ag_rerange_output,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1844,12 +1845,20 @@ class DeepseekV2AttentionMLA(nn.Module):
         # support allgather+rerrange
         latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
         latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
-        latent_cache_output = cp_all_gather_rerange_output(
-            latent_cache.contiguous(),
-            self.cp_size,
-            forward_batch,
-            torch.cuda.current_stream(),
-        )
+        if self.nsa_enable_prefill_cp:
+            latent_cache_output = cp_all_gather_rerange_output(
+                latent_cache.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+        else:
+            latent_cache_output = pcp_ag_rerange_output(
+                latent_cache.contiguous(),
+                self.pcp_size,
+                forward_batch
+            )
+
         k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
         return k_nope, k_pe
@@ -3409,7 +3418,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         elif self.enable_prefill_cp:
             cur_cp_seq_len = len(input_ids) // (self.pcp_size * 2)
             if can_cp_split(cur_cp_seq_len, self.pcp_size, True, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                forward_batch.pcp_metadata = prepare_input_dp_with_cp_dsa(
                     torch.tensor(len(input_ids)),
                     self.pcp_rank,
                     self.pcp_size,

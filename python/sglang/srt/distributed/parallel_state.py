@@ -1432,6 +1432,7 @@ _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
 _ENABLE_PDMUX_P_TP: bool = False
 
+_PCP: Optional[GroupCoordinator] = None
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
@@ -1460,6 +1461,10 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
+
+def get_pcp_group() -> GroupCoordinator:
+    assert _PCP is not None, "prefill context parallel group is not initialized"
+    return _PCP
 
 
 # kept for backward compatibility
@@ -1590,6 +1595,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     torch_compile: Optional[bool] = None,
@@ -1730,6 +1736,17 @@ def initialize_model_parallel(
         backend,
         use_custom_allreduce=False,
         group_name="pp",
+    )
+
+    global _PCP
+    pcp_tp_size = tensor_model_parallel_size // context_parallel_size
+    group_ranks = [[range(i, get_world_size(), pcp_tp_size)] for i in range(pcp_tp_size)]
+    _PCP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_custom_allreduce=False,
+        group_name="pcp",
     )
 
 
