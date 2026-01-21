@@ -260,6 +260,7 @@ class TpModelWorker(BaseTpWorker):
             moe_ep_size=server_args.ep_size,
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
+            pcp_size=server_args.prefill_context_parallel_size,
             nccl_port=nccl_port,
             dp_rank=dp_rank,
             server_args=server_args,

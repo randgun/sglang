@@ -299,6 +299,7 @@ class ModelRunner:
         moe_ep_size: int,
         pp_rank: int,
         pp_size: int,
+        pcp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
@@ -318,6 +319,7 @@ class ModelRunner:
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.pcp_size = pcp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -1997,7 +1999,7 @@ class ModelRunner:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend" and not self.mambaish_config: 
+        if self.server_args.attention_backend == "ascend" and not self.mambaish_config:
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,

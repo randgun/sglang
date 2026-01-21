@@ -4551,7 +4551,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-        args.pcp_size = args.prefill_context_parallel_size
+        args.prefill_context_parallel_size = args.pcp_size
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
@@ -4604,12 +4604,19 @@ class ServerArgs:
         # Check parallel size constraints
         if not is_npu:
             assert (
-                       self.tp_size * self.pp_size
-                   ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+                self.tp_size * self.pp_size
+            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
         else:
+            if self.prefill_context_parallel_size > 1:
+                assert (
+                    self.disaggregation_mode != "decode"
+                ), "Context parallel is only supported for prefill when PD disaggregation."
+                assert (
+                    self.chunked_prefill_size is None or self.chunked_prefill_size == -1
+                ), "Context parallel is not compatible with chunk prefill."
             assert (
-                       self.tp_size * self.pp_size * self.prefill_context_parallel_size
-                   ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+                self.tp_size * self.pp_size * self.prefill_context_parallel_size
+            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.pp_size > 1:
             assert (
