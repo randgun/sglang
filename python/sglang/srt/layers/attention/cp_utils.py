@@ -1,0 +1,211 @@
+import torch
+from dataclasses import dataclass
+from itertools import accumulate
+from typing import Optional, List
+
+from sglang.srt.server_args import get_global_server_args
+
+import torch.distributed as dist
+
+# 新增：KV Gather 辅助函数
+def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: dist.ProcessGroup):
+    """
+    Args:
+        local_kv: [batch, num_kv_heads, local_seq_len, head_dim]
+    Returns:
+        global_kv: [batch, num_kv_heads, global_seq_len, head_dim]
+    """
+    if cp_group is None or cp_group.size() == 1:
+        return local_kv
+        
+    world_size = dist.get_world_size(group=cp_group)
+    # 假设所有 rank 长度一致 (需由 padding 保证，或处理变长 gather)
+    # 简单起见，这里假设 pad 到了整齐切分
+    output_list = [torch.empty_like(local_kv) for _ in range(world_size)]
+    dist.all_gather(output_list, local_kv, group=cp_group)
+    
+    # 注意：AllGather 出来的数据是按 Rank 序的 [Rank0_Chunk, Rank1_Chunk...]
+    # 但因为我们用了 Zigzag，这里的数据物理上已经是乱序的了。
+    # 对于 Attention 来说，K/V 的顺序不影响结果，只要 Position ID 对得上即可！
+    # 所以直接 cat 起来给 FlashAttention 即可。
+    return torch.cat(output_list, dim=0) # 假设 dim 2 是 seq_len
+
+
+
+@dataclass
+class ContextParallelMetadata:
+    split_list: Optional[List[int]] = None
+    max_rank_len: Optional[List[int]] = None
+    zigzag_index: Optional[List[int]] = None
+    per_rank_actual_token: Optional[List[int]] = None
+    reverse_split_len: Optional[List[int]] = None
+    cp_reverse_index: Optional[List[int]] = None
+    kv_len_prev: int = -1
+    kv_len_next: int = -1
+    actual_seq_q_prev: int = -1
+    actual_seq_q_next: int = -1
+    q_head_num: Optional[int] = None  # Query头数
+    kv_head_num: Optional[int] = None  # Key/Value头数
+    head_dim: Optional[int] = None  # 头维度
+    kv_len_prev_tensor: Optional[torch.Tensor] = None
+    kv_len_next_tensor: Optional[torch.Tensor] = None
+    actual_seq_q_prev_tensor: Optional[torch.Tensor] = None
+    actual_seq_q_next_tensor: Optional[torch.Tensor] = None
+    total_seq_lens: Optional[int] = None
+    kv_with_q_head_nomask_idx: Optional[torch.Tensor] = None
+    kv_with_q_head_mask_idx: Optional[torch.Tensor] = None
+    kv_with_q_tail_nomask_idx: Optional[torch.Tensor] = None
+    kv_with_q_tail_mask_idx: Optional[torch.Tensor] = None
+    head_attn_nomask_seqlens: Optional[torch.Tensor] = None
+    tail_attn_nomask_seqlens: Optional[torch.Tensor] = None
+    attn_mask_seqlens: Optional[torch.Tensor] = None
+
+
+def prepare_qwen_cp_metadata(
+    seq_len: int,
+    cp_rank: int,
+    cp_size: int,
+    num_heads: int,
+    head_dim: int,
+):
+    """Prepare context parallelism metadata for QWEN models using zigzag strategy.
+
+    This function implements the zigzag segmentation strategy to balance
+    computational load across CP ranks during prefill phase.
+
+    Args:
+        seq_len: Total sequence length for the request
+        cp_rank: Current context parallel rank
+        cp_size: Total number of CP ranks
+        num_heads: Number of attention heads
+        head_dim: Dimension of each attention head
+
+    Returns:
+        ContextParallelMetadata: Metadata for CP coordination
+    """
+    if cp_size <= 1:
+        return None
+
+    bs_per_cp_group = 1
+    seq_len_origin = seq_len
+
+    cp_segment_num = cp_size * 2
+    seq_per_batch = seq_len // cp_segment_num
+    split_list = seq_per_batch.repeat_interleave(cp_segment_num).int().tolist()
+
+    remainder = seq_len % cp_segment_num
+    if remainder > 0:
+        split_list[:remainder] = [x + 1 for x in split_list[:remainder]]
+
+    seq_max_rank_len = (seq_len + cp_size - 1) // cp_size
+    max_rank_len = seq_max_rank_len.repeat_interleave(cp_size).int().tolist()
+
+    zigzag_index = list(
+        range(cp_rank, cp_rank + bs_per_cp_group * cp_segment_num, cp_segment_num)
+    ) + list(
+        range(
+            cp_segment_num - cp_rank - 1,
+            bs_per_cp_group * cp_segment_num,
+            cp_segment_num,
+        )
+    )
+
+    per_rank_actual_token = list(
+        split_list[i] + split_list[cp_size * 2 - i - 1] for i in range(cp_size)
+    )
+
+    reverse_split_len = [
+        element
+        for i in range(cp_size)
+        for element in (split_list[i], split_list[cp_size * 2 - i - 1])
+    ]
+
+    cp_reverse_index = []
+    for batch_id in range(bs_per_cp_group):
+        cp_reverse_index.extend(
+            list(range(batch_id, cp_segment_num * bs_per_cp_group, 2 * bs_per_cp_group))
+            + list(
+                range(
+                    (cp_segment_num - 1) * bs_per_cp_group + batch_id,
+                    0,
+                    -2 * bs_per_cp_group,
+                )
+            )
+        )
+
+    prefix_sum_list = list(accumulate(split_list))
+
+    kv_len_prev = prefix_sum_list[cp_rank]
+    kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
+    actual_seq_q_prev = split_list[cp_rank]
+    actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
+
+    kv_len_prev_tensor = torch.tensor(kv_len_prev, device="cuda", dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next, device="cuda", dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, device="cuda", dtype=torch.int32)
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, device="cuda", dtype=torch.int32)
+
+    metadata = ContextParallelMetadata(
+        split_list=split_list,
+        max_rank_len=max_rank_len,
+        zigzag_index=zigzag_index,
+        per_rank_actual_token=per_rank_actual_token,
+        reverse_split_len=reverse_split_len,
+        cp_reverse_index=cp_reverse_index,
+        kv_len_prev=kv_len_prev,
+        kv_len_next=kv_len_next,
+        actual_seq_q_prev=actual_seq_q_prev,
+        actual_seq_q_next=actual_seq_q_next,
+        kv_len_prev_tensor=kv_len_prev_tensor,
+        kv_len_next_tensor=kv_len_next_tensor,
+        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
+        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
+        total_seq_lens=seq_len_origin,
+        q_head_num=num_heads,
+        head_dim=head_dim,
+    )
+
+    return metadata
+
+
+def cp_split_tensor_by_zigzag(
+    tensor: torch.Tensor,
+    split_list: List[int],
+    zigzag_index: List[int],
+):
+    """Split tensor according to CP zigzag strategy.
+
+    Args:
+        tensor: Input tensor to split
+        split_list: List of split sizes
+        zigzag_index: Zigzag reordering index
+
+    Returns:
+        torch.Tensor: Split tensor for current CP rank
+    """
+    tensor_list = list(torch.split(tensor, split_list, dim=0))
+    selected = [tensor_list[i] for i in zigzag_index]
+    return torch.cat(selected, dim=0)
+
+def cp_rebuild_tensor_by_zigzag(
+    tensor: torch.Tensor,
+    reverse_split_len: List[int],
+    cp_reverse_index: List[int],
+):
+    """Rebuild tensor from CP output back to original order.
+
+    Args:
+        tensor: Output tensor from CP computation
+        reverse_split_len: List of split sizes in reverse order
+        cp_reverse_index: Reverse index for reordering
+
+    Returns:
+        torch.Tensor: Rebuilt tensor in original token order
+    """
+    tensor_list = list(torch.split(tensor, reverse_split_len, dim=0))
+    reordered = [tensor_list[i] for i in cp_reverse_index]
+    return torch.cat(reordered, dim=0)
+
+def is_enable_prefill_cp():
+    return get_global_server_args().prefill_context_parallel_size > 1
+

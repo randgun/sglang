@@ -26,6 +26,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_pcp_group,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -36,6 +37,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.attention.cp_utils import cp_all_gather_kv, is_enable_prefill_cp, prepare_qwen_cp_metadata
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -639,19 +641,31 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states
 
         q, k, v, fb = inner_state
-
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            fb,
-            save_kv_cache=save_kv_cache,
-        )
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            cp_group = get_pcp_group()
+            pcp_size = cp_group.size()
+            # Split q by length dimension according to pcp_size
+            q = torch.chunk(q, pcp_size, dim=0)[cp_group.rank()]
+            k = cp_all_gather_kv(k, cp_group)
+            v = cp_all_gather_kv(v, cp_group)
+            attn_output = self.attn(q, k, v, fb, save_kv_cache=save_kv_cache)
+        else:
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                fb,
+                save_kv_cache=save_kv_cache,
+            )
         output, _ = self.o_proj(attn_output)
         return output
 
