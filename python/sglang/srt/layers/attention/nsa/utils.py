@@ -1,5 +1,4 @@
 # temp NSA debugging environ
-from dataclasses import dataclass
 from itertools import accumulate
 from typing import TYPE_CHECKING, List, Tuple, Union
 
@@ -8,6 +7,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.cp_utils import ContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather_into_tensor,
@@ -119,26 +119,6 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
             ]
         )
     return nsa_cache_seqlens
-
-
-@dataclass
-class NSAContextParallelMetadata:
-
-    split_list: List[int] = None
-    max_rank_len: List[int] = None
-    zigzag_index: List[int] = None
-    per_rank_actual_token: List[int] = None
-    reverse_split_len: List[int] = None
-    cp_reverse_index: List[int] = None
-    kv_len_prev: int = -1
-    kv_len_next: int = -1
-    actual_seq_q_prev: int = -1
-    actual_seq_q_next: int = -1
-    kv_len_prev_tensor: torch.Tensor = None
-    kv_len_next_tensor: torch.Tensor = None
-    actual_seq_q_prev_tensor: torch.Tensor = None
-    actual_seq_q_next_tensor: torch.Tensor = None
-    total_seq_lens: torch.Tensor = None
 
 
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
@@ -521,24 +501,59 @@ def prepare_input_dp_with_cp_dsa(
                 )
             )
         )
-    prefix_sum_list = list(accumulate(split_list))
 
-    # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
-    # cp_seq_index = calculate_cp_seq_idx(split_list[:], seqs_len[:])
-    kv_len_prev = prefix_sum_list[cp_rank]
-    kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
-    actual_seq_q_prev = split_list[cp_rank]
-    actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
-    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device="cuda", dtype=torch.int32)
-    kv_len_next_tensor = torch.tensor(kv_len_next).to(device="cuda", dtype=torch.int32)
-    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(
-        device="cuda", dtype=torch.int32
-    )
-    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
-        device="cuda", dtype=torch.int32
-    )
+    prefix_offsets = [0] + list(accumulate(split_list))
 
-    nsa_cp_metadata = NSAContextParallelMetadata(
+    head_chunk_id = cp_rank
+
+    tail_chunk_id = cp_segment_num - 1 - cp_rank
+
+    head_start_global = prefix_offsets[head_chunk_id]
+    head_end_global = prefix_offsets[head_chunk_id + 1]
+    tail_start_global = prefix_offsets[tail_chunk_id]
+    tail_end_global = prefix_offsets[tail_chunk_id + 1]
+    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32)
+    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32)
+    kv_len_prev = head_start_global
+    kv_len_next = tail_start_global
+    actual_seq_q_prev = split_list[head_chunk_id]
+    actual_seq_q_next = split_list[tail_chunk_id]
+    # [新增] Attn Mask Seqlens (Tensor)
+    # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用 通常 Ascend 算子需要 int32 类型的 Tensor
+    attn_mask_seqlens_tensor = torch.tensor(
+        [[actual_seq_q_prev], [actual_seq_q_next]], dtype=torch.int32
+    )
+    kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx = [], []
+    kv_with_q_tail_nomask_idx, kv_with_q_tail_mask_idx = [], []
+    kv_with_q_head_nomask_idx.extend(
+        list(range(0, head_start_global))
+    )
+    kv_with_q_head_mask_idx.extend(
+        list(range(head_start_global, head_end_global))
+    )
+    kv_with_q_tail_nomask_idx.extend(
+        list(range(0, tail_start_global))
+    )
+    kv_with_q_tail_mask_idx.extend(
+        list(range(tail_start_global, tail_end_global))
+
+    )
+    kv_with_q_head_nomask_idx_tensor = torch.tensor(kv_with_q_head_nomask_idx, dtype=torch.int32)
+    kv_with_q_head_mask_idx_tensor = torch.tensor(kv_with_q_head_mask_idx, dtype=torch.int32)
+    kv_with_q_tail_nomask_idx_tensor = torch.tensor(kv_with_q_tail_nomask_idx, dtype=torch.int32)
+    kv_with_q_tail_mask_idx_tensor = torch.tensor(kv_with_q_tail_mask_idx, dtype=torch.int32)
+    # Head Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
+    # kv_with_q_head_nomask_idx = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
+    # kv_with_q_head_mask_idx = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
+    # Tail Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
+    # kv_with_q_tail_nomask_idx = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
+    # kv_with_q_tail_mask_idx = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
+    kv_len_prev_tensor = torch.tensor(kv_len_prev,  dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next,  dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, dtype=torch.int32)
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, dtype=torch.int32)
+
+    cp_metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
         zigzag_index=zigzag_index,
@@ -554,5 +569,13 @@ def prepare_input_dp_with_cp_dsa(
         actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
+        # new param with mask
+        kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx_tensor,
+        kv_with_q_head_mask_idx=kv_with_q_head_mask_idx_tensor,
+        kv_with_q_tail_nomask_idx=kv_with_q_tail_nomask_idx_tensor,
+        kv_with_q_tail_mask_idx=kv_with_q_tail_mask_idx_tensor,
+        head_attn_nomask_seqlens=head_attn_nomask_seqlens,
+        tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
+        attn_mask_seqlens=attn_mask_seqlens_tensor,
     )
-    return nsa_cp_metadata
+    return cp_metadata
