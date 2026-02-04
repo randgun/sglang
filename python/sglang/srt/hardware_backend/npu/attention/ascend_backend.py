@@ -795,6 +795,63 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_output, attn_lse
 
+    def forward_gqa_pcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        metadata = forward_batch.gqa_cp_metadata
+        if metadata is None:
+            raise ValueError("GQA PCP metadata is required for forward_gqa_pcp.")
+
+        q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+        head_len = metadata.actual_seq_q_prev
+        tail_len = metadata.actual_seq_q_next
+        head_start = metadata.kv_len_prev
+        tail_start = metadata.kv_len_next
+        kv_len = k.shape[0]
+
+        attn_output = torch.empty(
+            (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
+            device=q.device,
+            dtype=q.dtype,
+        )
+
+        q_head, q_tail = torch.split(q, [head_len, tail_len], dim=0)
+        output_offset = 0
+        for segment_q, segment_len, segment_start in (
+            (q_head, head_len, head_start),
+            (q_tail, tail_len, tail_start),
+        ):
+            if segment_len == 0:
+                continue
+            segment_mask = self.fia_mask[
+                segment_start : segment_start + segment_len, :kv_len
+            ].unsqueeze(0)
+            attn_output[output_offset : output_offset + segment_len] = (
+                torch.ops.npu.npu_fused_infer_attention_score(
+                    segment_q[None],
+                    k[None],
+                    v[None],
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                    atten_mask=segment_mask,
+                    sparse_mode=3 if segment_len != 1 else 0,
+                    scale=layer.scaling,
+                    next_tokens=0,
+                )[0]
+            )
+            output_offset += segment_len
+
+        return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_mla_pcp(
         self,
         q_nope,
@@ -969,33 +1026,37 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""
-                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                attn_output = torch.empty(
-                    (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                    device=q.device,
-                    dtype=q.dtype,
-                )
-                q_len_offset = 0
-                for q_len in forward_batch.extend_seq_lens_cpu:
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
-                            q[None, q_len_offset : q_len_offset + q_len],
-                            k[None, q_len_offset : q_len_offset + q_len],
-                            v[None, q_len_offset : q_len_offset + q_len],
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
-                            scale=layer.scaling,
-                            next_tokens=0,
-                        )[0]
+                if enable_prefill_cp(
+                    forward_batch, self.is_prefill_cp_enable
+                ) and forward_batch.gqa_cp_metadata is not None:
+                    attn_output = self.forward_gqa_pcp(q, k, v, layer, forward_batch)
+                else:
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    attn_output = torch.empty(
+                        (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
+                        device=q.device,
+                        dtype=q.dtype,
                     )
-                    q_len_offset += q_len
-                attn_output = attn_output.view(
-                    -1, layer.tp_q_head_num * layer.v_head_dim
-                )
-
+                    q_len_offset = 0
+                    for q_len in forward_batch.extend_seq_lens_cpu:
+                        attn_output[q_len_offset : q_len_offset + q_len] = (
+                            torch.ops.npu.npu_fused_infer_attention_score(
+                                q[None, q_len_offset : q_len_offset + q_len],
+                                k[None, q_len_offset : q_len_offset + q_len],
+                                v[None, q_len_offset : q_len_offset + q_len],
+                                num_heads=layer.tp_q_head_num,
+                                num_key_value_heads=layer.tp_k_head_num,
+                                input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                                atten_mask=self.fia_mask.unsqueeze(0),
+                                sparse_mode=3 if q_len != 1 else 0,
+                                scale=layer.scaling,
+                                next_tokens=0,
+                            )[0]
+                        )
+                        q_len_offset += q_len
+                    attn_output = attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
             else:
                 causal = True
                 if (
@@ -1178,6 +1239,7 @@ class AscendAttnBackend(AttentionBackend):
                     ],
                     dim=0,
                 )
+        # for mla pcp
         elif enable_prefill_cp(forward_batch,self.is_prefill_cp_enable):
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)

@@ -145,6 +145,55 @@ def prepare_qwen_cp_metadata(
     actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, device="cuda", dtype=torch.int32)
     actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, device="cuda", dtype=torch.int32)
 
+    # ========== Mask 计算相关元数据 ==========
+    # 计算 prefix offsets 用于定位每个 chunk 的全局起始位置
+    prefix_offsets = [0] + prefix_sum_list
+
+    # 当前 rank 对应的 head chunk 和 tail chunk 的索引
+    head_chunk_id = cp_rank
+    tail_chunk_id = cp_segment_num - 1 - cp_rank
+
+    # Head chunk 的全局起始和结束位置
+    head_start_global = prefix_offsets[head_chunk_id]
+    head_end_global = prefix_offsets[head_chunk_id + 1]
+    # Tail chunk 的全局起始和结束位置
+    tail_start_global = prefix_offsets[tail_chunk_id]
+    tail_end_global = prefix_offsets[tail_chunk_id + 1]
+
+    # Attention mask 的序列长度信息 [seq_per_batch, start_global]
+    head_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [head_start_global]], dtype=torch.int32, device="cuda"
+    )
+    tail_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [tail_start_global]], dtype=torch.int32, device="cuda"
+    )
+
+    # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用
+    attn_mask_seqlens_tensor = torch.tensor(
+        [[actual_seq_q_prev], [actual_seq_q_next]], dtype=torch.int32, device="cuda"
+    )
+
+    # KV 与 Q 的 mask 索引计算
+    # Head Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
+    kv_with_q_head_nomask_idx = list(range(0, head_start_global))
+    kv_with_q_head_mask_idx = list(range(head_start_global, head_end_global))
+    # Tail Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
+    kv_with_q_tail_nomask_idx = list(range(0, tail_start_global))
+    kv_with_q_tail_mask_idx = list(range(tail_start_global, tail_end_global))
+
+    kv_with_q_head_nomask_idx_tensor = torch.tensor(
+        kv_with_q_head_nomask_idx, dtype=torch.int32, device="cuda"
+    ) if kv_with_q_head_nomask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+    kv_with_q_head_mask_idx_tensor = torch.tensor(
+        kv_with_q_head_mask_idx, dtype=torch.int32, device="cuda"
+    ) if kv_with_q_head_mask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+    kv_with_q_tail_nomask_idx_tensor = torch.tensor(
+        kv_with_q_tail_nomask_idx, dtype=torch.int32, device="cuda"
+    ) if kv_with_q_tail_nomask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+    kv_with_q_tail_mask_idx_tensor = torch.tensor(
+        kv_with_q_tail_mask_idx, dtype=torch.int32, device="cuda"
+    ) if kv_with_q_tail_mask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+
     metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
@@ -163,6 +212,14 @@ def prepare_qwen_cp_metadata(
         total_seq_lens=seq_len_origin,
         q_head_num=num_heads,
         head_dim=head_dim,
+        # Mask 相关元数据
+        kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx_tensor,
+        kv_with_q_head_mask_idx=kv_with_q_head_mask_idx_tensor,
+        kv_with_q_tail_nomask_idx=kv_with_q_tail_nomask_idx_tensor,
+        kv_with_q_tail_mask_idx=kv_with_q_tail_mask_idx_tensor,
+        head_attn_nomask_seqlens=head_attn_nomask_seqlens,
+        tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
+        attn_mask_seqlens=attn_mask_seqlens_tensor,
     )
 
     return metadata
