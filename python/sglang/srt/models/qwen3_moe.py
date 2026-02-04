@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -898,6 +899,7 @@ class Qwen3MoeForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
+        self.pcp_group = get_pcp_group()
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3MoeModel(
@@ -915,6 +917,24 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def ring_attn_all_gather(
+        self,
+        input: torch.Tensor, 
+        async_op: bool=False
+    ):
+        if self.pcp_group is None or self.pcp_group.world_size == 1:
+            return input
+
+        process_group = self.pcp_group.device_group
+        world_size = torch.distributed.get_world_size(process_group)
+        output = torch.empty(
+            world_size * input.shape[0], *input.shape[1:], dtype=input.dtype, device=input.device
+        )
+        torch.distributed.all_gather_into_tensor(
+            output, input.contiguous(), group=process_group, async_op=async_op
+        )
+        return output
 
     @torch.no_grad()
     def forward(
@@ -937,7 +957,17 @@ class Qwen3MoeForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
+        hidden_states_all = None
+        if self.pcp_group is not None and self.pcp_group.world_size > 1 \
+                and self.pcp_group.is_first_rank:
+            hidden_states_all = self.ring_attn_all_gather(hidden_states)
+
         if self.pp_group.is_last_rank:
+            if self.pcp_group is not None and self.pcp_group.world_size > 1 \
+                    and self.pcp_group.is_first_rank:
+                input_ids = forward_batch.input_ids
+                hidden_states = hidden_states_all[:input_ids.shape[0]]
+
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )

@@ -22,6 +22,7 @@ import os
 import socket
 import threading
 import time
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
@@ -2158,6 +2159,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def ring_attn_data_slice(
+        self,
+        input_ids: torch.Tensor, 
+        positions: torch.Tensor, 
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        根据RingAttention的配置, 对模型输入数据按照rank进行切分
+ 
+        Args:
+            - input_ids: 输入数据的编码信息
+            - positions: 输入数据的位置信息
+ 
+        Returns:
+            - input_ids_slice: 编码信息的切片
+            - positions_slice: 位置信息的切片
+        """
+        input_lens = len(input_ids)
+        local_input_lens = math.ceil(input_lens / self.pcp_size)
+        start, end = self.pcp_rank * local_input_lens, (self.pcp_rank + 1) * local_input_lens
+        input_ids_slice = input_ids[start:end]
+        positions_slice = positions[start:end]
+        return input_ids_slice, positions_slice
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -2211,15 +2235,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        return (
-            self.model.forward(
+        if self.pcp_size > 1:
+            input_ids_slice, positions_slice = self.ring_attn_data_slice(
                 forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            ),
-            can_run_graph,
-        )
+                forward_batch.positions
+            )
+            return (
+                self.model.forward(
+                    input_ids_slice,
+                    positions_slice,
+                    forward_batch,
+                    **kwargs,
+                ),
+                can_run_graph,
+            )
+        else:
+            return (
+                self.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                ),
+                can_run_graph,
+            )
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
