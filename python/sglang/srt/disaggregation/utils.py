@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import numpy as np
 import torch
@@ -28,6 +29,82 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+#########################
+# CP Transfer Metadata
+#########################
+
+@dataclasses.dataclass
+class CPMetadata:
+    split_list: List[int]  # 每个Block的token数量(对齐到page_size的整数倍), eg. [128, 128, 128, 128, 128, 128, 128, 128]
+    zigzag_index: List[int]  # 重新排列Block以平衡各rank计算负载的索引映射
+    cp_reverse_index: List[int] # 将 zigzag 重排后的数据恢复到原始顺序的索引映射，eg. [0, 2, 4, 6, 7, 5, 3, 1]
+    cp_size: int  # CP并行数, eg. 4
+    aligned_seq_len: int  # 序列对齐到page_size*cp_size*2的长度, eg. 128 * 8 = 1024
+    actual_seq_len: int  # 实际序列长度
+
+
+def calculate_cp_metadata(
+    actual_seq_len: int,
+    cp_size: int,
+    cp_rank: int,
+    page_size: int,
+) -> CPMetadata:
+    """
+    Calculate CP metadata for a single request.
+    """
+    # Calculate alignment unit and aligned sequence length
+    alignment_unit = page_size * cp_size * 2
+    aligned_seq_len = ((actual_seq_len + alignment_unit - 1) // alignment_unit) * alignment_unit
+
+    # Calculate split_list
+    cp_block_num = cp_size * 2
+    seq_len_per_block = aligned_seq_len // cp_block_num
+    split_list = [seq_len_per_block] * cp_block_num
+
+    # Calculate zigzag_index
+    bs_per_cp_group = 1  # Currently only support batch=1
+    zigzag_index = list(
+        range(
+            cp_rank,
+            cp_rank + bs_per_cp_group * cp_block_num,
+            cp_block_num,
+        )
+    ) + list(
+        range(
+            cp_block_num - cp_rank - 1,
+            bs_per_cp_group * cp_block_num,
+            cp_block_num,
+        )
+    )
+
+    # Calculate cp_reverse_index
+    cp_reverse_index = []
+    for batch_id in range(bs_per_cp_group):
+        cp_reverse_index.extend(
+            list(
+                range(
+                    batch_id,
+                    cp_block_num * bs_per_cp_group,
+                    2 * bs_per_cp_group,
+                )
+            )
+            + list(
+                range(
+                    (cp_block_num - 1) * bs_per_cp_group + batch_id,
+                    0,
+                    -2 * bs_per_cp_group,
+                )
+            )
+        )
+
+    return CPMetadata(
+        split_list=split_list,
+        zigzag_index=zigzag_index,
+        cp_reverse_index=cp_reverse_index,
+        cp_size=cp_size,
+        aligned_seq_len=aligned_seq_len,
+        actual_seq_len=actual_seq_len,
+    )
 
 #########################
 # Synchronization

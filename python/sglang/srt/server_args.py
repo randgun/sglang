@@ -4650,6 +4650,13 @@ class ServerArgs:
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
         parser.add_argument(
+            "--prefill-context-parallel-size",
+            "--pcp-size",
+            type=int,
+            default=ServerArgs.prefill_context_parallel_size,
+            help="The prefill context parallelism size.",
+        )
+        parser.add_argument(
             "--nsa-prefill-cp-mode",
             type=str,
             default=ServerArgs.nsa_prefill_cp_mode,

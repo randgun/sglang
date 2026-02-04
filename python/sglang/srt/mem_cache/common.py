@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.distributed.parallel_state import get_context_parallel_world_size
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -87,8 +88,12 @@ def write_cache_indices(
     extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
+    reqs: list["Req"] | None = None,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    # Check if CP is enabled
+    enable_cp = get_context_parallel_world_size() > 1
+
+    if support_triton(get_global_server_args().attention_backend) and not enable_cp:
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -117,10 +122,47 @@ def write_cache_indices(
                 (req_idx, slice(0, prefix_len)),
                 prefix_tensors[i],
             )
-            req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
-            )
+
+            if enable_cp:
+                if reqs is None:
+                    raise ValueError("reqs must be provided when CP mode is enabled")
+                cp_metadata = reqs[i].cp_metadata
+                actual_seq_len = cp_metadata.actual_seq_len
+                out_offset = pt
+
+                for block_idx in cp_metadata.zigzag_index:
+                    block_size = cp_metadata.split_list[block_idx]
+
+                    # Calculate token range of block_idx
+                    block_token_start = 0
+                    for j in range(block_idx):
+                        block_token_start += cp_metadata.split_list[j]
+                    block_token_end = block_token_start + block_size
+
+                    # Skip if block exceeds actual sequence length
+                    if block_token_start >= actual_seq_len:
+                        break
+
+                    # Calculate write range
+                    extend_block_start = block_token_start
+                    extend_block_end = min(block_token_end, actual_seq_len)
+
+                    # Calculate number of KV indices to write
+                    write_size = extend_block_end - extend_block_start
+
+                    # Write to req_to_token_pool
+                    req_to_token_pool.write(
+                        (req_idx, slice(extend_block_start, extend_block_end)),
+                        out_cache_loc[out_offset : out_offset + write_size],
+                    )
+
+                    out_offset += write_size
+            else:
+                req_to_token_pool.write(
+                    (req_idx, slice(prefix_len, seq_len)),
+                    out_cache_loc[pt : pt + extend_len],
+                )
+
             pt += extend_len
 
 
@@ -363,12 +405,21 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
+        
+        enable_cp = any(req.cp_metadata is not None for req in batch.reqs)
+        if enable_cp:
+            seq_lens_cpu_for_alloc = prefix_lens_cpu + extend_lens_cpu
+            seq_lens_for_alloc = seq_lens_cpu_for_alloc.to(batch.device, non_blocking=True)
+        else:
+            seq_lens_for_alloc = batch.seq_lens
+            seq_lens_cpu_for_alloc = batch.seq_lens_cpu
+        
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens=seq_lens_for_alloc,
+            seq_lens_cpu=seq_lens_cpu_for_alloc,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
@@ -386,6 +437,7 @@ def alloc_for_extend(
         extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
+        batch.reqs,
     )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices

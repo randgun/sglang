@@ -31,7 +31,7 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, CPMetadata
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
@@ -58,6 +58,8 @@ class TransferKVChunk:
     is_last: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
+    cp_rank: Optional[int] = None
+    cp_metadata: Optional[CPMetadata] = None
 
 
 # decode
@@ -380,6 +382,56 @@ class MooncakeKVManager(CommonKVManager):
 
         return 0
 
+    def _map_cp_page_indices(
+        self,
+        prefill_page_indices: npt.NDArray[np.int32],
+        cp_metadata: CPMetadata,
+        page_size: int,
+    ) -> npt.NDArray[np.int32]:
+        """
+        Map Prefill page indices to Decode page indices in CP mode.
+        
+        Example:
+        - actual_seq_len = 12345, page_size = 32, cp_size = 4
+        - split_list = [1568, 1568, 1568, 1568, 1568, 1568, 1568, 1568]
+        - pages_per_block = 49 (1568 // 32), CP_Rank 0: zigzag_index = [0, 7]
+        - Prefill stores blocks in zigzag order: [block 0 (pages 0-48), block 7 (pages 49-97)]
+        - Prefill page 0 -> zigzag block 0 -> original block 0 -> Decode page 0
+        - Prefill page 49 -> zigzag block 1 -> original block 7 -> Decode page 343
+        - For prefill_page_idx = 49:
+          * block_idx_zigzag = 49 // 49 = 1
+          * original_block_idx = zigzag_index[1] = 7
+          * page_offset_in_block = 49 % 49 = 0
+          * block_token_start = sum(split_list[0..6]) = 1568 * 7 = 10976
+          * page_token_start = 10976 + 0 * 32 = 10976
+          * decode_page_idx = 10976 // 32 = 343
+        """
+        pages_per_block = cp_metadata.split_list[0] // page_size
+        
+        decode_page_indices = []
+        for prefill_page_idx in prefill_page_indices:
+            # Get block position in zigzag_index
+            block_idx_zigzag = prefill_page_idx // pages_per_block
+            
+            # Get the original block index
+            original_block_idx = cp_metadata.zigzag_index[block_idx_zigzag]
+            
+            # Calculate page offset within the block
+            page_offset_in_block = prefill_page_idx % pages_per_block
+            
+            # Calculate block start token position in original request
+            block_token_start = sum(cp_metadata.split_list[j] 
+                                   for j in range(original_block_idx))
+            
+            # Calculate page start token position in original request
+            page_token_start = block_token_start + page_offset_in_block * page_size
+            
+            # Calculate Decode page index
+            decode_page_idx = page_token_start // page_size
+            decode_page_indices.append(decode_page_idx)
+        
+        return np.array(decode_page_indices, dtype=np.int32)
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -401,9 +453,9 @@ class MooncakeKVManager(CommonKVManager):
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
+        prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
+        dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
@@ -870,6 +922,15 @@ class MooncakeKVManager(CommonKVManager):
                                 : len(chunked_dst_kv_indice)
                             ]
 
+                        if kv_chunk.cp_metadata is not None:
+                            mapped_dst_kv_indices = self._map_cp_page_indices(
+                                kv_chunk.prefill_kv_indices,
+                                kv_chunk.cp_metadata,
+                                self.kv_args.page_size,
+                            )
+                        else:
+                            mapped_dst_kv_indices = chunked_dst_kv_indice
+
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
@@ -881,15 +942,16 @@ class MooncakeKVManager(CommonKVManager):
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
+                                mapped_dst_kv_indices,
                                 executor,
+                                cp_metadata=kv_chunk.cp_metadata,
                             )
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
+                                mapped_dst_kv_indices,
                                 target_rank_registration_info.dst_tp_rank,
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
@@ -1098,6 +1160,8 @@ class MooncakeKVManager(CommonKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        cp_rank: Optional[int] = None,
+        cp_metadata: Optional[CPMetadata] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -1132,6 +1196,8 @@ class MooncakeKVManager(CommonKVManager):
                 is_last=is_last,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
             )
         )
 
@@ -1213,6 +1279,8 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        cp_rank: Optional[int] = None,
+        cp_metadata: Optional["CPMetadata"] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -1224,6 +1292,8 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1233,6 +1303,8 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
             )
 
     def poll(self) -> KVPoll:

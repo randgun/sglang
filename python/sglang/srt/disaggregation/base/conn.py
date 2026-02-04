@@ -9,7 +9,8 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.utils import CPMetadata, DisaggregationMode
+
 
 
 class KVArgs:
@@ -86,6 +87,8 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        cp_rank: Optional[int] = None,
+        cp_metadata: Optional["CPMetadata"] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.

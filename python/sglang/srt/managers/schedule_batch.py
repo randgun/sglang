@@ -56,10 +56,23 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.disaggregation.utils import (
+    CPMetadata,
+    DisaggregationMode,
+    calculate_cp_metadata,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
+    get_tensor_model_parallel_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
@@ -807,6 +820,9 @@ class Req:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        
+        # For CP mode KV transfer
+        self.cp_metadata: Optional["CPMetadata"] = None
 
     @property
     def seqlen(self) -> int:
@@ -1511,11 +1527,75 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Init tensors
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+
+        # Check if CP mode is enabled
+        enable_cp = is_enable_prefill_cp()
+        if enable_cp:
+            server_args = get_global_server_args()
+            if not server_args.disable_radix_cache:
+                raise ValueError(
+                    "CP mode requires radix cache to be disabled. "
+                    "Please set --disable-radix-cache when enabling CP mode."
+                )
+
+            # check prefix_indices should be empty when radix cache is disabled
+            for req in reqs:
+                if len(req.prefix_indices) > 0:
+                    raise ValueError(
+                        f"CP mode requires radix cache to be disabled, "
+                        f"but prefix_indices length is {len(req.prefix_indices)} for request {req.rid}"
+                    )
+
+            # Get CP configuration
+            cp_size = get_context_parallel_world_size()
+            cp_rank = get_context_parallel_rank()
+            page_size = self.token_to_kv_pool_allocator.page_size
+
+            """
+            CP Mode Memory Allocation Example:
+            - actual_seq_len = 12345, page_size = 32, cp_size = 4
+            - aligned_seq_len = 12544 (aligned to page_size * cp_size * 2 = 256)
+            - split_list = [1568, 1568, 1568, 1568, 1568, 1568, 1568, 1568] (8 blocks)
+            - For CP_Rank 0: zigzag_index = [0, 7], extend_tokens = 1568 + 1568 = 3136
+            - Memory allocated: 3136 tokens
+            - KV indices written: 2937 tokens (block 0: [0, 1568), block 7: [10976, 12345))
+            """
+            
+            # Calculate CP metadata for each request
+            cp_extend_tokens_list = []
+            extend_lens = []
+            for i, req in enumerate(reqs):
+                actual_seq_len = len(req.fill_ids)
+
+                # Calculate CP metadata
+                req.cp_metadata = calculate_cp_metadata(
+                    actual_seq_len=actual_seq_len,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    page_size=page_size,
+                )
+
+                # Update seq_lens to aligned length for CP mode
+                seq_lens[i] = req.cp_metadata.aligned_seq_len
+
+                # Calculate extend tokens for current CP_Rank
+                prefix_len = len(req.prefix_indices)
+                cp_extend_tokens = (
+                    sum(req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index)
+                    - prefix_len
+                )
+                cp_extend_tokens_list.append(cp_extend_tokens)
+                extend_lens.append(cp_extend_tokens)
+
+            # Update extend_num_tokens for CP mode
+            extend_num_tokens = sum(cp_extend_tokens_list)
+        else:
+            # Non-CP mode: keep original logic
+            extend_lens = [r.extend_input_len for r in reqs]
+            extend_num_tokens = sum(len(ids) for ids in input_ids)
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(

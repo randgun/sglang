@@ -1547,6 +1547,7 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     prefill_context_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
 ) -> None:
