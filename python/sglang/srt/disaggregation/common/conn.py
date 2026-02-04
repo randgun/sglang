@@ -21,7 +21,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, CPMetadata
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -227,6 +227,8 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        cp_rank: Optional[int] = None,
+        cp_metadata: Optional["CPMetadata"] = None,
     ):
         pass
 

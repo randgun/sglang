@@ -25,6 +25,7 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
@@ -48,6 +49,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.distributed.parallel_state import get_context_parallel_rank
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -668,12 +670,6 @@ class SchedulerDisaggregationPrefillMixin:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
-        req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -719,10 +715,60 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
-        page_indices = kv_to_page_indices(kv_indices, page_size)
-        if len(page_indices) == 0:
-            logger.info(
-                f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
+        enable_cp = req.cp_metadata is not None
+
+        if enable_cp:
+            cp_metadata = req.cp_metadata
+            cp_rank = get_context_parallel_rank()
+            
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :cp_metadata.actual_seq_len
+                ]
+                .cpu()
+                .numpy()
             )
-            return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+            
+            # Process each block assigned to current CP rank
+            prefill_page_indices = []
+            for block_idx in cp_metadata.zigzag_index:
+                block_token_start = sum(cp_metadata.split_list[j] for j in range(block_idx))
+                block_token_end = block_token_start + cp_metadata.split_list[block_idx]
+                
+                block_kv_indices = kv_indices[block_token_start:block_token_end]
+                block_kv_indices = block_kv_indices[block_kv_indices != -1]
+                
+                if len(block_kv_indices) == 0:
+                    continue
+                
+                block_prefill_pages = kv_to_page_indices(block_kv_indices, page_size)
+                prefill_page_indices.extend(block_prefill_pages)
+            
+            prefill_page_indices_array = np.array(prefill_page_indices, dtype=np.int32)
+            if len(prefill_page_indices_array) == 0:
+                logger.info(
+                    f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty (CP mode)"
+                )
+                return
+            
+            req.disagg_kv_sender.send(
+                prefill_page_indices_array,
+                state_indices,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
+            )
+        else:
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+                .cpu()
+                .numpy()
+            )
+            req.start_send_idx = end_idx
+
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if len(page_indices) == 0:
+                logger.info(
+                    f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
+                )
+                return
+            req.disagg_kv_sender.send(page_indices, state_indices)
