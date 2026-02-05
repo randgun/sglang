@@ -200,8 +200,9 @@ class Qwen2Attention(nn.Module):
             and forward_batch.forward_mode.is_context_parallel_extend()
         ):
             cp_group = get_pcp_group()
-            k_global = cp_all_gather_kv(k, cp_group, self.alt_stream)
-            v_global = cp_all_gather_kv(v, cp_group, self.alt_stream)
+            cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
+            k_global = cp_all_gather_kv(k, cp_group, cuda_stream)
+            v_global = cp_all_gather_kv(v, cp_group, cuda_stream)
             attn_output = self.attn(q, k_global, v_global, forward_batch)
         else:
             attn_output = self.attn(q, k, v, forward_batch)
