@@ -37,8 +37,8 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.attention.cp_utils import cp_all_gather_kv, is_enable_prefill_cp, prepare_qwen_cp_metadata
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.attention.cp_utils import cp_all_gather_kv, is_enable_prefill_cp
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size,get_pcp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -652,7 +652,7 @@ class Qwen3MoeAttention(nn.Module):
             and forward_batch.forward_mode.is_context_parallel_extend()
         ):
             cp_group = get_pcp_group()
-            pcp_size = cp_group.size()
+            pcp_size = get_pcp_size()
             # Split q by length dimension according to pcp_size
             q = torch.chunk(q, pcp_size, dim=0)[cp_group.rank()]
             k = cp_all_gather_kv(k, cp_group)

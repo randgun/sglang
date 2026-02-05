@@ -96,7 +96,10 @@ def prepare_qwen_cp_metadata(
     """
     if cp_size <= 1:
         return None
-
+    # kv_len = torch.tensor(kv_len)
+    # bs_per_cp_group = 1
+    # kv_len_origin = kv_len
+    seq_len = torch.tensor(seq_len)
     bs_per_cp_group = 1
     seq_len_origin = seq_len
 
