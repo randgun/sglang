@@ -36,9 +36,15 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.attention.cp_utils import cp_all_gather_kv, is_enable_prefill_cp, cp_split_tensor_by_zigzag
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size,get_pcp_size
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+)
+from sglang.srt.layers.attention.cp_utils import (
+    cp_all_gather_kv,
+    is_enable_prefill_cp,
+)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -646,21 +652,13 @@ class Qwen3MoeAttention(nn.Module):
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
+        # RadixAttention expects Q/K/V in [tokens, num_heads * head_dim].
         if (
             forward_batch.gqa_cp_metadata is not None
             and is_enable_prefill_cp()
             and forward_batch.forward_mode.is_context_parallel_extend()
         ):
             cp_group = get_pcp_group()
-            pcp_size = get_pcp_size()
-            # Split q by length dimension according to pcp_size
-            q = cp_split_tensor_by_zigzag(
-                q, 
-                forward_batch.gqa_cp_metadata.split_list, 
-                forward_batch.gqa_cp_metadata.zigzag_index
-            )
-            print(f"+++{q=}")
-            q = q[cp_group.rank]
             k = cp_all_gather_kv(k, cp_group)
             v = cp_all_gather_kv(v, cp_group)
             attn_output = self.attn(q, k, v, fb, save_kv_cache=save_kv_cache)

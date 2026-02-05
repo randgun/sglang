@@ -666,7 +666,13 @@ class Qwen2MoeModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
         if gqa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
-                hidden_states = cp_split_tensor_by_zigzag(forward_batch, hidden_states)
+                metadata = forward_batch.gqa_cp_metadata
+                hidden_states = cp_split_tensor_by_zigzag(
+                    hidden_states, metadata.split_list, metadata.zigzag_index
+                )
+                positions = cp_split_tensor_by_zigzag(
+                    positions.unsqueeze(-1), metadata.split_list, metadata.zigzag_index
+                ).squeeze(-1)
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:

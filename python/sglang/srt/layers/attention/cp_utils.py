@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import Optional, List
@@ -11,24 +12,31 @@ from sglang.srt.distributed import GroupCoordinator
 def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator):
     """
     Args:
-        local_kv: [batch, num_kv_heads, local_seq_len, head_dim]
+        local_kv: [local_tokens, num_kv_heads * head_dim] or
+                  [local_tokens, num_kv_heads, head_dim]
     Returns:
-        global_kv: [batch, num_kv_heads, global_seq_len, head_dim]
+        global_kv: [global_tokens, num_kv_heads * head_dim] or
+                   [global_tokens, num_kv_heads, head_dim]
     """
-    if cp_group is None or cp_group.size == 1:
+    if cp_group is None or dist.get_world_size(group=cp_group) == 1:
         return local_kv
-        
+
+    assert local_kv.dim() in (
+        2,
+        3,
+    ), f"cp_all_gather_kv expects 2D/3D tensor, got shape={tuple(local_kv.shape)}"
+
     world_size = cp_group.size
-    # 假设所有 rank 长度一致 (需由 padding 保证，或处理变长 gather)
-    # 简单起见，这里假设 pad 到了整齐切分
     output_list = [torch.empty_like(local_kv) for _ in range(world_size)]
     torch.distributed.all_gather(output_list, local_kv, group=cp_group)
-    
-    # 注意：AllGather 出来的数据是按 Rank 序的 [Rank0_Chunk, Rank1_Chunk...]
-    # 但因为我们用了 Zigzag，这里的数据物理上已经是乱序的了。
-    # 对于 Attention 来说，K/V 的顺序不影响结果，只要 Position ID 对得上即可！
-    # 所以直接 cat 起来给 FlashAttention 即可。
-    return torch.cat(output_list, dim=0) # 假设 dim 2 是 seq_len
+    # For RadixAttention path, token/sequence is the leading dimension.
+    # Concatenate along dim=0 to rebuild global KV tokens.
+    global_kv = torch.cat(output_list, dim=0)
+    assert (
+        global_kv.shape[1:] == local_kv.shape[1:]
+    ), f"KV head dims changed after all_gather: local={tuple(local_kv.shape)} global={tuple(global_kv.shape)}"
+
+    return global_kv
 
 def gqa_use_prefill_cp(forward_batch, gqa_enable_prefill_cp=None):
     if gqa_enable_prefill_cp is None:
@@ -154,7 +162,7 @@ def prepare_qwen_cp_metadata(
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
 
-    device = kv_len_prev.device
+    device = seq_len.device
 
     kv_len_prev_tensor = torch.tensor(kv_len_prev, device=device, dtype=torch.int32)
     kv_len_next_tensor = torch.tensor(kv_len_next, device=device, dtype=torch.int32)
