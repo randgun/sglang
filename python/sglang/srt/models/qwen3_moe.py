@@ -920,19 +920,19 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def ring_attn_all_gather(
         self,
-        input: torch.Tensor, 
+        input_t: torch.Tensor, 
         async_op: bool=False
     ):
-        if self.pcp_group is None or self.pcp_group.world_size == 1:
-            return input
+        if self.pcp_group.world_size == 1:
+            return input_t
 
         process_group = self.pcp_group.device_group
         world_size = torch.distributed.get_world_size(process_group)
         output = torch.empty(
-            world_size * input.shape[0], *input.shape[1:], dtype=input.dtype, device=input.device
+            world_size * input_t.shape[0], *input_t.shape[1:], dtype=input_t.dtype, device=input_t.device
         )
         torch.distributed.all_gather_into_tensor(
-            output, input.contiguous(), group=process_group, async_op=async_op
+            output, input_t.contiguous(), group=process_group, async_op=async_op
         )
         return output
 
@@ -958,13 +958,11 @@ class Qwen3MoeForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         hidden_states_all = None
-        if self.pcp_group is not None and self.pcp_group.world_size > 1 \
-                and self.pcp_group.is_first_rank:
+        if self.pcp_group.world_size > 1 and self.pcp_group.is_first_rank:
             hidden_states_all = self.ring_attn_all_gather(hidden_states)
 
         if self.pp_group.is_last_rank:
-            if self.pcp_group is not None and self.pcp_group.world_size > 1 \
-                    and self.pcp_group.is_first_rank:
+            if self.pcp_group.world_size > 1 and self.pcp_group.is_first_rank:
                 input_ids = forward_batch.input_ids
                 hidden_states = hidden_states_all[:input_ids.shape[0]]
 

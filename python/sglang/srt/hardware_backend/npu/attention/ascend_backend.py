@@ -608,7 +608,7 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ):
-        comm = RingComm()
+        comm = RingComm(self.pcp_group.device_group)
         out, lse = None, None
         next_k, next_v = None, None
         seq_half = q.shape[0] // 2
@@ -623,7 +623,7 @@ class AscendAttnBackend(AttentionBackend):
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
                 atten_mask=self.fia_mask.unsqueeze(0) if attn_mask else None,
-                sparse_mode=3 if q_len != 1 else 0,
+                sparse_mode=3 if attn_mask else 0,
                 scale=layer.scaling,
                 next_tokens=0,
                 softmax_lse_flag=True
