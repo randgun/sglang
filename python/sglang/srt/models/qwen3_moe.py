@@ -654,7 +654,9 @@ class Qwen3MoeAttention(nn.Module):
             cp_group = get_pcp_group()
             pcp_size = get_pcp_size()
             # Split q by length dimension according to pcp_size
-            q = torch.chunk(q, pcp_size, dim=0)[cp_group.rank()]
+            q = torch.chunk(q, pcp_size, dim=0)
+            print(f"+++{q=}")
+            q = q[cp_group.rank]
             k = cp_all_gather_kv(k, cp_group)
             v = cp_all_gather_kv(v, cp_group)
             attn_output = self.attn(q, k, v, fb, save_kv_cache=save_kv_cache)

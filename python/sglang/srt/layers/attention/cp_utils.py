@@ -15,7 +15,7 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: dist.ProcessGroup):
     Returns:
         global_kv: [batch, num_kv_heads, global_seq_len, head_dim]
     """
-    if cp_group is None or cp_group.size() == 1:
+    if cp_group is None or cp_group.size == 1:
         return local_kv
         
     world_size = dist.get_world_size(group=cp_group)
