@@ -301,7 +301,7 @@ def initialize_dp_attention(
     if pcp_size>1:
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
-        _ATTN_CP_SIZE = pcp_size
+        _ATTN_PCP_SIZE = pcp_size
 
     tp_group = get_tp_group()
     # Trick to solve circular references
@@ -333,8 +333,8 @@ def initialize_dp_attention(
     )
 
 def get_pcp_rank() -> int:
-    assert _ATTN_PCP_RANK is not None, "dp attention not initialized!"
-    return _ATTN_PCP_RANK
+    assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
+    return _ATTN_DP_RANK
 
 def get_pcp_size() -> int:
     assert _ATTN_PCP_SIZE is not None, "dp attention not initialized!"
