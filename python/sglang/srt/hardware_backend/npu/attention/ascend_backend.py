@@ -11,6 +11,11 @@ from sgl_kernel_npu.attention.sinks_attention import (
 )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state import get_pcp_group
+from sglang.srt.hardware_backend.npu.attention.ring_utils import (
+    RingComm, 
+    update_out_and_lse
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -207,6 +212,7 @@ class AscendAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.forward_metadata = None
+        self.pcp_group = get_pcp_group()
         self.device = model_runner.device
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -594,6 +600,58 @@ class AscendAttnBackend(AttentionBackend):
         )
         return torch.cat([attn_out_prev, attn_out_next], dim=0)
 
+    def forward_ring_zig(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        comm = RingComm(self.pcp_group.device_group)
+        out, lse = None, None
+        next_k, next_v = None, None
+        seq_half = q.shape[0] // 2
+        world_size = self.pcp_group.world_size
+ 
+        def forward(q, k, v, layer, forward_batch, attn_mask=True):
+            attn_out, lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q,
+                k,
+                v,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                atten_mask=self.fia_mask.unsqueeze(0) if attn_mask else None,
+                sparse_mode=3 if attn_mask else 0,
+                scale=layer.scaling,
+                next_tokens=0,
+                softmax_lse_flag=True
+            )
+            return attn_out, lse
+ 
+        for loop in range(world_size):
+            if loop + 1 != world_size:
+                next_k, next_v = comm.send_recv_kv(k, v)
+ 
+            if loop == 0:
+                block_out, block_lse = forward(q, k, v, layer, forward_batch, attn_mask=True)
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            elif loop <= comm.rank:
+                block_out, block_lse = forward(q, k[:seq_half], v[:seq_half], layer, forward_batch, attn_mask=False)
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            else:
+                block_out, block_lse = forward(q[seq_half:], k, v, layer, forward_batch, attn_mask=False)
+                out_slice, lse_slice = update_out_and_lse(out[seq_half:], lse[seq_half:], block_out, block_lse)
+                out[seq_half:], lse[seq_half:] = out_slice, lse_slice
+ 
+            if loop + 1 != world_size:
+                comm.wait()
+                k, v = next_k, next_v
+ 
+        lse = lse.squeeze(dim=-1).transpose(1, 2)
+        return out, lse
+        
     def forward_sparse(
         self,
         q: torch.Tensor,
