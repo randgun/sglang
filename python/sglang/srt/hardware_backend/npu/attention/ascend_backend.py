@@ -1254,7 +1254,7 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
                         scale=layer.scaling,
                         next_tokens=0,
-                    )                   
+                    )
 
                 attn_output = attn_output.reshape(
                     -1, layer.tp_q_head_num, layer.v_head_dim

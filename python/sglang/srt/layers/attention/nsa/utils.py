@@ -1,13 +1,13 @@
 # temp NSA debugging environ
 from itertools import accumulate
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Tuple, Union,Optional
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.cp_utils import ContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather_into_tensor,
@@ -21,6 +21,37 @@ from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+@dataclass
+class ContextParallelMetadata:
+    split_list: Optional[List[int]] = None
+    max_rank_len: Optional[List[int]] = None
+    zigzag_index: Optional[List[int]] = None
+    per_rank_actual_token: Optional[List[int]] = None
+    reverse_split_len: Optional[List[int]] = None
+    cp_reverse_index: Optional[List[int]] = None
+    kv_len_prev: int = -1
+    kv_len_next: int = -1
+    actual_seq_q_prev: int = -1
+    actual_seq_q_next: int = -1
+    q_head_num: Optional[int] = None  # Query头数
+    kv_head_num: Optional[int] = None  # Key/Value头数
+    head_dim: Optional[int] = None  # 头维度
+    kv_len_prev_tensor: Optional[torch.Tensor] = None
+    kv_len_next_tensor: Optional[torch.Tensor] = None
+    actual_seq_q_prev_tensor: Optional[torch.Tensor] = None
+    actual_seq_q_next_tensor: Optional[torch.Tensor] = None
+    total_seq_lens: Optional[int] = None
+    kv_with_q_head_nomask_idx: Optional[torch.Tensor] = None
+    kv_with_q_head_mask_idx: Optional[torch.Tensor] = None
+    kv_with_q_tail_nomask_idx: Optional[torch.Tensor] = None
+    kv_with_q_tail_mask_idx: Optional[torch.Tensor] = None
+    head_attn_nomask_seqlens: Optional[torch.Tensor] = None
+    tail_attn_nomask_seqlens: Optional[torch.Tensor] = None
+    attn_mask_seqlens: Optional[torch.Tensor] = None
+
+
 
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
@@ -501,7 +532,55 @@ def prepare_input_dp_with_cp_dsa(
                 )
             )
         )
+    mask_metadata = calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list)
 
+
+    cp_metadata = ContextParallelMetadata(
+        split_list=split_list,
+        max_rank_len=max_rank_len,
+        zigzag_index=zigzag_index,
+        per_rank_actual_token=per_rank_actual_token,
+        reverse_split_len=reverse_split_len,
+        cp_reverse_index=cp_reverse_index,
+        kv_len_prev=mask_metadata.kv_len_prev,
+        kv_len_next=mask_metadata.kv_len_next,
+        actual_seq_q_prev=mask_metadata.actual_seq_q_prev,
+        actual_seq_q_next=mask_metadata.actual_seq_q_next,
+        kv_len_prev_tensor=mask_metadata.kv_len_prev_tensor,
+        kv_len_next_tensor=mask_metadata.kv_len_next_tensor,
+        actual_seq_q_prev_tensor=mask_metadata.actual_seq_q_prev_tensor,
+        actual_seq_q_next_tensor=mask_metadata.actual_seq_q_next_tensor,
+        total_seq_lens=kv_len_origin,
+        # new param with mask
+        kv_with_q_head_nomask_idx=mask_metadata.kv_with_q_head_nomask_idx,
+        kv_with_q_head_mask_idx=mask_metadata.kv_with_q_head_mask_idx,
+        kv_with_q_tail_nomask_idx=mask_metadata.kv_with_q_tail_nomask_idx,
+        kv_with_q_tail_mask_idx=mask_metadata.kv_with_q_tail_mask_idx,
+        head_attn_nomask_seqlens=mask_metadata.head_attn_nomask_seqlens,
+        tail_attn_nomask_seqlens=mask_metadata.tail_attn_nomask_seqlens,
+        attn_mask_seqlens=mask_metadata.attn_mask_seqlens,
+    )
+    return cp_metadata
+
+@dataclass
+class MaskMetaData:
+    kv_with_q_head_nomask_idx: torch.Tensor
+    kv_with_q_head_mask_idx: torch.Tensor
+    kv_with_q_tail_nomask_idx: torch.Tensor
+    kv_with_q_tail_mask_idx: torch.Tensor
+    head_attn_nomask_seqlens: torch.Tensor
+    tail_attn_nomask_seqlens: torch.Tensor
+    attn_mask_seqlens: torch.Tensor
+    kv_len_prev_tensor: torch.Tensor
+    kv_len_next_tensor: torch.Tensor
+    actual_seq_q_prev_tensor: torch.Tensor
+    actual_seq_q_next_tensor: torch.Tensor
+    kv_len_prev: int
+    kv_len_next: int
+    actual_seq_q_prev: int
+    actual_seq_q_next: int
+
+def calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list):
     prefix_offsets = [0] + list(accumulate(split_list))
 
     head_chunk_id = cp_rank
@@ -552,24 +631,8 @@ def prepare_input_dp_with_cp_dsa(
     kv_len_next_tensor = torch.tensor(kv_len_next,  dtype=torch.int32)
     actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, dtype=torch.int32)
     actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, dtype=torch.int32)
-
-    cp_metadata = ContextParallelMetadata(
-        split_list=split_list,
-        max_rank_len=max_rank_len,
-        zigzag_index=zigzag_index,
-        per_rank_actual_token=per_rank_actual_token,
-        reverse_split_len=reverse_split_len,
-        cp_reverse_index=cp_reverse_index,
-        kv_len_prev=kv_len_prev,
-        kv_len_next=kv_len_next,
-        actual_seq_q_prev=actual_seq_q_prev,
-        actual_seq_q_next=actual_seq_q_next,
-        kv_len_prev_tensor=kv_len_prev_tensor,
-        kv_len_next_tensor=kv_len_next_tensor,
-        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
-        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
-        total_seq_lens=kv_len_origin,
-        # new param with mask
+    
+    return MaskMetaData(
         kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx_tensor,
         kv_with_q_head_mask_idx=kv_with_q_head_mask_idx_tensor,
         kv_with_q_tail_nomask_idx=kv_with_q_tail_nomask_idx_tensor,
@@ -577,5 +640,12 @@ def prepare_input_dp_with_cp_dsa(
         head_attn_nomask_seqlens=head_attn_nomask_seqlens,
         tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
         attn_mask_seqlens=attn_mask_seqlens_tensor,
+        kv_len_prev_tensor=kv_len_prev_tensor,
+        kv_len_next_tensor=kv_len_next_tensor,
+        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
+        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
+        kv_len_prev=kv_len_prev,
+        kv_len_next=kv_len_next,
+        actual_seq_q_prev=actual_seq_q_prev,
+        actual_seq_q_next=actual_seq_q_next,
     )
-    return cp_metadata

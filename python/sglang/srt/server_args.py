@@ -5029,7 +5029,10 @@ class ServerArgs:
                 ), "Prefill context parallelism is not supported in decode mode"
                 assert (
                     self.chunked_prefill_size is None or self.chunked_prefill_size == -1
-                ), "Prefill context parallelism is not supported in chunked prefill mode"    
+                ), "Prefill context parallelism is not supported in chunked prefill mode"
+                assert (
+                    self.disable_radix_cache
+                ), "Prefill context parallelism has not supported radix cache"
             assert (
                 self.tp_size * self.pp_size * self.prefill_context_parallel_size
             ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
