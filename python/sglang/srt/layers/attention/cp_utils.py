@@ -14,20 +14,23 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator):
     Args:
         local_kv: [local_tokens, num_kv_heads * head_dim] or
                   [local_tokens, num_kv_heads, head_dim]
+        cp_group: get_pcp_group() returns a GroupCoordinator; use
+                  cp_group.device_group as the real communication group.
     Returns:
         global_kv: [global_tokens, num_kv_heads * head_dim] or
                    [global_tokens, num_kv_heads, head_dim]
     """
-    if cp_group is None or dist.get_world_size(group=cp_group) == 1:
+    if cp_group is None or cp_group.world_size == 1:
         return local_kv
+    pg = cp_group.device_group
     assert local_kv.dim() in (
         2,
         3,
     ), f"cp_all_gather_kv expects 2D/3D tensor, got shape={tuple(local_kv.shape)}"
 
-    world_size = cp_group.size
+    world_size = cp_group.world_size
     output_list = [torch.empty_like(local_kv) for _ in range(world_size)]
-    torch.distributed.all_gather(output_list, local_kv, group=cp_group)
+    dist.all_gather(output_list, local_kv, group=pg)
     # For RadixAttention path, token/sequence is the leading dimension.
     # Concatenate along dim=0 to rebuild global KV tokens.
     global_kv = torch.cat(output_list, dim=0)
