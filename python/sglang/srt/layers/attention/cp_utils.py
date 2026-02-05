@@ -21,22 +21,43 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator, stream:
     """
     if cp_group is None or cp_group.world_size == 1:
         return local_kv
+
     assert local_kv.dim() in (
         2,
         3,
     ), f"cp_all_gather_kv expects 2D/3D tensor, got shape={tuple(local_kv.shape)}"
 
     world_size = cp_group.world_size
+    local_kv = local_kv.contiguous()
 
-    global_shape = (local_kv.shape[0] * world_size,) + local_kv.shape[1:]
-    global_kv = torch.empty(global_shape, dtype=local_kv.dtype, device=local_kv.device)
-    cp_group.cp_all_gather_into_tensor_async(global_kv, local_kv, stream=stream)
-    assert (
-        global_kv.shape[1:] == local_kv.shape[1:]
-    ), f"KV head dims changed after all_gather: local={tuple(local_kv.shape)} global={tuple(global_kv.shape)}"
+    # CP split can produce different local token counts across ranks.
+    # HCCL/NCCL all_gather_into_tensor requires the same count on each rank,
+    # so gather lengths first, pad to max_len, and trim after all-gather.
+    local_len = torch.tensor([local_kv.shape[0]], dtype=torch.int32, device=local_kv.device)
+    gathered_lens = cp_group.all_gather(local_len, dim=0)
+    gathered_lens_cpu = gathered_lens.detach().cpu().tolist()
 
-    return global_kv
+    max_len = max(gathered_lens_cpu)
+    if local_kv.shape[0] != max_len:
+        padded_local_kv = torch.zeros(
+            (max_len,) + local_kv.shape[1:],
+            dtype=local_kv.dtype,
+            device=local_kv.device,
+        )
+        padded_local_kv[: local_kv.shape[0]].copy_(local_kv)
+        local_kv = padded_local_kv
 
+    gather_shape = (max_len * world_size,) + local_kv.shape[1:]
+    gathered_padded_kv = torch.empty(gather_shape, dtype=local_kv.dtype, device=local_kv.device)
+    cp_group.cp_all_gather_into_tensor_async(gathered_padded_kv, local_kv, stream=stream)
+    if len(set(gathered_lens_cpu)) == 1:
+        return gathered_padded_kv
+    chunks = torch.split(gathered_padded_kv, max_len, dim=0)
+    return torch.cat(
+        [chunk[:valid_len] for chunk, valid_len in zip(chunks, gathered_lens_cpu)], dim=0
+    )
+
+    
 def gqa_use_prefill_cp(forward_batch, gqa_enable_prefill_cp=None):
     if gqa_enable_prefill_cp is None:
         gqa_enable_prefill_cp = is_enable_prefill_cp()

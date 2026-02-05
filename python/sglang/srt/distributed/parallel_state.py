@@ -1689,7 +1689,16 @@ def initialize_model_parallel(
     )
     global _PCP
     pcp_tp_size = tensor_model_parallel_size // prefill_context_parallel_size
-    group_ranks = [list(range(i,get_world_size(),pcp_tp_size)) for i in range(pcp_tp_size)]
+    assert pcp_tp_size >= 1, (
+        "Invalid PCP TP size: tensor_model_parallel_size must be >= "
+        "prefill_context_parallel_size, "
+        f"got tensor_model_parallel_size={tensor_model_parallel_size}, "
+        f"prefill_context_parallel_size={prefill_context_parallel_size}, "
+        f"pcp_tp_size={pcp_tp_size}"
+    )
+    group_ranks = [
+        list(range(i, get_world_size(), pcp_tp_size)) for i in range(pcp_tp_size)
+    ]
     _PCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
