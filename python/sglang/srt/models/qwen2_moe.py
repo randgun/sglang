@@ -37,7 +37,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.cp_utils import cp_all_gather_kv, is_enable_prefill_cp,prepare_qwen_cp_metadata
+from sglang.srt.layers.attention.cp_utils import (cp_all_gather_kv, gqa_use_prefill_cp, is_enable_prefill_cp,prepare_qwen_cp_metadata,cp_split_tensor_by_zigzag)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -664,6 +664,9 @@ class Qwen2MoeModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        if gqa_use_prefill_cp(forward_batch):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_tensor_by_zigzag(forward_batch, hidden_states)
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:

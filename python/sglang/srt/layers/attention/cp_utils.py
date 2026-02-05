@@ -4,11 +4,11 @@ from itertools import accumulate
 from typing import Optional, List
 
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.distributed import GroupCoordinator
 
-import torch.distributed as dist
 
 # 新增：KV Gather 辅助函数
-def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: dist.ProcessGroup):
+def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator):
     """
     Args:
         local_kv: [batch, num_kv_heads, local_seq_len, head_dim]
@@ -18,11 +18,11 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: dist.ProcessGroup):
     if cp_group is None or cp_group.size == 1:
         return local_kv
         
-    world_size = dist.get_world_size(group=cp_group)
+    world_size = cp_group.size
     # 假设所有 rank 长度一致 (需由 padding 保证，或处理变长 gather)
     # 简单起见，这里假设 pad 到了整齐切分
     output_list = [torch.empty_like(local_kv) for _ in range(world_size)]
-    dist.all_gather(output_list, local_kv, group=cp_group)
+    torch.distributed.all_gather(output_list, local_kv, group=cp_group)
     
     # 注意：AllGather 出来的数据是按 Rank 序的 [Rank0_Chunk, Rank1_Chunk...]
     # 但因为我们用了 Zigzag，这里的数据物理上已经是乱序的了。
@@ -154,10 +154,12 @@ def prepare_qwen_cp_metadata(
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
 
-    kv_len_prev_tensor = torch.tensor(kv_len_prev, device="cuda", dtype=torch.int32)
-    kv_len_next_tensor = torch.tensor(kv_len_next, device="cuda", dtype=torch.int32)
-    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, device="cuda", dtype=torch.int32)
-    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, device="cuda", dtype=torch.int32)
+    device = kv_len_prev.device
+
+    kv_len_prev_tensor = torch.tensor(kv_len_prev, device=device, dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next, device=device, dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, device=device, dtype=torch.int32)
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, device=device, dtype=torch.int32)
 
     # ========== Mask 计算相关元数据 ==========
     # 计算 prefix offsets 用于定位每个 chunk 的全局起始位置
@@ -176,15 +178,15 @@ def prepare_qwen_cp_metadata(
 
     # Attention mask 的序列长度信息 [seq_per_batch, start_global]
     head_attn_nomask_seqlens = torch.tensor(
-        [[seq_per_batch], [head_start_global]], dtype=torch.int32, device="cuda"
+        [[seq_per_batch], [head_start_global]], dtype=torch.int32, device=device
     )
     tail_attn_nomask_seqlens = torch.tensor(
-        [[seq_per_batch], [tail_start_global]], dtype=torch.int32, device="cuda"
+        [[seq_per_batch], [tail_start_global]], dtype=torch.int32, device=device
     )
 
     # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用
     attn_mask_seqlens_tensor = torch.tensor(
-        [[actual_seq_q_prev], [actual_seq_q_next]], dtype=torch.int32, device="cuda"
+        [[actual_seq_q_prev], [actual_seq_q_next]], dtype=torch.int32, device=device
     )
 
     # KV 与 Q 的 mask 索引计算
@@ -196,17 +198,17 @@ def prepare_qwen_cp_metadata(
     kv_with_q_tail_mask_idx = list(range(tail_start_global, tail_end_global))
 
     kv_with_q_head_nomask_idx_tensor = torch.tensor(
-        kv_with_q_head_nomask_idx, dtype=torch.int32, device="cuda"
-    ) if kv_with_q_head_nomask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+        kv_with_q_head_nomask_idx, dtype=torch.int32, device=device
+    ) if kv_with_q_head_nomask_idx else torch.empty(0, dtype=torch.int32, device=device)
     kv_with_q_head_mask_idx_tensor = torch.tensor(
-        kv_with_q_head_mask_idx, dtype=torch.int32, device="cuda"
-    ) if kv_with_q_head_mask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+        kv_with_q_head_mask_idx, dtype=torch.int32, device=device
+    ) if kv_with_q_head_mask_idx else torch.empty(0, dtype=torch.int32, device=device)
     kv_with_q_tail_nomask_idx_tensor = torch.tensor(
-        kv_with_q_tail_nomask_idx, dtype=torch.int32, device="cuda"
-    ) if kv_with_q_tail_nomask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+        kv_with_q_tail_nomask_idx, dtype=torch.int32, device=device
+    ) if kv_with_q_tail_nomask_idx else torch.empty(0, dtype=torch.int32, device=device)
     kv_with_q_tail_mask_idx_tensor = torch.tensor(
-        kv_with_q_tail_mask_idx, dtype=torch.int32, device="cuda"
-    ) if kv_with_q_tail_mask_idx else torch.empty(0, dtype=torch.int32, device="cuda")
+        kv_with_q_tail_mask_idx, dtype=torch.int32, device=device
+    ) if kv_with_q_tail_mask_idx else torch.empty(0, dtype=torch.int32, device=device)
 
     metadata = ContextParallelMetadata(
         split_list=split_list,
