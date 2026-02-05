@@ -566,10 +566,15 @@ class LayerCommunicator:
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
+        dp_padding_mode = forward_batch.dp_padding_mode
+        is_dp_max_padding = (
+            dp_padding_mode is not None and dp_padding_mode.is_max_len()
+        )
+
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
-            and forward_batch.dp_padding_mode.is_max_len()
+            and is_dp_max_padding
         ):
             return True
         if nsa_use_prefill_cp(forward_batch):
@@ -928,7 +933,12 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
-        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        dp_padding_mode = forward_batch.dp_padding_mode
+        is_dp_max_padding = (
+            dp_padding_mode is not None and dp_padding_mode.is_max_len()
+        )
+        
+        if allow_reduce_scatter and is_dp_max_padding:
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
