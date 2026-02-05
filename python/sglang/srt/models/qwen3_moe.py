@@ -659,8 +659,8 @@ class Qwen3MoeAttention(nn.Module):
             and forward_batch.forward_mode.is_context_parallel_extend()
         ):
             cp_group = get_pcp_group()
-            k = cp_all_gather_kv(k, cp_group)
-            v = cp_all_gather_kv(v, cp_group)
+            k = cp_all_gather_kv(k, cp_group, self.alt_stream)
+            v = cp_all_gather_kv(v, cp_group, self.alt_stream)
             attn_output = self.attn(q, k, v, fb, save_kv_cache=save_kv_cache)
         else:
             attn_output = self.attn(

@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import Optional, List
@@ -9,7 +8,7 @@ from sglang.srt.distributed import GroupCoordinator
 
 
 # 新增：KV Gather 辅助函数
-def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator):
+def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator, stream: torch.cuda.Stream):
     """
     Args:
         local_kv: [local_tokens, num_kv_heads * head_dim] or
@@ -22,18 +21,16 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator):
     """
     if cp_group is None or cp_group.world_size == 1:
         return local_kv
-    pg = cp_group.device_group
     assert local_kv.dim() in (
         2,
         3,
     ), f"cp_all_gather_kv expects 2D/3D tensor, got shape={tuple(local_kv.shape)}"
 
     world_size = cp_group.world_size
-    output_list = [torch.empty_like(local_kv) for _ in range(world_size)]
-    dist.all_gather(output_list, local_kv, group=pg)
-    # For RadixAttention path, token/sequence is the leading dimension.
-    # Concatenate along dim=0 to rebuild global KV tokens.
-    global_kv = torch.cat(output_list, dim=0)
+
+    global_shape = (local_kv.shape[0] * world_size,) + local_kv.shape[1:]
+    global_kv = torch.empty(global_shape, dtype=local_kv.dtype, device=local_kv.device)
+    cp_group.cp_all_gather_into_tensor_async(global_kv, local_kv, stream=stream)
     assert (
         global_kv.shape[1:] == local_kv.shape[1:]
     ), f"KV head dims changed after all_gather: local={tuple(local_kv.shape)} global={tuple(global_kv.shape)}"
