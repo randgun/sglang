@@ -447,6 +447,7 @@ def prepare_input_dp_with_cp_dsa(
     cp_rank,
     cp_size,
     seqs_len,
+    device,
 ):
     if is_nsa_prefill_cp_round_robin_split():
         return True
@@ -532,7 +533,7 @@ def prepare_input_dp_with_cp_dsa(
                 )
             )
         )
-    mask_metadata = calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list)
+    mask_metadata = calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list,device)
 
 
     cp_metadata = ContextParallelMetadata(
@@ -580,7 +581,7 @@ class MaskMetaData:
     actual_seq_q_prev: int
     actual_seq_q_next: int
 
-def calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list):
+def calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list,device):
     prefix_offsets = [0] + list(accumulate(split_list))
 
     head_chunk_id = cp_rank
@@ -627,10 +628,10 @@ def calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list):
     # Tail Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
     # kv_with_q_tail_nomask_idx = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
     # kv_with_q_tail_mask_idx = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
-    kv_len_prev_tensor = torch.tensor(kv_len_prev,  dtype=torch.int32)
-    kv_len_next_tensor = torch.tensor(kv_len_next,  dtype=torch.int32)
-    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, dtype=torch.int32)
-    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, dtype=torch.int32)
+    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(dtype=torch.int32, device=device)
+    kv_len_next_tensor = torch.tensor(kv_len_next).to(dtype=torch.int32, device=device)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(dtype=torch.int32, device=device)
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(dtype=torch.int32, device=device)
     
     return MaskMetaData(
         kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx_tensor,
