@@ -20,7 +20,8 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp,enable_prefill_cp,cp_all_gather_rerange_output
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp,nsa_use_prefill_cp
+from sglang.srt.layers.attention.cp_utils import gqa_use_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -254,20 +255,20 @@ class AscendAttnBackend(AttentionBackend):
         """
         return [None, None]
 
-    def _all_gather_kv_for_cp(
-        self, tensor: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        if (
-            forward_batch.nsa_cp_metadata is None
-            or not enable_prefill_cp(forward_batch, self.is_prefill_cp_enable)
-            or self.pcp_size <= 1
-        ):
-            return tensor
-        flattened = tensor.view(tensor.shape[0], -1)
-        gathered = cp_all_gather_rerange_output(
-            flattened, self.pcp_size, forward_batch, torch.npu.current_stream()
-        )
-        return gathered.view(-1, *tensor.shape[1:])
+    # def _all_gather_kv_for_cp(
+    #     self, tensor: torch.Tensor, forward_batch: ForwardBatch
+    # ) -> torch.Tensor:
+    #     if (
+    #         forward_batch.nsa_cp_metadata is None
+    #         or not enable_prefill_cp(forward_batch, self.is_prefill_cp_enable)
+    #         or self.pcp_size <= 1
+    #     ):
+    #         return tensor
+    #     flattened = tensor.view(tensor.shape[0], -1)
+    #     gathered = cp_all_gather_rerange_output(
+    #         flattened, self.pcp_size, forward_batch, torch.npu.current_stream()
+    #     )
+    #     return gathered.view(-1, *tensor.shape[1:])
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -805,7 +806,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         metadata = forward_batch.gqa_cp_metadata
         if metadata is None:
-            raise ValueError("GQA PCP metadata is required for forward_gqa_pcp.")
+            raise ValueError("GQA PCP metadata is required for forward gqa pcp.")
 
         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
@@ -1026,7 +1027,7 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""
-                if enable_prefill_cp(
+                if gqa_use_prefill_cp(
                     forward_batch, self.is_prefill_cp_enable
                 ) and forward_batch.gqa_cp_metadata is not None:
                     attn_output = self.forward_gqa_pcp(q, k, v, layer, forward_batch)
@@ -1240,7 +1241,7 @@ class AscendAttnBackend(AttentionBackend):
                     dim=0,
                 )
         # for mla pcp
-        elif enable_prefill_cp(forward_batch,self.is_prefill_cp_enable):
+        elif nsa_use_prefill_cp(forward_batch,self.is_prefill_cp_enable):
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             attn_output, _ = self.forward_mla_pcp(

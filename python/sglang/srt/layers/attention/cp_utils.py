@@ -30,6 +30,17 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: dist.ProcessGroup):
     # 所以直接 cat 起来给 FlashAttention 即可。
     return torch.cat(output_list, dim=0) # 假设 dim 2 是 seq_len
 
+def gqa_use_prefill_cp(forward_batch, gqa_enable_prefill_cp=None):
+    if gqa_enable_prefill_cp is None:
+        gqa_enable_prefill_cp = is_enable_prefill_cp()
+    if (
+        forward_batch.gqa_cp_metadata is not None
+        and gqa_enable_prefill_cp
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    ):
+        return True
+    else:
+        return False
 
 
 @dataclass
