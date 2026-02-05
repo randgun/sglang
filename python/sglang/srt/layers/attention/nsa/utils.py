@@ -35,9 +35,9 @@ class ContextParallelMetadata:
     kv_len_next: int = -1
     actual_seq_q_prev: int = -1
     actual_seq_q_next: int = -1
-    q_head_num: Optional[int] = None  # Query头数
-    kv_head_num: Optional[int] = None  # Key/Value头数
-    head_dim: Optional[int] = None  # 头维度
+    q_head_num: Optional[int] = None  
+    kv_head_num: Optional[int] = None  
+    head_dim: Optional[int] = None  
     kv_len_prev_tensor: Optional[torch.Tensor] = None
     kv_len_next_tensor: Optional[torch.Tensor] = None
     actual_seq_q_prev_tensor: Optional[torch.Tensor] = None
@@ -649,3 +649,6 @@ def calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list):
         actual_seq_q_prev=actual_seq_q_prev,
         actual_seq_q_next=actual_seq_q_next,
     )
+
+def is_enable_prefill_cp():
+    return get_global_server_args().prefill_context_parallel_size > 1

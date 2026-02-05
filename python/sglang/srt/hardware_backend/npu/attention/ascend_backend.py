@@ -244,7 +244,8 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
-        self.is_prefill_cp_enable =  model_runner.pcp_size > 1
+        self.is_prefill_cp_enable = model_runner.pcp_size > 1
+        self.pcp_size = model_runner.pcp_size
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -1178,10 +1179,10 @@ class AscendAttnBackend(AttentionBackend):
                     ],
                     dim=0,
                 )
-        elif nsa_use_prefill_cp(forward_batch,self.is_prefill_cp_enable):
+        elif nsa_use_prefill_cp(forward_batch, self.is_prefill_cp_enable):
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
-            attn_output, _ = self.forward_mla_pcp(
+            attn_output = self.forward_mla_pcp(
                     q_nope,
                     k_nope,
                     v,
@@ -1241,20 +1242,20 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                        q_nope,
-                        k_nope,
-                        v,
-                        query_rope=q_rope,
-                        key_rope=k_rope,
-                        num_heads=layer.tp_q_head_num,
-                        input_layout="TND",
-                        atten_mask=self.fia_mask,
-                        sparse_mode=3,
-                        actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
-                        scale=layer.scaling,
-                        next_tokens=0,
-                    )
+                    q_nope,
+                    k_nope,
+                    v,
+                    query_rope=q_rope,
+                    key_rope=k_rope,
+                    num_heads=layer.tp_q_head_num,
+                    input_layout="TND",
+                    atten_mask=self.fia_mask,
+                    sparse_mode=3,
+                    actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
+                    scale=layer.scaling,
+                    next_tokens=0,
+                )
 
                 attn_output = attn_output.reshape(
                     -1, layer.tp_q_head_num, layer.v_head_dim

@@ -4961,7 +4961,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-        if args.__contains__("pcp_size"):
+        if hasattr(args, "pcp_size"):
             args.prefill_context_parallel_size = args.pcp_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
@@ -5035,7 +5035,7 @@ class ServerArgs:
                 ), "Prefill context parallelism has not supported radix cache"
             assert (
                 self.tp_size * self.pp_size * self.prefill_context_parallel_size
-            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+            ) % self.nnodes == 0, "(tp_size * pp_size * pcp_size) must be divisible by number of nodes"
 
         if self.pp_size > 1:
             assert (

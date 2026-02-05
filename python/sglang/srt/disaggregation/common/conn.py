@@ -10,7 +10,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import requests
-from python.sglang.srt.layers.attention.cp_utils import is_enable_prefill_cp
 import zmq
 from aiohttp import web
 
@@ -30,6 +29,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -40,6 +40,9 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Constant for prefill context parallel TP size
+PREFILL_CP_ATTN_TP_SIZE = 16
 
 
 class CommonKVManager(BaseKVManager):
@@ -128,9 +131,9 @@ class CommonKVManager(BaseKVManager):
         attn_dp_size = self.attn_dp_size
         if is_enable_prefill_cp():
             attn_dp_rank = 0
-            attn_tp_size = 16
+            attn_tp_size = PREFILL_CP_ATTN_TP_SIZE
             attn_dp_size = 1
-            attn_tp_rank = self.pcp_rank * self.attn_tp_size + self.attn_tp_rank
+            attn_tp_rank = self.pcp_rank * attn_tp_size + self.attn_tp_rank
         payload = {
             "role": "Prefill",
             "attn_tp_size": attn_tp_size,

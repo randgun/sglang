@@ -301,7 +301,7 @@ def initialize_dp_attention(
     if pcp_size>1:
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
-        _ATTN_CP_SIZE = pcp_size
+        _ATTN_PCP_SIZE = pcp_size
 
     tp_group = get_tp_group()
     # Trick to solve circular references
@@ -310,7 +310,7 @@ def initialize_dp_attention(
     use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
     group_ranks = [
         list(range(head,head + _ATTN_TP_SIZE))
-        for head in range(0,pp_size * tp_size, _ATTN_TP_SIZE) 
+        for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE) 
     ]
     _ATTN_TP_GROUP = GroupCoordinator(
         group_ranks,
@@ -600,7 +600,7 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
 def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
-    max_len = forward_batch.nsa_cp_meatadata.max_rank_len[0]
+    max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
 
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
@@ -633,3 +633,4 @@ def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
     return outputs
+    

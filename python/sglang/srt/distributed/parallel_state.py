@@ -1418,8 +1418,6 @@ def get_pcp_group() -> GroupCoordinator:
     assert _PCP is not None, "pipeline model parallel group is not initialized"
     return _PCP
 
-    
-
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
@@ -1697,9 +1695,6 @@ def initialize_model_parallel(
         use_custom_allreduce= False,
         group_name="pcp_tp",
     )
-
-    
-
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
