@@ -20,7 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp,enable_prefill_cp,cp_all_gather_rerange_output
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp,nsa_use_prefill_cp,cp_all_gather_rerange_output
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -259,7 +259,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if (
             forward_batch.nsa_cp_metadata is None
-            or not enable_prefill_cp(forward_batch, self.is_prefill_cp_enable)
+            or not nsa_use_prefill_cp(forward_batch, self.is_prefill_cp_enable)
             or self.pcp_size <= 1
         ):
             return tensor
@@ -1178,7 +1178,7 @@ class AscendAttnBackend(AttentionBackend):
                     ],
                     dim=0,
                 )
-        elif enable_prefill_cp(forward_batch,self.is_prefill_cp_enable):
+        elif nsa_use_prefill_cp(forward_batch,self.is_prefill_cp_enable):
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             attn_output, _ = self.forward_mla_pcp(
