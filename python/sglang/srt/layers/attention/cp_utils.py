@@ -20,7 +20,6 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator):
     """
     if cp_group is None or dist.get_world_size(group=cp_group) == 1:
         return local_kv
-
     assert local_kv.dim() in (
         2,
         3,
@@ -162,7 +161,7 @@ def prepare_qwen_cp_metadata(
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
 
-    device = seq_len.device
+    device = "npu"
 
     kv_len_prev_tensor = torch.tensor(kv_len_prev, device=device, dtype=torch.int32)
     kv_len_next_tensor = torch.tensor(kv_len_next, device=device, dtype=torch.int32)
