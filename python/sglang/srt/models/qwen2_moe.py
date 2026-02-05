@@ -433,7 +433,7 @@ class Qwen2MoeAttention(nn.Module):
             cp_group = get_pcp_group()
             pcp_size = cp_group.size()
             # Split q by length dimension according to pcp_size
-            q = torch.chunk(q, pcp_size, dim=0)[cp_group.rank()]
+            q = torch.chunk(q, pcp_size, dim=0)[cp_group.rank]
             k = cp_all_gather_kv(k, cp_group)
             v = cp_all_gather_kv(v, cp_group)
             attn_output = self.attn(q, k, v, forward_batch)
@@ -646,6 +646,14 @@ class Qwen2MoeModel(nn.Module):
                 num_heads=self.config.num_attention_heads,
                 head_dim=head_dim,
             )
+            # if self.nsa_enable_prefill_cp:
+            #     if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+            #         forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            #             len(input_ids),
+            #             self.cp_rank,
+            #             self.cp_size,
+            #             forward_batch.seq_lens_cpu.tolist(),
+            #         )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
