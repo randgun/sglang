@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
-from sglang.srt.layers.attention.cp_utils import is_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,

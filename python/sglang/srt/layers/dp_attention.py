@@ -614,7 +614,7 @@ def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
 
     get_pcp_group().all_gather_into_tensor(all_shuffled_sensor, input_tensor)
 
-    splitted_tensor = list(torch.split(all_shuffled_sensor, forward_batch.nsa_cp_meatadata.max_rank_len, dim=0))
+    splitted_tensor = list(torch.split(all_shuffled_sensor, forward_batch.nsa_cp_metadata.max_rank_len, dim=0))
     output_tensor = torch.cat(
         [
             splitted_tensor[index][:per_rank_len]

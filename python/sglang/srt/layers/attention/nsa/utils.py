@@ -35,9 +35,6 @@ class ContextParallelMetadata:
     kv_len_next: int = -1
     actual_seq_q_prev: int = -1
     actual_seq_q_next: int = -1
-    q_head_num: Optional[int] = None  
-    kv_head_num: Optional[int] = None  
-    head_dim: Optional[int] = None  
     kv_len_prev_tensor: Optional[torch.Tensor] = None
     kv_len_next_tensor: Optional[torch.Tensor] = None
     actual_seq_q_prev_tensor: Optional[torch.Tensor] = None
@@ -75,6 +72,8 @@ def is_nsa_prefill_cp_round_robin_split():
         and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
     )
 
+def is_enable_prefill_cp():
+    return get_global_server_args().prefill_context_parallel_size > 1
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
@@ -442,12 +441,41 @@ def calculate_cp_seq_idx(cp_chunks_len, seqs_len):
     return tuple_len
 
 
+def _compute_attention_metadata(
+    cp_metadata,
+    device,
+    seq_per_batch,
+    head_start_global,
+    head_end_global,
+    tail_start_global,
+    tail_end_global
+):
+    """Compute attention metadata for prefill checkpointing."""
+    # Compute nomask seqlens
+    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
+    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
+    
+    # Compute indices using torch.arange for efficiency
+    kv_with_q_head_nomask_idx_tensor = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
+    kv_with_q_head_mask_idx_tensor = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
+    kv_with_q_tail_nomask_idx_tensor = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
+    kv_with_q_tail_mask_idx_tensor = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
+    
+    cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
+    cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
+    cp_metadata.kv_with_q_head_nomask_idx_tensor = kv_with_q_head_nomask_idx_tensor
+    cp_metadata.kv_with_q_head_mask_idx_tensor = kv_with_q_head_mask_idx_tensor
+    cp_metadata.kv_with_q_tail_nomask_idx_tensor = kv_with_q_tail_nomask_idx_tensor
+    cp_metadata.kv_with_q_tail_mask_idx_tensor = kv_with_q_tail_mask_idx_tensor
+    return cp_metadata
+
+
 def prepare_input_dp_with_cp_dsa(
     kv_len,
     cp_rank,
     cp_size,
     seqs_len,
-    device,
+    device
 ):
     if is_nsa_prefill_cp_round_robin_split():
         return True
@@ -533,9 +561,31 @@ def prepare_input_dp_with_cp_dsa(
                 )
             )
         )
-    mask_metadata = calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list,device)
 
+    prefix_offsets = [0] + list(accumulate(split_list))
+    head_chunk_id = cp_rank
+    tail_chunk_id = cp_segment_num - 1 - cp_rank
+    head_start_global = prefix_offsets[head_chunk_id]
+    head_end_global = prefix_offsets[head_chunk_id + 1]
+    tail_start_global = prefix_offsets[tail_chunk_id]
+    tail_end_global = prefix_offsets[tail_chunk_id + 1]
+    kv_len_prev = head_start_global
+    kv_len_next = tail_start_global
+    actual_seq_q_prev = split_list[head_chunk_id]
+    actual_seq_q_next = split_list[tail_chunk_id]
 
+    kv_len_prev = head_start_global
+    kv_len_next = tail_start_global
+    actual_seq_q_prev = split_list[head_chunk_id]
+    actual_seq_q_next = split_list[tail_chunk_id]
+    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device=device, dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next).to(device=device, dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(
+        device=device, dtype=torch.int32
+    )
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
+        device=device, dtype=torch.int32
+    )    
     cp_metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
@@ -543,113 +593,28 @@ def prepare_input_dp_with_cp_dsa(
         per_rank_actual_token=per_rank_actual_token,
         reverse_split_len=reverse_split_len,
         cp_reverse_index=cp_reverse_index,
-        kv_len_prev=mask_metadata.kv_len_prev,
-        kv_len_next=mask_metadata.kv_len_next,
-        actual_seq_q_prev=mask_metadata.actual_seq_q_prev,
-        actual_seq_q_next=mask_metadata.actual_seq_q_next,
-        kv_len_prev_tensor=mask_metadata.kv_len_prev_tensor,
-        kv_len_next_tensor=mask_metadata.kv_len_next_tensor,
-        actual_seq_q_prev_tensor=mask_metadata.actual_seq_q_prev_tensor,
-        actual_seq_q_next_tensor=mask_metadata.actual_seq_q_next_tensor,
-        total_seq_lens=kv_len_origin,
-        # new param with mask
-        kv_with_q_head_nomask_idx=mask_metadata.kv_with_q_head_nomask_idx,
-        kv_with_q_head_mask_idx=mask_metadata.kv_with_q_head_mask_idx,
-        kv_with_q_tail_nomask_idx=mask_metadata.kv_with_q_tail_nomask_idx,
-        kv_with_q_tail_mask_idx=mask_metadata.kv_with_q_tail_mask_idx,
-        head_attn_nomask_seqlens=mask_metadata.head_attn_nomask_seqlens,
-        tail_attn_nomask_seqlens=mask_metadata.tail_attn_nomask_seqlens,
-        attn_mask_seqlens=mask_metadata.attn_mask_seqlens,
-    )
-    return cp_metadata
-
-@dataclass
-class MaskMetaData:
-    kv_with_q_head_nomask_idx: torch.Tensor
-    kv_with_q_head_mask_idx: torch.Tensor
-    kv_with_q_tail_nomask_idx: torch.Tensor
-    kv_with_q_tail_mask_idx: torch.Tensor
-    head_attn_nomask_seqlens: torch.Tensor
-    tail_attn_nomask_seqlens: torch.Tensor
-    attn_mask_seqlens: torch.Tensor
-    kv_len_prev_tensor: torch.Tensor
-    kv_len_next_tensor: torch.Tensor
-    actual_seq_q_prev_tensor: torch.Tensor
-    actual_seq_q_next_tensor: torch.Tensor
-    kv_len_prev: int
-    kv_len_next: int
-    actual_seq_q_prev: int
-    actual_seq_q_next: int
-
-def calculate_cp_metadata(cp_rank,cp_segment_num,seq_per_batch,split_list,device):
-    prefix_offsets = [0] + list(accumulate(split_list))
-
-    head_chunk_id = cp_rank
-
-    tail_chunk_id = cp_segment_num - 1 - cp_rank
-
-    head_start_global = prefix_offsets[head_chunk_id]
-    head_end_global = prefix_offsets[head_chunk_id + 1]
-    tail_start_global = prefix_offsets[tail_chunk_id]
-    tail_end_global = prefix_offsets[tail_chunk_id + 1]
-    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32)
-    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32)
-    kv_len_prev = head_start_global
-    kv_len_next = tail_start_global
-    actual_seq_q_prev = split_list[head_chunk_id]
-    actual_seq_q_next = split_list[tail_chunk_id]
-    # [新增] Attn Mask Seqlens (Tensor)
-    # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用 通常 Ascend 算子需要 int32 类型的 Tensor
-    attn_mask_seqlens_tensor = torch.tensor(
-        [[actual_seq_q_prev], [actual_seq_q_next]], dtype=torch.int32
-    )
-    kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx = [], []
-    kv_with_q_tail_nomask_idx, kv_with_q_tail_mask_idx = [], []
-    kv_with_q_head_nomask_idx.extend(
-        list(range(0, head_start_global))
-    )
-    kv_with_q_head_mask_idx.extend(
-        list(range(head_start_global, head_end_global))
-    )
-    kv_with_q_tail_nomask_idx.extend(
-        list(range(0, tail_start_global))
-    )
-    kv_with_q_tail_mask_idx.extend(
-        list(range(tail_start_global, tail_end_global))
-
-    )
-    kv_with_q_head_nomask_idx_tensor = torch.tensor(kv_with_q_head_nomask_idx, dtype=torch.int32)
-    kv_with_q_head_mask_idx_tensor = torch.tensor(kv_with_q_head_mask_idx, dtype=torch.int32)
-    kv_with_q_tail_nomask_idx_tensor = torch.tensor(kv_with_q_tail_nomask_idx, dtype=torch.int32)
-    kv_with_q_tail_mask_idx_tensor = torch.tensor(kv_with_q_tail_mask_idx, dtype=torch.int32)
-    # Head Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
-    # kv_with_q_head_nomask_idx = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
-    # kv_with_q_head_mask_idx = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
-    # Tail Chunk: [0, start) 是 nomask, [start, end) 是 causal mask
-    # kv_with_q_tail_nomask_idx = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
-    # kv_with_q_tail_mask_idx = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
-    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(dtype=torch.int32, device=device)
-    kv_len_next_tensor = torch.tensor(kv_len_next).to(dtype=torch.int32, device=device)
-    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(dtype=torch.int32, device=device)
-    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(dtype=torch.int32, device=device)
-    
-    return MaskMetaData(
-        kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx_tensor,
-        kv_with_q_head_mask_idx=kv_with_q_head_mask_idx_tensor,
-        kv_with_q_tail_nomask_idx=kv_with_q_tail_nomask_idx_tensor,
-        kv_with_q_tail_mask_idx=kv_with_q_tail_mask_idx_tensor,
-        head_attn_nomask_seqlens=head_attn_nomask_seqlens,
-        tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
-        attn_mask_seqlens=attn_mask_seqlens_tensor,
-        kv_len_prev_tensor=kv_len_prev_tensor,
-        kv_len_next_tensor=kv_len_next_tensor,
-        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
-        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         kv_len_prev=kv_len_prev,
         kv_len_next=kv_len_next,
         actual_seq_q_prev=actual_seq_q_prev,
         actual_seq_q_next=actual_seq_q_next,
+        kv_len_prev_tensor=kv_len_prev_tensor,
+        kv_len_next_tensor=kv_len_next_tensor,
+        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
+        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
+        total_seq_lens=kv_len_origin,
     )
-
-def is_enable_prefill_cp():
-    return get_global_server_args().prefill_context_parallel_size > 1
+    if is_enable_prefill_cp():
+        return _compute_attention_metadata(
+            cp_metadata,
+            device=device,
+            seq_per_batch=seq_per_batch,
+            head_start_global=head_start_global,
+            head_end_global=head_end_global,
+            tail_start_global=tail_start_global,
+            tail_end_global=tail_end_global,
+            kv_len_prev=kv_len_prev,
+            kv_len_next=kv_len_next,
+            actual_seq_q_prev=actual_seq_q_prev,
+            actual_seq_q_next=actual_seq_q_next,
+        )
+    return cp_metadata

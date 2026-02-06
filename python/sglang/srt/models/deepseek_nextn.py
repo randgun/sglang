@@ -238,6 +238,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                    input_ids.device,
                 )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
