@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 from typing import TYPE_CHECKING, List, Optional
 
@@ -35,11 +36,14 @@ from .moe_align_block_size import moe_align_block_size
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
+logger = logging.getLogger(__name__)
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_moe_diag_log = get_bool_env_var("SGLANG_MOE_DIAG_LOG")
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
@@ -348,6 +352,18 @@ def fused_experts_impl(
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
+    if _moe_diag_log:
+        logger.info(
+            "MoE fused input: hs=%s topk_ids=%s topk_weights=%s w1=%s w2=%s act=%s gated=%s",
+            tuple(hidden_states.shape),
+            tuple(topk_ids.shape),
+            tuple(topk_weights.shape),
+            tuple(w1.shape),
+            tuple(w2.shape),
+            activation,
+            is_gated,
+        )
+
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     # We execute the fused_moe kernel in chunks to circumvent this issue:
@@ -418,6 +434,17 @@ def fused_experts_impl(
         if tokens_in_chunk == 0:
             break
 
+        if _moe_diag_log and (chunk == 0 or end_chunk_idx == num_tokens):
+            logger.info(
+                "MoE chunk=%d range=[%d,%d) tokens=%d hidden=%d topk=%d",
+                chunk,
+                begin_chunk_idx,
+                end_chunk_idx,
+                tokens_in_chunk,
+                curr_hidden_states.shape[1],
+                topk,
+            )
+
         if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
             # Adjust the intermediate cache size and config for the last
             # chunk. Note that in most cases we only have one chunk
@@ -448,6 +475,19 @@ def fused_experts_impl(
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+
+        if _moe_diag_log and (
+            curr_topk_ids.shape[0] != tokens_in_chunk
+            or curr_topk_weights.shape[0] != tokens_in_chunk
+        ):
+            logger.warning(
+                "MoE chunk token mismatch: tokens=%d topk_ids=%s topk_weights=%s range=[%d,%d)",
+                tokens_in_chunk,
+                tuple(curr_topk_ids.shape),
+                tuple(curr_topk_weights.shape),
+                begin_chunk_idx,
+                end_chunk_idx,
+            )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             curr_topk_ids, config["BLOCK_SIZE_M"], E

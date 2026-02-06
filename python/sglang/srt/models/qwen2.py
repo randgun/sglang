@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -38,6 +39,13 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.attention.cp_utils import (
+    cp_all_gather_kv,
+    cp_rebuild_tensor_by_zigzag,
+    cp_split_tensor_by_zigzag,
+    is_enable_prefill_cp,
+    prepare_qwen_cp_metadata,
+)
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -183,8 +191,22 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            cp_group = get_pcp_group()
+            cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
+            k_global = cp_all_gather_kv(k, cp_group, cuda_stream)
+            v_global = cp_all_gather_kv(v, cp_group, cuda_stream)
+            attn_output = self.attn(q, k_global, v_global, forward_batch)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -340,7 +362,24 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
+        if (
+            forward_batch.gqa_cp_metadata is None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            cp_group = get_pcp_group()
+            head_dim = getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            )
+            forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
+                seq_len=len(input_ids),
+                cp_rank=cp_group.rank_in_group,
+                cp_size=cp_group.world_size,
+                num_heads=self.config.num_attention_heads,
+                head_dim=head_dim,
+            )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -351,6 +390,19 @@ class Qwen2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            metadata = forward_batch.gqa_cp_metadata
+            hidden_states = cp_split_tensor_by_zigzag(
+                hidden_states, metadata.split_list, metadata.zigzag_index
+            )
+            positions = cp_split_tensor_by_zigzag(
+                positions.unsqueeze(-1), metadata.split_list, metadata.zigzag_index
+            ).squeeze(-1)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
@@ -378,6 +430,20 @@ class Qwen2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+
+            if (
+                forward_batch.gqa_cp_metadata is not None
+                and is_enable_prefill_cp()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            ):
+                metadata = forward_batch.gqa_cp_metadata
+                hidden_states = cp_rebuild_tensor_by_zigzag(
+                    hidden_states, metadata.reverse_split_len, metadata.cp_reverse_index
+                )
+                if residual is not None:
+                    residual = cp_rebuild_tensor_by_zigzag(
+                        residual, metadata.reverse_split_len, metadata.cp_reverse_index
+                    )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

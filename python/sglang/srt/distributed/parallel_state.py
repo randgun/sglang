@@ -1384,6 +1384,7 @@ _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
 _ENABLE_PDMUX_P_TP: bool = False
 
+_PCP: Optional[GroupCoordinator] = None
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
@@ -1413,6 +1414,11 @@ def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
 
+def get_pcp_group() -> GroupCoordinator:
+    assert _PCP is not None, "pipeline model parallel group is not initialized"
+    return _PCP
+
+    
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
@@ -1541,6 +1547,7 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -1680,6 +1687,27 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
     )
+    global _PCP
+    pcp_tp_size = tensor_model_parallel_size // prefill_context_parallel_size
+    assert pcp_tp_size >= 1, (
+        "Invalid PCP TP size: tensor_model_parallel_size must be >= "
+        "prefill_context_parallel_size, "
+        f"got tensor_model_parallel_size={tensor_model_parallel_size}, "
+        f"prefill_context_parallel_size={prefill_context_parallel_size}, "
+        f"pcp_tp_size={pcp_tp_size}"
+    )
+    group_ranks = [
+        list(range(i, get_world_size(), pcp_tp_size)) for i in range(pcp_tp_size)
+    ]
+    _PCP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_custom_allreduce= False,
+        group_name="pcp_tp",
+    )
+
+    
 
 
 def create_custom_parallel_group(
@@ -1846,6 +1874,13 @@ def get_moe_tensor_parallel_rank():
     """Return my rank for the moe tensor parallel group."""
     return get_moe_tp_group().rank_in_group
 
+def get_context_parallel_world_size():
+    """Return world size for the context parallel group."""
+    return get_pcp_group().world_size
+
+def get_context_parallel_rank():
+    """Return my rank for the context parallel group."""
+    return get_pcp_group().rank_in_group
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""

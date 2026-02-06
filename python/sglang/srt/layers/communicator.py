@@ -566,10 +566,15 @@ class LayerCommunicator:
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
+        dp_padding_mode = forward_batch.dp_padding_mode
+        is_dp_max_padding = (
+            dp_padding_mode is not None and dp_padding_mode.is_max_len()
+        )
+
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
-            and forward_batch.dp_padding_mode.is_max_len()
+            and is_dp_max_padding
         ):
             return True
         if nsa_use_prefill_cp(forward_batch):
@@ -799,6 +804,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
+            if hidden_states.shape[0] == 0:
+                return hidden_states, residual
             if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
                 layernorm, "forward_with_allreduce_fusion"
             ):
@@ -924,11 +931,19 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
+        dp_padding_mode = forward_batch.dp_padding_mode
+        is_dp_max_padding = (
+            dp_padding_mode is not None and dp_padding_mode.is_max_len()
+        )
+        if forward_batch.global_dp_buffer_len is None:
+            hidden_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
+            return hidden_states, residual
+
         hidden_states, global_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,
-        )
-        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        )        
+        if allow_reduce_scatter and is_dp_max_padding:
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:

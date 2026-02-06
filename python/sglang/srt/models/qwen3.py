@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -19,6 +20,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.attention.cp_utils import cp_all_gather_kv, is_enable_prefill_cp
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -197,7 +199,17 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            cp_group = get_pcp_group()
+            k_global = cp_all_gather_kv(k, cp_group)
+            v_global = cp_all_gather_kv(v, cp_group)
+            attn_output = self.attn(q, k_global, v_global, forward_batch)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 

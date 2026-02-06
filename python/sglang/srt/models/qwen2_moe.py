@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
+    get_pcp_group,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -36,6 +37,13 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.cp_utils import (
+    cp_all_gather_kv,
+    cp_rebuild_tensor_by_zigzag,
+    cp_split_tensor_by_zigzag,
+    is_enable_prefill_cp,
+    prepare_qwen_cp_metadata,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -422,7 +430,19 @@ class Qwen2MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            cp_group = get_pcp_group()
+            cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
+            k = cp_all_gather_kv(k, cp_group, cuda_stream)
+            v = cp_all_gather_kv(v, cp_group, cuda_stream)
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -612,6 +632,32 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if (
+                forward_batch.gqa_cp_metadata is None
+                and is_enable_prefill_cp()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            ):
+            cp_group = get_pcp_group()
+            head_dim = getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            )
+            forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
+                seq_len=len(input_ids),
+                cp_rank=cp_group.rank_in_group,
+                cp_size=cp_group.world_size,
+                num_heads=self.config.num_attention_heads,
+                head_dim=head_dim,
+            )
+            # if self.nsa_enable_prefill_cp:
+            #     if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+            #         forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            #             len(input_ids),
+            #             self.cp_rank,
+            #             self.cp_size,
+            #             forward_batch.seq_lens_cpu.tolist(),
+            #         )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -622,6 +668,18 @@ class Qwen2MoeModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            metadata = forward_batch.gqa_cp_metadata
+            hidden_states = cp_split_tensor_by_zigzag(
+                hidden_states, metadata.split_list, metadata.zigzag_index
+            )
+            positions = cp_split_tensor_by_zigzag(
+                positions.unsqueeze(-1), metadata.split_list, metadata.zigzag_index
+            ).squeeze(-1)
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -667,6 +725,24 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+            if (
+                forward_batch.gqa_cp_metadata is not None
+                and is_enable_prefill_cp()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            ):
+                metadata = forward_batch.gqa_cp_metadata
+                hidden_states = cp_rebuild_tensor_by_zigzag(
+                    hidden_states,
+                    metadata.reverse_split_len,
+                    metadata.cp_reverse_index,
+                )
+                if residual is not None:
+                    residual = cp_rebuild_tensor_by_zigzag(
+                        residual,
+                        metadata.reverse_split_len,
+                        metadata.cp_reverse_index,
+                    )
+
 
         if len(aux_hidden_states) == 0:
             return hidden_states
