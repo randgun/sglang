@@ -81,6 +81,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
@@ -101,6 +102,7 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_qwen3_moe_diag_log = get_bool_env_var("SGLANG_QWEN3_MOE_DIAG_LOG")
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -513,6 +515,14 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
+    def _should_log_diag(self) -> bool:
+        if not _qwen3_moe_diag_log:
+            return False
+        num_layers = getattr(self.config, "num_hidden_layers", None)
+        return self.attn.layer_id == 0 or (
+            num_layers is not None and self.attn.layer_id == num_layers - 1
+        )
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -532,6 +542,14 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
+        if self._should_log_diag():
+            logger.info(
+                "Qwen3Moe attn L%d NPU prepare: hs=%s qkv=%s pos=%s",
+                self.attn.layer_id,
+                tuple(hidden_states.shape),
+                tuple(qkv.shape),
+                tuple(positions.shape),
+            )
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
@@ -558,8 +576,25 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
+        if self._should_log_diag():
+            logger.info(
+                "Qwen3Moe attn L%d prepare: hs=%s qkv=%s pos=%s",
+                self.attn.layer_id,
+                tuple(hidden_states.shape),
+                tuple(qkv.shape),
+                tuple(positions.shape),
+            )
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
+        if self._should_log_diag():
+            logger.info(
+                "Qwen3Moe attn L%d qkv split: q=%s k=%s v=%s fused_qk_norm_rope=%s",
+                self.attn.layer_id,
+                tuple(q.shape),
+                tuple(k.shape),
+                tuple(v.shape),
+                self._used_fused_qk_norm_rope_last_call,
+            )
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -660,8 +695,19 @@ class Qwen3MoeAttention(nn.Module):
         ):
             cp_group = get_pcp_group()
             cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
+            k_before, v_before = tuple(k.shape), tuple(v.shape)
             k = cp_all_gather_kv(k, cp_group, cuda_stream)
             v = cp_all_gather_kv(v, cp_group, cuda_stream)
+            if self._should_log_diag():
+                logger.info(
+                    "Qwen3Moe attn L%d cp_all_gather_kv: q=%s k=%s->%s v=%s->%s",
+                    self.attn.layer_id,
+                    tuple(q.shape),
+                    k_before,
+                    tuple(k.shape),
+                    v_before,
+                    tuple(v.shape),
+                )
             attn_output = self.attn(q, k, v, fb, save_kv_cache=save_kv_cache)
         else:
             attn_output = self.attn(
@@ -672,6 +718,14 @@ class Qwen3MoeAttention(nn.Module):
                 save_kv_cache=save_kv_cache,
             )
         output, _ = self.o_proj(attn_output)
+        if self._should_log_diag():
+            logger.info(
+                "Qwen3Moe attn L%d output: attn=%s out=%s save_kv_cache=%s",
+                self.attn.layer_id,
+                tuple(attn_output.shape),
+                tuple(output.shape),
+                save_kv_cache,
+            )
         return output
 
     def forward(
