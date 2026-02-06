@@ -804,6 +804,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
+            if hidden_states.shape[0] == 0:
+                return hidden_states, residual
             if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
                 layernorm, "forward_with_allreduce_fusion"
             ):
