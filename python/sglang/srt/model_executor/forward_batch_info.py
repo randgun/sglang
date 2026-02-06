@@ -44,7 +44,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.attention.cp_utils import ContextParallelMetadata
+from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
