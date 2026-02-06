@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -37,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 
 
 def nsa_enable_prefill_cp():
@@ -161,7 +163,8 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 hidden_states,
                 local_hidden_states,
             )
-        return hidden_states, residual
+            return hidden_states, residual
+        
 
 
 class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
@@ -196,6 +199,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        layer_norm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
     ):
         # for prefill: full -> attn tp scattered
@@ -207,4 +211,9 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                 context.attn_tp_rank
             ]
             attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
-        return hidden_states, residual
+            return hidden_states, residual
+        elif is_enable_prefill_cp():
+            if hidden_states.shape[0] != 0:
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                hidden_states, residual = layer_norm(hidden_states, residual)
+            return hidden_states, residual
