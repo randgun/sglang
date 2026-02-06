@@ -42,7 +42,9 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.attention.cp_utils import (
     cp_all_gather_kv,
+    cp_rebuild_tensor_by_zigzag,
     is_enable_prefill_cp,
+    prepare_qwen_cp_metadata,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
@@ -701,6 +703,13 @@ class Qwen3MoeAttention(nn.Module):
             k_before, v_before = tuple(k.shape), tuple(v.shape)
             k = cp_all_gather_kv(k, cp_group, cuda_stream)
             v = cp_all_gather_kv(v, cp_group, cuda_stream)
+            metadata = forward_batch.gqa_cp_metadata
+            k = cp_rebuild_tensor_by_zigzag(
+                k, metadata.reverse_split_len, metadata.cp_reverse_index
+            )
+            v = cp_rebuild_tensor_by_zigzag(
+                v, metadata.reverse_split_len, metadata.cp_reverse_index
+            )
             if self._should_log_diag():
                 logger.info(
                     "Qwen3Moe attn L%d cp_all_gather_kv: q=%s k=%s->%s v=%s->%s",
@@ -1001,6 +1010,24 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if (
+            forward_batch.gqa_cp_metadata is None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            cp_group = get_pcp_group()
+            head_dim = getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            )
+            forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
+                seq_len=len(input_ids),
+                cp_rank=cp_group.rank_in_group,
+                cp_size=cp_group.world_size,
+                num_heads=self.config.num_attention_heads,
+                head_dim=head_dim,
+            )
         hidden_states = self.model(
             input_ids,
             positions,
