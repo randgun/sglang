@@ -633,3 +633,39 @@ def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
     return outputs
+
+
+def pcp_gqa_ag_rearange_output(input_tensor,pcp_size,forward_batch):
+    max_len = forward_batch.gqa_cp_metadata.max_rank_len[0]
+
+    pad_size = max_len - input_tensor.shape[0]
+    if pad_size > 0:
+        input_tensor = F.pad(input_tensor, (0, 0, 0, pad_size),mode="constant",value=0)
+    all_shuffled_sensor = torch.empty(
+        max_len * pcp_size,
+        input_tensor.shape[-1],
+        dtype=input_tensor.dtype,
+        device=input_tensor.device,
+    )
+
+    get_pcp_group().all_gather_into_tensor(all_shuffled_sensor, input_tensor)
+
+    splitted_tensor = list(torch.split(all_shuffled_sensor, forward_batch.gqa_cp_metadata.max_rank_len, dim=0))
+    output_tensor = torch.cat(
+        [
+            splitted_tensor[index][:per_rank_len]
+            for index, per_rank_len in enumerate(
+                forward_batch.gqa_cp_metadata.per_rank_actual_token
+            )
+        ],
+        dim=0,
+    )
+    outputs_list = list(
+        torch.split(
+            output_tensor, forward_batch.gqa_cp_metadata.reverse_split_len, dim=0
+        )
+    )
+    outputs = torch.cat(
+        [outputs_list[i] for i in forward_batch.gqa_cp_metadata.cp_reverse_index], dim=0
+    )
+    return outputs

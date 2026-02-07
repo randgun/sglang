@@ -41,12 +41,11 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
 )
 from sglang.srt.layers.attention.cp_utils import (
-    cp_all_gather_kv,
     cp_rebuild_tensor_by_zigzag,
     is_enable_prefill_cp,
     prepare_qwen_cp_metadata,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size,pcp_ag_rearange_output
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size,pcp_gqa_ag_rearange_output
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -702,8 +701,8 @@ class Qwen3MoeAttention(nn.Module):
             cp_group = get_pcp_group()
             cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
             k_before, v_before = tuple(k.shape), tuple(v.shape)
-            k = pcp_ag_rearange_output(k, self.cp_size, cuda_stream)
-            v = pcp_ag_rearange_output(v, cp_group.size, cuda_stream)
+            k = pcp_gqa_ag_rearange_output(k, self.cp_size, cuda_stream)
+            v = pcp_gqa_ag_rearange_output(v, cp_group.size, cuda_stream)
             metadata = forward_batch.gqa_cp_metadata
             k = cp_rebuild_tensor_by_zigzag(
                 k, metadata.reverse_split_len, metadata.cp_reverse_index
