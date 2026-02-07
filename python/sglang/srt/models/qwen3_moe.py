@@ -45,7 +45,7 @@ from sglang.srt.layers.attention.cp_utils import (
     is_enable_prefill_cp,
     prepare_qwen_cp_metadata,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size,pcp_gqa_ag_rearange_output
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size,pcp_gqa_ag_rearange_output,get_pcp_rank
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -458,7 +458,7 @@ class Qwen3MoeAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.cp_size = get_pcp_size()
+        self.pcp_size = get_pcp_size()
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -700,7 +700,7 @@ class Qwen3MoeAttention(nn.Module):
         ):
             cp_group = get_pcp_group()
             k_before, v_before = tuple(k.shape), tuple(v.shape)
-            k = pcp_gqa_ag_rearange_output(k, self.cp_size, forward_batch)
+            k = pcp_gqa_ag_rearange_output(k, self.pcp_size, forward_batch)
             v = pcp_gqa_ag_rearange_output(v, cp_group.size, forward_batch)
             metadata = forward_batch.gqa_cp_metadata
             k = cp_rebuild_tensor_by_zigzag(
@@ -984,6 +984,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
+        self.pcp_rank = get_pcp_rank()
+        self.pcp_size = get_pcp_size()
         self.quant_config = quant_config
         self.model = Qwen3MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1034,8 +1036,8 @@ class Qwen3MoeForCausalLM(nn.Module):
             )
             forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
                 seq_len=seq_len_total,
-                cp_rank=cp_group.rank_in_group,
-                cp_size=cp_group.world_size,
+                cp_rank=self.pcp_rank,
+                cp_size=self.pcp_size,
                 num_heads=self.config.num_attention_heads,
                 head_dim=head_dim,
             )
