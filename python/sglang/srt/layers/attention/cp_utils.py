@@ -391,6 +391,20 @@ def cp_rebuild_tensor_by_zigzag(
     """
     except_len = sum(reverse_split_len)
     if except_len != tensor.shape[0]:
+        if _cp_diag_log:
+            logger.info(
+                "CP rebuild zigzag skip: expected_len=%d actual_len=%d",
+                int(except_len),
+                int(tensor.shape[0]),
+            )
+        return tensor
+    if len(cp_reverse_index) != len(reverse_split_len):
+        if _cp_diag_log:
+            logger.info(
+                "CP rebuild zigzag skip: reverse_index_len=%d split_len=%d",
+                int(len(cp_reverse_index)),
+                int(len(reverse_split_len)),
+            )
         return tensor
     tensor_list = list(torch.split(tensor, reverse_split_len, dim=0))
     reordered = [tensor_list[i] for i in cp_reverse_index]
