@@ -389,6 +389,9 @@ def cp_rebuild_tensor_by_zigzag(
     Returns:
         torch.Tensor: Rebuilt tensor in original token order
     """
+    except_len = sum(reverse_split_len)
+    if except_len != tensor.shape[0]:
+        return tensor
     tensor_list = list(torch.split(tensor, reverse_split_len, dim=0))
     reordered = [tensor_list[i] for i in cp_reverse_index]
     out = torch.cat(reordered, dim=0)
