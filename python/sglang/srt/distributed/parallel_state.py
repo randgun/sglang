@@ -731,6 +731,7 @@ class GroupCoordinator:
             ):
                 pynccl_comm.all_gather(output, input)
         else:
+            print(f"+++ {output.shape=} {input.shape=} {self.device_group.world_size=}")
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
             )

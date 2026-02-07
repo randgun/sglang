@@ -695,13 +695,13 @@ class Qwen2MoeModel(nn.Module):
                 and forward_batch.forward_mode.is_context_parallel_extend()
             ):
                 metadata = forward_batch.gqa_cp_metadata
-                hidden_states = cp_rebuild_tensor_by_zigzag(
+                hidden_states = cp_split_tensor_by_zigzag(
                     hidden_states,
                     metadata.reverse_split_len,
                     metadata.cp_reverse_index,
                 )
                 if residual is not None:
-                    residual = cp_rebuild_tensor_by_zigzag(
+                    residual = cp_split_tensor_by_zigzag(
                         residual,
                         metadata.reverse_split_len,
                         metadata.cp_reverse_index,

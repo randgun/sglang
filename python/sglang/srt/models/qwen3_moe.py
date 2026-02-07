@@ -591,6 +591,25 @@ class Qwen3MoeAttention(nn.Module):
             )
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            print(f"+++ forward_core, pcp_size={self.pcp_size}")
+            k = pcp_gqa_ag_rearange_output(k, self.pcp_size, forward_batch)
+            v = pcp_gqa_ag_rearange_output(v, self.pcp_size, forward_batch)           
+            if self._should_log_diag():
+                logger.info(
+                    "Qwen3Moe attn L%d cp_all_gather_kv: q=%s k=%s->%s v=%s->%s",
+                    self.attn.layer_id,
+                    tuple(q.shape),
+                    k,
+                    tuple(k.shape),
+                    v,
+                    tuple(v.shape),
+                )
+
         if self._should_log_diag():
             logger.info(
                 "Qwen3Moe attn L%d qkv split: q=%s k=%s v=%s fused_qk_norm_rope=%s",
@@ -692,34 +711,14 @@ class Qwen3MoeAttention(nn.Module):
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
-        # RadixAttention expects Q/K/V in [tokens, num_heads * head_dim].
-        if (
-            forward_batch.gqa_cp_metadata is not None
-            and is_enable_prefill_cp()
-            and forward_batch.forward_mode.is_context_parallel_extend()
-        ):
-            k_before, v_before = tuple(k.shape), tuple(v.shape)
-            k = pcp_gqa_ag_rearange_output(k, self.pcp_size, forward_batch)
-            v = pcp_gqa_ag_rearange_output(v, self.pcp_size, forward_batch)           
-            if self._should_log_diag():
-                logger.info(
-                    "Qwen3Moe attn L%d cp_all_gather_kv: q=%s k=%s->%s v=%s->%s",
-                    self.attn.layer_id,
-                    tuple(q.shape),
-                    k_before,
-                    tuple(k.shape),
-                    v_before,
-                    tuple(v.shape),
-                )
-            attn_output = self.attn(q, k, v, fb, save_kv_cache=save_kv_cache)
-        else:
-            attn_output = self.attn(
-                q,
-                k,
-                v,
-                fb,
-                save_kv_cache=save_kv_cache,
-            )
+        # RadixAttention expects Q/K/V in [tokens, num_heads * head_dim]
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            fb,
+            save_kv_cache=save_kv_cache,
+        )
         output, _ = self.o_proj(attn_output)
         if self._should_log_diag():
             # Qwen3Moe attn L0 output: attn=(59, 2048) out=(59, 4096) save_kv_cache=True
