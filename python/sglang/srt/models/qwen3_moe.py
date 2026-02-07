@@ -1028,23 +1028,6 @@ class Qwen3MoeForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if (
-                forward_batch.gqa_cp_metadata is not None
-                and is_enable_prefill_cp()
-                and forward_batch.forward_mode.is_context_parallel_extend()
-            ):
-                metadata = forward_batch.gqa_cp_metadata
-                hidden_states = cp_split_tensor_by_zigzag(
-                    hidden_states,
-                    metadata.reverse_split_len,
-                    metadata.cp_reverse_index,
-                )
-                if self._should_log_diag():
-                    logger.info(
-                        "Qwen2Moe Model L%d qkv split: hidden_states=%s",
-                        self.attn.layer_id,
-                        tuple(hidden_states.shape),
-                    )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
