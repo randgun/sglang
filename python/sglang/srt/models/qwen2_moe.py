@@ -688,24 +688,7 @@ class Qwen2MoeModel(nn.Module):
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
-            if (
-                forward_batch.gqa_cp_metadata is not None
-                and is_enable_prefill_cp()
-                and forward_batch.forward_mode.is_context_parallel_extend()
-            ):
-                metadata = forward_batch.gqa_cp_metadata
-                hidden_states = cp_split_tensor_by_zigzag(
-                    hidden_states,
-                    metadata.reverse_split_len,
-                    metadata.cp_reverse_index,
-                )
-                if residual is not None:
-                    residual = cp_split_tensor_by_zigzag(
-                        residual,
-                        metadata.reverse_split_len,
-                        metadata.cp_reverse_index,
-                    )
+                    hidden_states, _ = self.norm(hidden_states, residual)        
 
 
         if len(aux_hidden_states) == 0:

@@ -44,6 +44,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.attention.cp_utils import (
     is_enable_prefill_cp,
     prepare_qwen_cp_metadata,
+    cp_split_tensor_by_zigzag
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size,pcp_gqa_ag_rearange_output,get_pcp_rank
 from sglang.srt.layers.layernorm import RMSNorm
@@ -609,17 +610,6 @@ class Qwen3MoeAttention(nn.Module):
                     v,
                     tuple(v.shape),
                 )
-
-        if self._should_log_diag():
-            logger.info(
-                "Qwen3Moe attn L%d qkv split: q=%s k=%s v=%s fused_qk_norm_rope=%s",
-                self.attn.layer_id,
-                tuple(q.shape),
-                tuple(k.shape),
-                tuple(v.shape),
-                self._used_fused_qk_norm_rope_last_call,
-            )
-
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -1038,6 +1028,23 @@ class Qwen3MoeForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if (
+                forward_batch.gqa_cp_metadata is not None
+                and is_enable_prefill_cp()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            ):
+                metadata = forward_batch.gqa_cp_metadata
+                hidden_states = cp_split_tensor_by_zigzag(
+                    hidden_states,
+                    metadata.reverse_split_len,
+                    metadata.cp_reverse_index,
+                )
+                if self._should_log_diag():
+                    logger.info(
+                        "Qwen2Moe Model L%d qkv split: hidden_states=%s",
+                        self.attn.layer_id,
+                        tuple(hidden_states.shape),
+                    )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
