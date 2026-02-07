@@ -127,9 +127,10 @@ def prepare_qwen_cp_metadata(
     # kv_len = torch.tensor(kv_len)
     # bs_per_cp_group = 1
     # kv_len_origin = kv_len
-    seq_len = torch.tensor(seq_len)
+    seq_len_value = int(seq_len)
+    seq_len = torch.tensor(seq_len_value)
     bs_per_cp_group = 1
-    seq_len_origin = seq_len
+    seq_len_origin = seq_len_value
 
     cp_segment_num = cp_size * 2
     seq_per_batch = seq_len // cp_segment_num
@@ -309,4 +310,3 @@ def cp_rebuild_tensor_by_zigzag(
 
 def is_enable_prefill_cp():
     return get_global_server_args().prefill_context_parallel_size > 1
-

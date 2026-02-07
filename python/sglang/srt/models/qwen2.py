@@ -363,9 +363,12 @@ class Qwen2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if (
-            forward_batch.gqa_cp_metadata is None
-            and is_enable_prefill_cp()
+            is_enable_prefill_cp()
             and forward_batch.forward_mode.is_context_parallel_extend()
+            and (
+                forward_batch.gqa_cp_metadata is None
+                or forward_batch.gqa_cp_metadata.total_seq_lens != len(input_ids)
+            )
         ):
             cp_group = get_pcp_group()
             head_dim = getattr(
