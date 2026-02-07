@@ -53,6 +53,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    pcp_ag_rearange_output,
+    get_pcp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -376,6 +378,7 @@ class Qwen2MoeAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.cp_size = get_pcp_size()
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -438,8 +441,8 @@ class Qwen2MoeAttention(nn.Module):
         ):
             cp_group = get_pcp_group()
             cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
-            k = cp_all_gather_kv(k, cp_group, cuda_stream)
-            v = cp_all_gather_kv(v, cp_group, cuda_stream)
+            k = pcp_ag_rearange_output(k, self.cp_size, cuda_stream)
+            v = pcp_ag_rearange_output(v, self.cp_size, cuda_stream)
             attn_output = self.attn(q, k, v, forward_batch)
         else:
             attn_output = self.attn(q, k, v, forward_batch)

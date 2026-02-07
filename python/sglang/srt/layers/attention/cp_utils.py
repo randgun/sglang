@@ -263,12 +263,12 @@ def prepare_qwen_cp_metadata(
     tail_start_global = prefix_offsets[tail_chunk_id]
     tail_end_global = prefix_offsets[tail_chunk_id + 1]
 
-    # Attention mask 的序列长度信息 [seq_per_batch, start_global]
+    # Attention mask 的序列长度信息 [chunk_len, start_global]
     head_attn_nomask_seqlens = torch.tensor(
-        [[seq_per_batch], [head_start_global]], dtype=torch.int32, device=device
+        [[actual_seq_q_prev], [head_start_global]], dtype=torch.int32, device=device
     )
     tail_attn_nomask_seqlens = torch.tensor(
-        [[seq_per_batch], [tail_start_global]], dtype=torch.int32, device=device
+        [[actual_seq_q_next], [tail_start_global]], dtype=torch.int32, device=device
     )
 
     # 包含 Head 和 Tail 两个 block 的长度，供算子 batch 处理使用

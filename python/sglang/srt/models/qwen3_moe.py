@@ -46,7 +46,7 @@ from sglang.srt.layers.attention.cp_utils import (
     is_enable_prefill_cp,
     prepare_qwen_cp_metadata,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size,pcp_ag_rearange_output
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -459,6 +459,7 @@ class Qwen3MoeAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.cp_size = get_pcp_size()
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -701,19 +702,9 @@ class Qwen3MoeAttention(nn.Module):
             cp_group = get_pcp_group()
             cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
             k_before, v_before = tuple(k.shape), tuple(v.shape)
-            k = cp_all_gather_kv(k, cp_group, cuda_stream)
-            v = cp_all_gather_kv(v, cp_group, cuda_stream)
+            k = pcp_ag_rearange_output(k, self.cp_size, cuda_stream)
+            v = pcp_ag_rearange_output(v, cp_group.size, cuda_stream)
             metadata = forward_batch.gqa_cp_metadata
-            # gathered_len = int(k.shape[0])
-            # if metadata is None or metadata.total_seq_lens != gathered_len:
-            #     metadata = prepare_qwen_cp_metadata(
-            #         seq_len=gathered_len,
-            #         cp_rank=cp_group.rank_in_group,
-            #         cp_size=cp_group.world_size,
-            #         num_heads=self.total_num_heads,
-            #         head_dim=self.head_dim,
-            #     )
-            #     forward_batch.gqa_cp_metadata = metadata
             k = cp_rebuild_tensor_by_zigzag(
                 k, metadata.reverse_split_len, metadata.cp_reverse_index
             )
@@ -741,6 +732,7 @@ class Qwen3MoeAttention(nn.Module):
             )
         output, _ = self.o_proj(attn_output)
         if self._should_log_diag():
+            # Qwen3Moe attn L0 output: attn=(59, 2048) out=(59, 4096) save_kv_cache=True
             logger.info(
                 "Qwen3Moe attn L%d output: attn=%s out=%s save_kv_cache=%s",
                 self.attn.layer_id,
