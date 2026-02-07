@@ -43,7 +43,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_moe_diag_log = get_bool_env_var("SGLANG_MOE_DIAG_LOG")
+_moe_diag_log = get_bool_env_var("SGLANG_QWEN3_MOE_DIAG_LOG")
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul

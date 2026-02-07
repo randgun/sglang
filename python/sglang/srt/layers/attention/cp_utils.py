@@ -1,3 +1,4 @@
+import logging
 import torch
 from dataclasses import dataclass
 from itertools import accumulate
@@ -5,6 +6,10 @@ from typing import Optional, List
 
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.distributed import GroupCoordinator
+from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
+_cp_diag_log = get_bool_env_var("SGLANG_QWEN3_MOE_DIAG_LOG")
 
 
 # 新增：KV Gather 辅助函数
@@ -29,6 +34,13 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator, stream:
 
     world_size = cp_group.world_size
     local_kv = local_kv.contiguous()
+    if _cp_diag_log:
+        logger.info(
+            "CP all_gather_kv enter: rank=%s world=%s local_kv=%s",
+            getattr(cp_group, "rank_in_group", None),
+            world_size,
+            tuple(local_kv.shape),
+        )
 
     # CP split can produce different local token counts across ranks.
     # HCCL/NCCL all_gather_into_tensor requires the same count on each rank,
@@ -38,6 +50,14 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator, stream:
     gathered_lens_cpu = gathered_lens.detach().cpu().tolist()
 
     max_len = max(gathered_lens_cpu)
+    if _cp_diag_log:
+        logger.info(
+            "CP all_gather_kv lens: rank=%s local_len=%d gathered=%s max_len=%d",
+            getattr(cp_group, "rank_in_group", None),
+            int(local_kv.shape[0]),
+            gathered_lens_cpu,
+            int(max_len),
+        )
     if local_kv.shape[0] != max_len:
         padded_local_kv = torch.zeros(
             (max_len,) + local_kv.shape[1:],
@@ -46,16 +66,35 @@ def cp_all_gather_kv(local_kv: torch.Tensor, cp_group: GroupCoordinator, stream:
         )
         padded_local_kv[: local_kv.shape[0]].copy_(local_kv)
         local_kv = padded_local_kv
+        if _cp_diag_log:
+            logger.info(
+                "CP all_gather_kv padded: rank=%s padded_local_kv=%s",
+                getattr(cp_group, "rank_in_group", None),
+                tuple(local_kv.shape),
+            )
 
     gather_shape = (max_len * world_size,) + local_kv.shape[1:]
     gathered_padded_kv = torch.empty(gather_shape, dtype=local_kv.dtype, device=local_kv.device)
     cp_group.cp_all_gather_into_tensor_async(gathered_padded_kv, local_kv, stream=stream)
     if len(set(gathered_lens_cpu)) == 1:
+        if _cp_diag_log:
+            logger.info(
+                "CP all_gather_kv exit (uniform): rank=%s gathered=%s",
+                getattr(cp_group, "rank_in_group", None),
+                tuple(gathered_padded_kv.shape),
+            )
         return gathered_padded_kv
     chunks = torch.split(gathered_padded_kv, max_len, dim=0)
-    return torch.cat(
+    out = torch.cat(
         [chunk[:valid_len] for chunk, valid_len in zip(chunks, gathered_lens_cpu)], dim=0
     )
+    if _cp_diag_log:
+        logger.info(
+            "CP all_gather_kv exit (trim): rank=%s gathered=%s",
+            getattr(cp_group, "rank_in_group", None),
+            tuple(out.shape),
+        )
+    return out
 
     
 def gqa_use_prefill_cp(forward_batch, gqa_enable_prefill_cp=None):
@@ -182,6 +221,25 @@ def prepare_qwen_cp_metadata(
     kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
+    if _cp_diag_log:
+        logger.info(
+            "CP meta: seq_len=%d cp_rank=%d cp_size=%d num_heads=%d head_dim=%d "
+            "seq_per_batch=%d split_sum=%d max_rank_len=%s per_rank_actual=%s "
+            "kv_prev=%d kv_next=%d q_prev=%d q_next=%d",
+            int(seq_len_value),
+            int(cp_rank),
+            int(cp_size),
+            int(num_heads),
+            int(head_dim),
+            int(seq_per_batch),
+            int(sum(split_list)),
+            max_rank_len,
+            per_rank_actual_token,
+            int(kv_len_prev),
+            int(kv_len_next),
+            int(actual_seq_q_prev),
+            int(actual_seq_q_next),
+        )
 
     device = "npu"
 
@@ -238,6 +296,23 @@ def prepare_qwen_cp_metadata(
     kv_with_q_tail_mask_idx_tensor = torch.tensor(
         kv_with_q_tail_mask_idx, dtype=torch.int32, device=device
     ) if kv_with_q_tail_mask_idx else torch.empty(0, dtype=torch.int32, device=device)
+    if _cp_diag_log:
+        logger.info(
+            "CP meta masks: head_start=%d head_end=%d tail_start=%d tail_end=%d "
+            "head_nomask=%d head_mask=%d tail_nomask=%d tail_mask=%d "
+            "head_attn_seqlens=%s tail_attn_seqlens=%s attn_mask_seqlens=%s",
+            int(head_start_global),
+            int(head_end_global),
+            int(tail_start_global),
+            int(tail_end_global),
+            int(kv_with_q_head_nomask_idx_tensor.numel()),
+            int(kv_with_q_head_mask_idx_tensor.numel()),
+            int(kv_with_q_tail_nomask_idx_tensor.numel()),
+            int(kv_with_q_tail_mask_idx_tensor.numel()),
+            tuple(head_attn_nomask_seqlens.shape),
+            tuple(tail_attn_nomask_seqlens.shape),
+            tuple(attn_mask_seqlens_tensor.shape),
+        )
 
     metadata = ContextParallelMetadata(
         split_list=split_list,
@@ -287,7 +362,17 @@ def cp_split_tensor_by_zigzag(
     """
     tensor_list = list(torch.split(tensor, split_list, dim=0))
     selected = [tensor_list[i] for i in zigzag_index]
-    return torch.cat(selected, dim=0)
+    out = torch.cat(selected, dim=0)
+    if _cp_diag_log:
+        logger.info(
+            "CP split zigzag: in=%s split_sum=%d splits=%d zigzag=%d out=%s",
+            tuple(tensor.shape),
+            int(sum(split_list)),
+            int(len(split_list)),
+            int(len(zigzag_index)),
+            tuple(out.shape),
+        )
+    return out
 
 def cp_rebuild_tensor_by_zigzag(
     tensor: torch.Tensor,
@@ -306,7 +391,17 @@ def cp_rebuild_tensor_by_zigzag(
     """
     tensor_list = list(torch.split(tensor, reverse_split_len, dim=0))
     reordered = [tensor_list[i] for i in cp_reverse_index]
-    return torch.cat(reordered, dim=0)
+    out = torch.cat(reordered, dim=0)
+    if _cp_diag_log:
+        logger.info(
+            "CP rebuild zigzag: in=%s split_sum=%d splits=%d reverse_idx=%d out=%s",
+            tuple(tensor.shape),
+            int(sum(reverse_split_len)),
+            int(len(reverse_split_len)),
+            int(len(cp_reverse_index)),
+            tuple(out.shape),
+        )
+    return out
 
 def is_enable_prefill_cp():
     return get_global_server_args().prefill_context_parallel_size > 1
