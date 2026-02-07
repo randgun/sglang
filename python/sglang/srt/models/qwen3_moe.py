@@ -597,7 +597,7 @@ class Qwen3MoeAttention(nn.Module):
             and is_enable_prefill_cp()
             and forward_batch.forward_mode.is_context_parallel_extend()
         ):
-            print(f"+++ forward_core, pcp_size={self.pcp_size}")
+            print(f"+++ forward_prepare_native, pcp_size={self.pcp_size}")
             k = pcp_gqa_ag_rearange_output(k, self.pcp_size, forward_batch)
             v = pcp_gqa_ag_rearange_output(v, self.pcp_size, forward_batch)           
             if self._should_log_diag():

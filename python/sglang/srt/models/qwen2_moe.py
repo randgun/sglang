@@ -646,6 +646,24 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
         aux_hidden_states = []
+        if (
+            forward_batch.gqa_cp_metadata is not None
+            and is_enable_prefill_cp()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            metadata = forward_batch.gqa_cp_metadata
+            hidden_states = cp_split_tensor_by_zigzag(
+                hidden_states,
+                metadata.reverse_split_len,
+                metadata.cp_reverse_index,
+            )
+            if self._should_log_diag():
+                logger.info(
+                    "Qwen2Moe Model L%d qkv split: hidden_states=%s",
+                    self.attn.layer_id,
+                    tuple(hidden_states.shape),
+                )
+                
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
