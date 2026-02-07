@@ -1010,10 +1010,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        seq_len_total = (
+            forward_batch.seq_lens_sum
+            if forward_batch.seq_lens_sum is not None
+            else len(input_ids)
+        )
         if (
-            forward_batch.gqa_cp_metadata is None
-            and is_enable_prefill_cp()
+            is_enable_prefill_cp()
             and forward_batch.forward_mode.is_context_parallel_extend()
+            and (
+                forward_batch.gqa_cp_metadata is None
+                or forward_batch.gqa_cp_metadata.total_seq_lens != seq_len_total
+            )
         ):
             cp_group = get_pcp_group()
             head_dim = getattr(
@@ -1022,7 +1030,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                 self.config.hidden_size // self.config.num_attention_heads,
             )
             forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
-                seq_len=len(input_ids),
+                seq_len=seq_len_total,
                 cp_rank=cp_group.rank_in_group,
                 cp_size=cp_group.world_size,
                 num_heads=self.config.num_attention_heads,
