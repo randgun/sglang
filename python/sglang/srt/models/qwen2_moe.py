@@ -99,7 +99,6 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
-
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -657,12 +656,7 @@ class Qwen2MoeModel(nn.Module):
                 metadata.reverse_split_len,
                 metadata.cp_reverse_index,
             )
-            if self._should_log_diag():
-                logger.info(
-                    "Qwen2Moe Model L%d qkv split: hidden_states=%s",
-                    self.attn.layer_id,
-                    tuple(hidden_states.shape),
-                )
+            print(f"Qwen2Moe Model L%d qkv split: hidden_states=%s",self.attn.layer_id,tuple(hidden_states.shape))
                 
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
