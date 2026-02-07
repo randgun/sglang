@@ -699,10 +699,9 @@ class Qwen3MoeAttention(nn.Module):
             and forward_batch.forward_mode.is_context_parallel_extend()
         ):
             cp_group = get_pcp_group()
-            cuda_stream = self.alt_stream if self.alt_stream is not None else torch.cuda.current_stream()
             k_before, v_before = tuple(k.shape), tuple(v.shape)
-            k = pcp_gqa_ag_rearange_output(k, self.cp_size, cuda_stream)
-            v = pcp_gqa_ag_rearange_output(v, cp_group.size, cuda_stream)
+            k = pcp_gqa_ag_rearange_output(k, self.cp_size, forward_batch)
+            v = pcp_gqa_ag_rearange_output(v, cp_group.size, forward_batch)
             metadata = forward_batch.gqa_cp_metadata
             k = cp_rebuild_tensor_by_zigzag(
                 k, metadata.reverse_split_len, metadata.cp_reverse_index
