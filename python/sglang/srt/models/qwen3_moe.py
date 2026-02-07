@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_context_parallel_rank,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -41,7 +42,6 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
 )
 from sglang.srt.layers.attention.cp_utils import (
-    cp_rebuild_tensor_by_zigzag,
     is_enable_prefill_cp,
     prepare_qwen_cp_metadata,
 )
@@ -698,17 +698,9 @@ class Qwen3MoeAttention(nn.Module):
             and is_enable_prefill_cp()
             and forward_batch.forward_mode.is_context_parallel_extend()
         ):
-            cp_group = get_pcp_group()
             k_before, v_before = tuple(k.shape), tuple(v.shape)
             k = pcp_gqa_ag_rearange_output(k, self.pcp_size, forward_batch)
-            v = pcp_gqa_ag_rearange_output(v, cp_group.size, forward_batch)
-            metadata = forward_batch.gqa_cp_metadata
-            k = cp_rebuild_tensor_by_zigzag(
-                k, metadata.reverse_split_len, metadata.cp_reverse_index
-            )
-            v = cp_rebuild_tensor_by_zigzag(
-                v, metadata.reverse_split_len, metadata.cp_reverse_index
-            )
+            v = pcp_gqa_ag_rearange_output(v, self.pcp_size, forward_batch)           
             if self._should_log_diag():
                 logger.info(
                     "Qwen3Moe attn L%d cp_all_gather_kv: q=%s k=%s->%s v=%s->%s",
@@ -984,7 +976,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
-        self.pcp_rank = get_pcp_rank()
+        self.pcp_rank = get_context_parallel_rank()
         self.pcp_size = get_pcp_size()
         self.quant_config = quant_config
         self.model = Qwen3MoeModel(
@@ -1025,14 +1017,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                 or forward_batch.gqa_cp_metadata.total_seq_lens != seq_len_total
             )
         ):
-            cp_group = get_pcp_group()
             head_dim = getattr(
                 self.config,
                 "head_dim",
                 self.config.hidden_size // self.config.num_attention_heads,
             )
             print(
-                f"+++ prepare_qwen_cp_metadata, seq_len_total={seq_len_total}, cp_rank={cp_group.rank_in_group}, cp_size={cp_group.world_size}, num_heads={self.config.num_attention_heads}, head_dim={head_dim}"
+                f"+++ prepare_qwen_cp_metadata, seq_len_total={seq_len_total}, cp_rank={self.pcp_rank}, cp_size={self.pcp_size}, num_heads={self.config.num_attention_heads}, head_dim={head_dim}"
             )
             forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
                 seq_len=seq_len_total,
