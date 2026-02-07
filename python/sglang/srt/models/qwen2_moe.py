@@ -651,6 +651,9 @@ class Qwen2MoeModel(nn.Module):
                 "head_dim",
                 self.config.hidden_size // self.config.num_attention_heads,
             )
+            print(
+                f"+++prepare_qwen_cp_metadata, seq_len_total={seq_len_total}, cp_rank={cp_group.rank_in_group}, cp_size={cp_group.world_size}, num_heads={self.config.num_attention_heads}, head_dim={head_dim}"
+            )
             forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
                 seq_len=seq_len_total,
                 cp_rank=cp_group.rank_in_group,

@@ -704,16 +704,16 @@ class Qwen3MoeAttention(nn.Module):
             k = cp_all_gather_kv(k, cp_group, cuda_stream)
             v = cp_all_gather_kv(v, cp_group, cuda_stream)
             metadata = forward_batch.gqa_cp_metadata
-            gathered_len = int(k.shape[0])
-            if metadata is None or metadata.total_seq_lens != gathered_len:
-                metadata = prepare_qwen_cp_metadata(
-                    seq_len=gathered_len,
-                    cp_rank=cp_group.rank_in_group,
-                    cp_size=cp_group.world_size,
-                    num_heads=self.total_num_heads,
-                    head_dim=self.head_dim,
-                )
-                forward_batch.gqa_cp_metadata = metadata
+            # gathered_len = int(k.shape[0])
+            # if metadata is None or metadata.total_seq_lens != gathered_len:
+            #     metadata = prepare_qwen_cp_metadata(
+            #         seq_len=gathered_len,
+            #         cp_rank=cp_group.rank_in_group,
+            #         cp_size=cp_group.world_size,
+            #         num_heads=self.total_num_heads,
+            #         head_dim=self.head_dim,
+            #     )
+            #     forward_batch.gqa_cp_metadata = metadata
             k = cp_rebuild_tensor_by_zigzag(
                 k, metadata.reverse_split_len, metadata.cp_reverse_index
             )
