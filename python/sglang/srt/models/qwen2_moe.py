@@ -632,43 +632,6 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        seq_len_total = (
-            forward_batch.seq_lens_sum
-            if forward_batch.seq_lens_sum is not None
-            else len(input_ids)
-        )
-        if (
-            is_enable_prefill_cp()
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and (
-                forward_batch.gqa_cp_metadata is None
-                or forward_batch.gqa_cp_metadata.total_seq_lens != seq_len_total
-            )
-        ):
-            cp_group = get_pcp_group()
-            head_dim = getattr(
-                self.config,
-                "head_dim",
-                self.config.hidden_size // self.config.num_attention_heads,
-            )
-            print(
-                f"+++prepare_qwen_cp_metadata, seq_len_total={seq_len_total}, cp_rank={cp_group.rank_in_group}, cp_size={cp_group.world_size}, num_heads={self.config.num_attention_heads}, head_dim={head_dim}"
-            )
-            forward_batch.gqa_cp_metadata = prepare_qwen_cp_metadata(
-                seq_len=seq_len_total,
-                cp_rank=cp_group.rank_in_group,
-                cp_size=cp_group.world_size,
-                num_heads=self.config.num_attention_heads,
-                head_dim=head_dim,
-            )
-            # if self.nsa_enable_prefill_cp:
-            #     if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
-            #         forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-            #             len(input_ids),
-            #             self.cp_rank,
-            #             self.cp_size,
-            #             forward_batch.seq_lens_cpu.tolist(),
-            #         )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -679,19 +642,6 @@ class Qwen2MoeModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-        if (
-            forward_batch.gqa_cp_metadata is not None
-            and is_enable_prefill_cp()
-            and forward_batch.forward_mode.is_context_parallel_extend()
-        ):
-            metadata = forward_batch.gqa_cp_metadata
-            hidden_states = cp_split_tensor_by_zigzag(
-                hidden_states, metadata.split_list, metadata.zigzag_index
-            )
-            positions = cp_split_tensor_by_zigzag(
-                positions.unsqueeze(-1), metadata.split_list, metadata.zigzag_index
-            ).squeeze(-1)
-
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
