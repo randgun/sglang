@@ -25,6 +25,12 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
+    cp_split_and_rebuild_data,
+    is_nsa_enable_prefill_cp,
+    prepare_input_dp_with_cp_dsa,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -36,7 +42,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_rank, get_pcp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -911,6 +917,10 @@ class Qwen3MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # Get PCP (Prefill Context Parallelism) configuration
+        self.cp_rank = get_pcp_rank()
+        self.cp_size = get_pcp_size()
+        self.nsa_enable_prefill_cp = self.cp_size > 1
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -925,6 +935,16 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Prepare prefill context parallelism metadata if PCP is enabled
+        if self.nsa_enable_prefill_cp and self.cp_size > 1 and can_cp_split(len(input_ids), self.cp_size, False, forward_batch):
+            forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                len(input_ids),
+                self.cp_rank,
+                self.cp_size,
+                forward_batch.seq_lens_cpu.tolist(),
+                input_ids.device,
+            )
+
         hidden_states = self.model(
             input_ids,
             positions,

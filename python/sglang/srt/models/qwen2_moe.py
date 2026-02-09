@@ -26,6 +26,12 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
+    cp_split_and_rebuild_data,
+    is_nsa_enable_prefill_cp,
+    prepare_input_dp_with_cp_dsa,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -44,6 +50,8 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_pcp_rank,
+    get_pcp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -623,6 +631,15 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # Apply prefill context parallelism zigzag split if CP metadata is available
+        if forward_batch.forward_mode.is_extend() and hasattr(forward_batch, 'nsa_cp_metadata') and forward_batch.nsa_cp_metadata is not None:
+            # Apply zigzag split and rebuild to hidden_states for load balancing
+            hidden_states = cp_split_and_rebuild_data(
+                hidden_states,
+                get_pcp_size(),
+                forward_batch.nsa_cp_metadata
+            )
+
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -705,6 +722,11 @@ class Qwen2MoeForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+        # Get PCP (Prefill Context Parallelism) configuration
+        self.cp_rank = get_pcp_rank()
+        self.cp_size = get_pcp_size()
+        self.nsa_enable_prefill_cp = self.cp_size > 1
+
     @torch.no_grad()
     def forward(
         self,
@@ -714,6 +736,16 @@ class Qwen2MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Prepare prefill context parallelism metadata if PCP is enabled
+        if self.nsa_enable_prefill_cp and self.cp_size > 1 and can_cp_split(len(input_ids), self.cp_size, False, forward_batch):
+            forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                len(input_ids),
+                self.cp_rank,
+                self.cp_size,
+                forward_batch.seq_lens_cpu.tolist(),
+                input_ids.device,
+            )
+
         hidden_states = self.model(
             input_ids,
             positions,
