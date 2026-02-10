@@ -889,6 +889,15 @@ class CommunicateSummableTensorPairFn:
             return CommunicateSummableTensorPairFn._scatter_hidden_states
 
         if (
+            (hidden_states_input_mode == ScatterMode.FULL)
+            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (output_mode == ScatterMode.SCATTERED)
+        ):
+            return (
+                CommunicateSummableTensorPairFn._scatter_hidden_states_and_merge_residual
+            )
+
+        if (
             (hidden_states_input_mode == ScatterMode.SCATTERED)
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
@@ -961,8 +970,32 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        **kwargs,
     ):
         assert residual is None, "not yet handled residual!=None"
         tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
         hidden_states = tensor_list[context.attn_tp_rank]
         return hidden_states, residual
+
+    @staticmethod
+    def _scatter_hidden_states_and_merge_residual(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        allow_reduce_scatter: bool = False,
+    ):
+        hidden_states, residual = CommunicateSummableTensorPairFn._scatter_hidden_states(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+            context=context,
+            allow_reduce_scatter=allow_reduce_scatter,
+        )
+        hidden_states += residual
+        return CommunicateSummableTensorPairFn._scatter(
+            hidden_states=hidden_states,
+            residual=None,
+            forward_batch=forward_batch,
+            context=context,
+        )
