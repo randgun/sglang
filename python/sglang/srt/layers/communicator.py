@@ -30,7 +30,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.attention.nsa.utils import (
-    is_nsa_enable_prefill_cp,
+    is_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -115,7 +115,7 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
-        if is_nsa_enable_prefill_cp():
+        if is_enable_prefill_cp():
             return ScatterMode.SCATTERED
         return ScatterMode.TP_ATTN_FULL
 

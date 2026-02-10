@@ -511,8 +511,7 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
-            not self.server_args.enable_nsa_prefill_context_parallel
-            and self.server_args.prefill_context_parallel_size <= 1
+            self.server_args.prefill_context_parallel_size <= 1
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size

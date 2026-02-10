@@ -224,7 +224,10 @@ class SchedulerDPAttnMixin:
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
             local_batch,
-            dp_size=self.server_args.dp_size,
+            # Use attention-world dp size here so PCP-only mode (pcp_size > 1
+            # without enable_dp_attention) can synchronize across attention
+            # subgroups correctly.
+            dp_size=self.attn_world_dp_size,
             attn_tp_size=self.attn_tp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,

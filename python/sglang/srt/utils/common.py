@@ -3113,7 +3113,14 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 
 def require_mlp_sync(server_args: ServerArgs):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+    # PCP (prefill context parallel) shares the same scheduler synchronization
+    # requirement as DP attention to keep all TP ranks entering collectives
+    # consistently, even when work requests are routed by attention subgroups.
+    return (
+        server_args.enable_dp_attention
+        or server_args.prefill_context_parallel_size > 1
+        or require_gathered_buffer(server_args)
+    )
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
