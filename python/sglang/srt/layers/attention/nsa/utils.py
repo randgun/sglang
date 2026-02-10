@@ -47,6 +47,11 @@ class ContextParallelMetadata:
     head_attn_nomask_seqlens: Optional[torch.Tensor] = None
     tail_attn_nomask_seqlens: Optional[torch.Tensor] = None
     attn_mask_seqlens: Optional[torch.Tensor] = None
+    # For KV transfer
+    cp_size: Optional[int] = None
+    cp_rank: Optional[int] = None
+    aligned_seq_len: Optional[int] = None
+    actual_seq_len: Optional[int] = None
 
 
 

@@ -31,7 +31,8 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode, CPMetadata
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
@@ -59,7 +60,7 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
     cp_rank: Optional[int] = None
-    cp_metadata: Optional[CPMetadata] = None
+    cp_metadata: Optional[ContextParallelMetadata] = None
 
 
 # decode
@@ -385,7 +386,7 @@ class MooncakeKVManager(CommonKVManager):
     def _map_cp_page_indices(
         self,
         prefill_page_indices: npt.NDArray[np.int32],
-        cp_metadata: CPMetadata,
+        cp_metadata: ContextParallelMetadata,
         page_size: int,
     ) -> npt.NDArray[np.int32]:
         """
@@ -1161,7 +1162,7 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         cp_rank: Optional[int] = None,
-        cp_metadata: Optional[CPMetadata] = None,
+        cp_metadata: Optional[ContextParallelMetadata] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -1280,7 +1281,7 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
         cp_rank: Optional[int] = None,
-        cp_metadata: Optional["CPMetadata"] = None,
+        cp_metadata: Optional["ContextParallelMetadata"] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)

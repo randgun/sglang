@@ -14,7 +14,7 @@ import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
-
+from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -33,24 +33,14 @@ class DisaggregationMode(Enum):
 # CP Transfer Metadata
 #########################
 
-@dataclasses.dataclass
-class CPMetadata:
-    split_list: List[int]  # 每个Block的token数量(对齐到page_size的整数倍), eg. [128, 128, 128, 128, 128, 128, 128, 128]
-    zigzag_index: List[int]  # 重新排列Block以平衡各rank计算负载的索引映射
-    cp_reverse_index: List[int] # 将 zigzag 重排后的数据恢复到原始顺序的索引映射，eg. [0, 2, 4, 6, 7, 5, 3, 1]
-    cp_size: int  # CP并行数, eg. 4
-    aligned_seq_len: int  # 序列对齐到page_size*cp_size*2的长度, eg. 128 * 8 = 1024
-    actual_seq_len: int  # 实际序列长度
-
-
-def calculate_cp_metadata(
+def calculate_cp_transfer_metadata(
     actual_seq_len: int,
     cp_size: int,
     cp_rank: int,
     page_size: int,
-) -> CPMetadata:
+):
     """
-    Calculate CP metadata for a single request.
+    Calculate CP transfer metadata for a single request.
     """
     # Calculate alignment unit and aligned sequence length
     alignment_unit = page_size * cp_size * 2
@@ -97,7 +87,7 @@ def calculate_cp_metadata(
             )
         )
 
-    return CPMetadata(
+    return ContextParallelMetadata(
         split_list=split_list,
         zigzag_index=zigzag_index,
         cp_reverse_index=cp_reverse_index,

@@ -57,9 +57,8 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import (
-    CPMetadata,
     DisaggregationMode,
-    calculate_cp_metadata,
+    calculate_cp_transfer_metadata,
 )
 from sglang.srt.distributed.parallel_state import (
     get_context_parallel_rank,
@@ -68,7 +67,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import (
+    ContextParallelMetadata,
+    is_enable_prefill_cp,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -822,7 +824,7 @@ class Req:
         self.dllm_config = dllm_config
         
         # For CP mode KV transfer
-        self.cp_metadata: Optional["CPMetadata"] = None
+        self.cp_metadata: Optional["ContextParallelMetadata"] = None
 
     @property
     def seqlen(self) -> int:
@@ -1571,7 +1573,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 actual_seq_len = len(req.fill_ids)
 
                 # Calculate CP metadata
-                req.cp_metadata = calculate_cp_metadata(
+                req.cp_metadata = calculate_cp_transfer_metadata(
                     actual_seq_len=actual_seq_len,
                     cp_size=cp_size,
                     cp_rank=cp_rank,
@@ -1589,9 +1591,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 cp_extend_tokens_list.append(cp_extend_tokens)
                 extend_lens.append(cp_extend_tokens)
+                
+                # Debug print for each request
+                print(f"[CP_MEM_DEBUG] prepare_for_extend: req_id={req.rid}, cp_rank={cp_rank}, "
+                      f"actual_seq_len={actual_seq_len}, aligned_seq_len={req.cp_metadata.aligned_seq_len}, "
+                      f"prefix_len={prefix_len}, cp_extend_tokens={cp_extend_tokens}, "
+                      f"zigzag_index={req.cp_metadata.zigzag_index}")
 
             # Update extend_num_tokens for CP mode
             extend_num_tokens = sum(cp_extend_tokens_list)
+            print(f"[CP_MEM_DEBUG] prepare_for_extend: cp_rank={cp_rank}, total_extend_num_tokens={extend_num_tokens}")
         else:
             # Non-CP mode: keep original logic
             extend_lens = [r.extend_input_len for r in reqs]
@@ -2317,6 +2326,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
+        prefill_cp_metadata = None
+        if len(self.reqs) > 0 and self.reqs[0].cp_metadata is not None:
+            prefill_cp_metadata = self.reqs[0].cp_metadata
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2372,6 +2385,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            prefill_cp_metadata=prefill_cp_metadata,
         )
 
     def copy(self):
@@ -2558,3 +2572,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For CP mode
+    prefill_cp_metadata: Optional[ContextParallelMetadata] = None
