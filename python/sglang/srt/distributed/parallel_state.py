@@ -722,18 +722,61 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and (
-            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
-        ):
-            with pynccl_comm.change_state(
-                enable=True, stream=get_current_device_stream_fast()
-            ):
-                pynccl_comm.all_gather(output, input)
-        else:
-            torch.distributed.all_gather_into_tensor(
-                output, input, group=self.device_group
+        expected_output_numel = input.numel() * self.world_size
+        if output.numel() != expected_output_numel:
+            logger.error(
+                "[allgather-shape-mismatch][group=%s][rank=%s][rank_in_group=%s] "
+                "world_size=%s input_shape=%s input_numel=%s output_shape=%s "
+                "output_numel=%s expected_output_numel=%s input_dtype=%s output_dtype=%s "
+                "input_device=%s output_device=%s",
+                self.unique_name,
+                self.rank,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input.shape),
+                input.numel(),
+                tuple(output.shape),
+                output.numel(),
+                expected_output_numel,
+                input.dtype,
+                output.dtype,
+                input.device,
+                output.device,
             )
+        pynccl_comm = self.pynccl_comm
+        try:
+            if pynccl_comm is not None and (
+                not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
+            ):
+                with pynccl_comm.change_state(
+                    enable=True, stream=get_current_device_stream_fast()
+                ):
+                    pynccl_comm.all_gather(output, input)
+            else:
+                torch.distributed.all_gather_into_tensor(
+                    output, input, group=self.device_group
+                )
+        except Exception:
+            logger.exception(
+                "[allgather-failed][group=%s][rank=%s][rank_in_group=%s] "
+                "world_size=%s input_shape=%s input_numel=%s output_shape=%s "
+                "output_numel=%s expected_output_numel=%s input_dtype=%s output_dtype=%s "
+                "input_device=%s output_device=%s",
+                self.unique_name,
+                self.rank,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input.shape),
+                input.numel(),
+                tuple(output.shape),
+                output.numel(),
+                expected_output_numel,
+                input.dtype,
+                output.dtype,
+                input.device,
+                output.device,
+            )
+            raise
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or _is_xpu:
@@ -753,11 +796,56 @@ class GroupCoordinator:
         assert (
             stream is not None
         ), f"Invalid params stream ({stream}, Please specify the stream to use when calling cp_all_gather_into_tensor_async.)"
+        expected_output_numel = input.numel() * self.world_size
+        if output.numel() != expected_output_numel:
+            logger.error(
+                "[cp-allgather-shape-mismatch][group=%s][rank=%s][rank_in_group=%s] "
+                "world_size=%s input_shape=%s input_numel=%s output_shape=%s "
+                "output_numel=%s expected_output_numel=%s input_dtype=%s output_dtype=%s "
+                "input_device=%s output_device=%s stream=%s",
+                self.unique_name,
+                self.rank,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input.shape),
+                input.numel(),
+                tuple(output.shape),
+                output.numel(),
+                expected_output_numel,
+                input.dtype,
+                output.dtype,
+                input.device,
+                output.device,
+                stream,
+            )
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
-            self.all_gather_into_tensor(output, input)
-        else:
-            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
+        try:
+            if pynccl_comm is None or pynccl_comm.disabled:
+                self.all_gather_into_tensor(output, input)
+            else:
+                pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
+        except Exception:
+            logger.exception(
+                "[cp-allgather-failed][group=%s][rank=%s][rank_in_group=%s] "
+                "world_size=%s input_shape=%s input_numel=%s output_shape=%s "
+                "output_numel=%s expected_output_numel=%s input_dtype=%s output_dtype=%s "
+                "input_device=%s output_device=%s stream=%s",
+                self.unique_name,
+                self.rank,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input.shape),
+                input.numel(),
+                tuple(output.shape),
+                output.numel(),
+                expected_output_numel,
+                input.dtype,
+                output.dtype,
+                input.device,
+                output.device,
+                stream,
+            )
+            raise
 
     def all_gather(
         self,

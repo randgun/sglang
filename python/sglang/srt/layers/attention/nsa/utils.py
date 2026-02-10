@@ -1,4 +1,5 @@
 # temp NSA debugging environ
+import logging
 from itertools import accumulate
 from typing import TYPE_CHECKING, List, Tuple, Union,Optional
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -302,6 +305,35 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     # step1
     max_len = (total_len + attn_tp_size - 1) // attn_tp_size
     pad_size = max_len - input_.shape[0]
+    if (
+        forward_batch is not None
+        and getattr(forward_batch, "nsa_cp_metadata", None) is not None
+    ):
+        md = forward_batch.nsa_cp_metadata
+        max_rank_len = md.max_rank_len or []
+        per_rank_actual_token = md.per_rank_actual_token or []
+        if sum(max_rank_len) != max_len * attn_tp_size:
+            logger.error(
+                "[nsa-cp-metadata-mismatch] sum(max_rank_len)=%s expected=%s "
+                "attn_tp_size=%s total_len=%s max_len=%s",
+                sum(max_rank_len),
+                max_len * attn_tp_size,
+                attn_tp_size,
+                total_len,
+                max_len,
+            )
+        logger.info(
+            "[nsa-cp-allgather-prepare] input_shape=%s total_len=%s attn_tp_size=%s "
+            "max_len=%s pad_size=%s sum(max_rank_len)=%s sum(per_rank_actual_token)=%s stream=%s",
+            tuple(input_.shape),
+            total_len,
+            attn_tp_size,
+            max_len,
+            pad_size,
+            sum(max_rank_len),
+            sum(per_rank_actual_token),
+            stream_op,
+        )
     if pad_size > 0:
         input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
     input_tensor_all = torch.empty(
@@ -326,6 +358,11 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
             )
         ],
         dim=0,
+    )
+    logger.info(
+        "[nsa-cp-allgather-output] gathered_shape=%s reorganized_shape=%s",
+        tuple(input_tensor_all.shape),
+        tuple(outputs.shape),
     )
     return outputs
 
@@ -374,6 +411,12 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         return output_tensor
 
     bs_seq_len, hidden_size = input_tensor.shape
+    logger.info(
+        "[nsa-cp-rerange-start] input_shape=%s cp_size=%s total_seq_lens=%s",
+        tuple(input_tensor.shape),
+        cp_size,
+        getattr(forward_batch.nsa_cp_metadata, "total_seq_lens", None),
+    )
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
         forward_batch.nsa_cp_metadata.total_seq_lens,
@@ -390,6 +433,11 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
+    logger.info(
+        "[nsa-cp-rerange-done] output_shape=%s hidden_size=%s",
+        tuple(output_tensor.shape),
+        hidden_size,
+    )
     return output_tensor
 
 
