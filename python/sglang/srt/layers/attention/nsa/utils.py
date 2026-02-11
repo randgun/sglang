@@ -179,6 +179,13 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
         return False
 
 
+def _get_cp_metadata(forward_batch):
+    """Get CP metadata from forward_batch, prefer gqa_cp_metadata over nsa_cp_metadata."""
+    if forward_batch.gqa_cp_metadata is not None:
+        return forward_batch.gqa_cp_metadata
+    return forward_batch.nsa_cp_metadata
+
+
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
@@ -187,12 +194,17 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
+    cp_metadata = _get_cp_metadata(forward_batch)
+    assert cp_metadata is not None, "CP metadata is not available"
+
+    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_data: input_shape={input_.shape}, split_list={cp_metadata.split_list}, zigzag_index={cp_metadata.zigzag_index}")
     input_list = list(
-        torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
+        torch.split(input_, cp_metadata.split_list, dim=0)
     )
     result = torch.cat(
-        [input_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index], dim=0
+        [input_list[i] for i in cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
+    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_data: output_shape={result.shape}")
     return result
 
 
@@ -205,13 +217,18 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         )
         return nsa_cp_round_robin_split_data(positions)
 
+    cp_metadata = _get_cp_metadata(forward_batch)
+    assert cp_metadata is not None, "CP metadata is not available"
+
+    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_position: input_shape={positions.shape}, split_list={cp_metadata.split_list}, zigzag_index={cp_metadata.zigzag_index}")
     position_id_list = list(
-        torch.split(positions, forward_batch.nsa_cp_metadata.split_list, dim=-1)
+        torch.split(positions, cp_metadata.split_list, dim=-1)
     )
     positions = torch.cat(
-        [position_id_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index],
+        [position_id_list[i] for i in cp_metadata.zigzag_index],
         dim=-1,
     )
+    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_position: output_shape={positions.shape}")
     return positions
 
 

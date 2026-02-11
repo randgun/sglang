@@ -129,6 +129,7 @@ def write_cache_indices(
                 cp_metadata = reqs[i].cp_metadata
                 actual_seq_len = cp_metadata.actual_seq_len
                 out_offset = pt
+                written_blocks = []
 
                 for block_idx in cp_metadata.zigzag_index:
                     block_size = cp_metadata.split_list[block_idx]
@@ -156,7 +157,23 @@ def write_cache_indices(
                         out_cache_loc[out_offset : out_offset + write_size],
                     )
 
+                    written_blocks.append({
+                        'block_idx': block_idx,
+                        'token_range': (extend_block_start, extend_block_end),
+                        'write_size': write_size,
+                        'kv_indices_sample': out_cache_loc[out_offset : out_offset + min(5, write_size)].cpu().tolist()
+                    })
                     out_offset += write_size
+                
+                # Print detailed information about what was written to req_to_token_pool
+                written_indices = req_to_token_pool.req_to_token[req_idx, :actual_seq_len].cpu().tolist()
+                non_zero_count = len([x for x in written_indices if x != 0])
+                print(f"write_cache_indices: [CP_MEM_DEBUG] req_idx={req_idx}, req_id={reqs[i].rid if reqs else 'N/A'}, "
+                      f"actual_seq_len={actual_seq_len}, aligned_seq_len={cp_metadata.aligned_seq_len}, "
+                      f"zigzag_index={cp_metadata.zigzag_index}, "
+                      f"written_blocks={len(written_blocks)}, written_kv_indices_count={non_zero_count}, "
+                      f"written_kv_indices_sample={written_indices[:min(10, len(written_indices))]}, "
+                      f"block_details={written_blocks}")
             else:
                 req_to_token_pool.write(
                     (req_idx, slice(prefix_len, seq_len)),
@@ -406,13 +423,8 @@ def alloc_for_extend(
             for t in prefix_tensors
         ]
         
-        enable_cp = any(req.cp_metadata is not None for req in batch.reqs)
-        if enable_cp:
-            seq_lens_cpu_for_alloc = prefix_lens_cpu + extend_lens_cpu
-            seq_lens_for_alloc = seq_lens_cpu_for_alloc.to(batch.device, non_blocking=True)
-        else:
-            seq_lens_for_alloc = batch.seq_lens
-            seq_lens_cpu_for_alloc = batch.seq_lens_cpu
+        seq_lens_for_alloc = batch.seq_lens
+        seq_lens_cpu_for_alloc = batch.seq_lens_cpu
         
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
@@ -423,6 +435,7 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
+        print(f"alloc_for_extend: [CP_MEM_DEBUG] out_cache_loc={out_cache_loc}")
 
     # Write to req_to_token_pool
     write_cache_indices(

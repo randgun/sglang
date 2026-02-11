@@ -1535,6 +1535,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Check if CP mode is enabled
         enable_cp = is_enable_prefill_cp()
+        print(f"[CP_MEM_DEBUG] prepare_for_extend: enable_cp={enable_cp}")
         if enable_cp:
             server_args = get_global_server_args()
             if not server_args.disable_radix_cache:
@@ -1555,7 +1556,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             cp_size = get_context_parallel_world_size()
             cp_rank = get_context_parallel_rank()
             page_size = self.token_to_kv_pool_allocator.page_size
-
+            print(f"[CP_MEM_DEBUG] prepare_for_extend: cp_size={cp_size}, cp_rank={cp_rank}, page_size={page_size}")
             """
             CP Mode Memory Allocation Example:
             - actual_seq_len = 12345, page_size = 32, cp_size = 4
@@ -1571,7 +1572,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens = []
             for i, req in enumerate(reqs):
                 actual_seq_len = len(req.fill_ids)
-
                 # Calculate CP metadata
                 req.cp_metadata = calculate_cp_transfer_metadata(
                     actual_seq_len=actual_seq_len,
@@ -1658,7 +1658,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            print(f"[CP_MEM_DEBUG] prepare_for_extend: req_id={req.rid}, seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}, extend_lens[i]={extend_lens[i] if i < len(extend_lens) else 'N/A'}")
+            if enable_cp:
+                actual_seq_len = req.cp_metadata.actual_seq_len
+                assert req.extend_input_len == actual_seq_len - pre_len
+            else:
+                assert seq_len - pre_len == req.extend_input_len
 
             req.extend_batch_idx += 1
 

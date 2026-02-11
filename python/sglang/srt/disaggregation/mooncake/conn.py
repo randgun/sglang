@@ -945,7 +945,6 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 mapped_dst_kv_indices,
                                 executor,
-                                cp_metadata=kv_chunk.cp_metadata,
                             )
                         else:
                             ret = self.send_kvcache_slice(
