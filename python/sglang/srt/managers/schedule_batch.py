@@ -1535,7 +1535,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Check if CP mode is enabled
         enable_cp = is_enable_prefill_cp()
-        print(f"[CP_MEM_DEBUG] prepare_for_extend: enable_cp={enable_cp}")
         if enable_cp:
             server_args = get_global_server_args()
             if not server_args.disable_radix_cache:
@@ -1556,7 +1555,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             cp_size = get_context_parallel_world_size()
             cp_rank = get_context_parallel_rank()
             page_size = self.token_to_kv_pool_allocator.page_size
-            print(f"[CP_MEM_DEBUG] prepare_for_extend: cp_size={cp_size}, cp_rank={cp_rank}, page_size={page_size}")
             """
             CP Mode Memory Allocation Example:
             - actual_seq_len = 12345, page_size = 32, cp_size = 4
@@ -1592,15 +1590,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 cp_extend_tokens_list.append(cp_extend_tokens)
                 extend_lens.append(cp_extend_tokens)
                 
-                # Debug print for each request
-                print(f"[CP_MEM_DEBUG] prepare_for_extend: req_id={req.rid}, cp_rank={cp_rank}, "
-                      f"actual_seq_len={actual_seq_len}, aligned_seq_len={req.cp_metadata.aligned_seq_len}, "
-                      f"prefix_len={prefix_len}, cp_extend_tokens={cp_extend_tokens}, "
-                      f"zigzag_index={req.cp_metadata.zigzag_index}")
+                # 验证点1: extend_tokens计算正确性
+                calculated_extend = sum(req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index) - prefix_len
+                is_correct = (cp_extend_tokens == calculated_extend)
+                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点1: extend_tokens计算 | "
+                      f"req_id={req.rid} | calculated={calculated_extend} | actual={cp_extend_tokens} | "
+                      f"是否符合预期={'✓' if is_correct else '✗'}")
+                
+                # 验证点2: zigzag_index长度检查
+                zigzag_len = len(req.cp_metadata.zigzag_index)
+                is_zigzag_correct = (zigzag_len == 2)
+                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点2: zigzag_index长度 | "
+                      f"req_id={req.rid} | zigzag_index={req.cp_metadata.zigzag_index} | "
+                      f"length={zigzag_len} | 是否符合预期={'✓' if is_zigzag_correct else '✗'} (期望=2)")
+                
+                # 验证点3: split_list块大小一致性
+                split_list_values = [req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index]
+                total_blocks_size = sum(split_list_values)
+                is_blocks_correct = (total_blocks_size == cp_extend_tokens + prefix_len)
+                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点3: 块大小计算 | "
+                      f"req_id={req.rid} | split_list[zigzag]={split_list_values} | "
+                      f"total_blocks={total_blocks_size} | extend+prefix={cp_extend_tokens + prefix_len} | "
+                      f"是否符合预期={'✓' if is_blocks_correct else '✗'}")
 
             # Update extend_num_tokens for CP mode
             extend_num_tokens = sum(cp_extend_tokens_list)
-            print(f"[CP_MEM_DEBUG] prepare_for_extend: cp_rank={cp_rank}, total_extend_num_tokens={extend_num_tokens}")
+            
+            # 验证点4: 总extend_num_tokens计算
+            expected_total = sum(extend_lens)
+            is_total_correct = (extend_num_tokens == expected_total)
+            print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点4: 总extend_num_tokens | "
+                  f"calculated={expected_total} | actual={extend_num_tokens} | "
+                  f"是否符合预期={'✓' if is_total_correct else '✗'}")
         else:
             # Non-CP mode: keep original logic
             extend_lens = [r.extend_input_len for r in reqs]
@@ -1658,7 +1679,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
-            print(f"[CP_MEM_DEBUG] prepare_for_extend: req_id={req.rid}, seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}, extend_lens[i]={extend_lens[i] if i < len(extend_lens) else 'N/A'}")
             if enable_cp:
                 actual_seq_len = req.cp_metadata.actual_seq_len
                 assert req.extend_input_len == actual_seq_len - pre_len

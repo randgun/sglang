@@ -13,7 +13,10 @@ from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.distributed.parallel_state import get_context_parallel_world_size
+from sglang.srt.distributed.parallel_state import (
+    get_context_parallel_world_size,
+    get_context_parallel_rank,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -92,6 +95,7 @@ def write_cache_indices(
 ):
     # Check if CP is enabled
     enable_cp = get_context_parallel_world_size() > 1
+    cp_rank = get_context_parallel_rank() if enable_cp else -1
 
     if support_triton(get_global_server_args().attention_backend) and not enable_cp:
         prefix_pointers = torch.tensor(
@@ -165,15 +169,101 @@ def write_cache_indices(
                     })
                     out_offset += write_size
                 
-                # Print detailed information about what was written to req_to_token_pool
+                # 验证点7: 写入的KV indices数量
                 written_indices = req_to_token_pool.req_to_token[req_idx, :actual_seq_len].cpu().tolist()
-                non_zero_count = len([x for x in written_indices if x != 0])
-                print(f"write_cache_indices: [CP_MEM_DEBUG] req_idx={req_idx}, req_id={reqs[i].rid if reqs else 'N/A'}, "
-                      f"actual_seq_len={actual_seq_len}, aligned_seq_len={cp_metadata.aligned_seq_len}, "
-                      f"zigzag_index={cp_metadata.zigzag_index}, "
-                      f"written_blocks={len(written_blocks)}, written_kv_indices_count={non_zero_count}, "
-                      f"written_kv_indices_sample={written_indices[:min(10, len(written_indices))]}, "
-                      f"block_details={written_blocks}")
+                non_zero_count = len([x for x in written_indices if x != 0 and x != -1])
+                expected_written = sum(block['write_size'] for block in written_blocks)
+                is_written_count_correct = (non_zero_count == expected_written)
+                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点7: 写入KV indices数量 | "
+                      f"req_id={reqs[i].rid if reqs else 'N/A'} | "
+                      f"written_count={non_zero_count} | expected={expected_written} | "
+                      f"是否符合预期={'✓' if is_written_count_correct else '✗'}")
+                
+                # 验证点8: 写入的token范围正确性
+                all_ranges_valid = True
+                for block_info in written_blocks:
+                    start, end = block_info['token_range']
+                    if not (0 <= start < actual_seq_len) or not (0 < end <= actual_seq_len):
+                        all_ranges_valid = False
+                        break
+                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点8: 写入token范围 | "
+                      f"req_id={reqs[i].rid if reqs else 'N/A'} | actual_seq_len={actual_seq_len} | "
+                      f"所有块范围是否在[0, {actual_seq_len})内={'✓' if all_ranges_valid else '✗'}")
+                
+                # 验证点9: 块覆盖范围完整性
+                total_written_range = sum(
+                    end - start for block_info in written_blocks
+                    for start, end in [block_info['token_range']]
+                )
+                expected_range = sum(
+                    cp_metadata.split_list[j] for j in cp_metadata.zigzag_index
+                )
+                is_range_correct = (total_written_range <= expected_range)
+                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点9: 块覆盖范围 | "
+                      f"req_id={reqs[i].rid if reqs else 'N/A'} | "
+                      f"total_written_range={total_written_range} | expected_range={expected_range} | "
+                      f"是否符合预期={'✓' if is_range_correct else '✗'} (written <= expected)")
+                
+                # 验证点10: req_to_token_pool写入位置正确性
+                # 验证每个块写入的位置是否与预期的块位置匹配
+                out_offset_check = pt
+                all_positions_correct = True
+                all_kv_match = True
+                position_details = []
+                
+                for block_info in written_blocks:
+                    block_idx = block_info['block_idx']
+                    start, end = block_info['token_range']
+                    write_size = block_info['write_size']
+                    
+                    # 计算这个块在原始序列中的预期位置
+                    expected_block_start = 0
+                    for j in range(block_idx):
+                        expected_block_start += cp_metadata.split_list[j]
+                    expected_block_end = expected_block_start + cp_metadata.split_list[block_idx]
+                    
+                    # 实际写入的位置应该等于预期的块位置（受actual_seq_len限制）
+                    actual_write_start = start
+                    actual_write_end = end
+                    expected_write_start = max(0, expected_block_start)
+                    expected_write_end = min(expected_block_end, actual_seq_len)
+                    
+                    is_position_correct = (actual_write_start == expected_write_start and 
+                                          actual_write_end == expected_write_end)
+                    
+                    if not is_position_correct:
+                        all_positions_correct = False
+                    
+                    # 验证写入的KV indices是否与分配的out_cache_loc一致
+                    written_kv_indices = req_to_token_pool.req_to_token[req_idx, actual_write_start:actual_write_end].cpu()
+                    expected_kv_indices = out_cache_loc[out_offset_check:out_offset_check + write_size].cpu()
+                    
+                    # 检查是否匹配（排除-1和0的情况）
+                    written_valid = written_kv_indices[written_kv_indices > 0]
+                    expected_valid = expected_kv_indices[expected_kv_indices > 0]
+                    is_kv_match = len(written_valid) == len(expected_valid)
+                    if is_kv_match and len(written_valid) > 0:
+                        is_kv_match = torch.allclose(written_valid.float(), expected_valid.float(), atol=1e-5)
+                    
+                    if not is_kv_match:
+                        all_kv_match = False
+                    
+                    position_details.append({
+                        'block_idx': block_idx,
+                        'expected_range': (expected_block_start, expected_block_end),
+                        'actual_write_range': (actual_write_start, actual_write_end),
+                        'expected_write_range': (expected_write_start, expected_write_end),
+                        'is_position_correct': is_position_correct,
+                        'is_kv_match': is_kv_match,
+                    })
+                    
+                    out_offset_check += write_size
+                
+                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点10: req_to_token_pool写入位置 | "
+                      f"req_id={reqs[i].rid if reqs else 'N/A'} | "
+                      f"所有块写入位置是否正确={'✓' if all_positions_correct else '✗'} | "
+                      f"所有KV indices是否匹配={'✓' if all_kv_match else '✗'} | "
+                      f"position_details={position_details}")
             else:
                 req_to_token_pool.write(
                     (req_idx, slice(prefix_len, seq_len)),
@@ -435,7 +525,40 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
-        print(f"alloc_for_extend: [CP_MEM_DEBUG] out_cache_loc={out_cache_loc}")
+    
+    # 验证点5: 内存分配大小正确性
+    enable_cp = get_context_parallel_world_size() > 1
+    if enable_cp:
+        cp_rank = get_context_parallel_rank()
+        allocated_size = len(out_cache_loc)
+        expected_size = batch.extend_num_tokens
+        is_alloc_correct = (allocated_size == expected_size)
+        print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点5: 内存分配大小 | "
+              f"allocated={allocated_size} | expected={expected_size} | "
+              f"是否符合预期={'✓' if is_alloc_correct else '✗'}")
+        
+        # 验证点6: 每个请求分配的内存大小
+        if batch.reqs is not None and len(batch.reqs) > 0:
+            extend_lens_list = extend_lens_cpu.tolist()
+            total_allocated = 0
+            for i, req in enumerate(batch.reqs):
+                if i < len(extend_lens_list):
+                    req_extend = extend_lens_list[i]
+                    start_idx = sum(extend_lens_list[:i])
+                    end_idx = start_idx + req_extend
+                    allocated_for_req = end_idx - start_idx
+                    is_req_alloc_correct = (allocated_for_req == req_extend)
+                    req_id = req.rid if hasattr(req, 'rid') else f"req_{i}"
+                    print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点6: 请求内存分配 | "
+                          f"req_id={req_id} | "
+                          f"allocated={allocated_for_req} | expected={req_extend} | "
+                          f"是否符合预期={'✓' if is_req_alloc_correct else '✗'}")
+                    total_allocated += allocated_for_req
+            
+            is_total_alloc_correct = (total_allocated == expected_size)
+            print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点6: 总分配内存 | "
+                  f"total_allocated={total_allocated} | expected={expected_size} | "
+                  f"是否符合预期={'✓' if is_total_alloc_correct else '✗'}")
 
     # Write to req_to_token_pool
     write_cache_indices(
