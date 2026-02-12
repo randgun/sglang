@@ -1,5 +1,8 @@
 # temp NSA debugging environ
 from itertools import accumulate
+import os
+import logging
+
 from typing import TYPE_CHECKING, List, Tuple, Union,Optional
 from dataclasses import dataclass
 
@@ -12,15 +15,63 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather_into_tensor,
     get_attention_dp_rank,
-    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_pcp_group,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
+
+
+def _is_pcp_precision_debug_enabled() -> bool:
+    return os.getenv("SGLANG_PCP_DEBUG_PRECISION", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _pcp_tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    if tensor.numel() == 0:
+        return (
+            f"{name}(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            "numel=0, empty=True)"
+        )
+
+    t = tensor.detach()
+    if t.dtype.is_floating_point or t.is_complex():
+        tf = t.float()
+        finite = torch.isfinite(tf)
+        finite_count = int(finite.sum().item())
+        total = tf.numel()
+        finite_tf = tf[finite]
+        if finite_count > 0:
+            min_v = float(finite_tf.min().item())
+            max_v = float(finite_tf.max().item())
+            mean_v = float(finite_tf.mean().item())
+            std_v = float(finite_tf.std(unbiased=False).item())
+        else:
+            min_v = max_v = mean_v = std_v = float("nan")
+        abs_max = float(tf.abs().max().item())
+        return (
+            f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={total}, "
+            f"finite={finite_count}/{total}, min={min_v:.6e}, max={max_v:.6e}, "
+            f"mean={mean_v:.6e}, std={std_v:.6e}, abs_max={abs_max:.6e})"
+        )
+
+    ti = t.to(torch.int64)
+    return (
+        f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={ti.numel()}, "
+        f"min={int(ti.min().item())}, max={int(ti.max().item())})"
+    )
 
 
 @dataclass
@@ -156,7 +207,7 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     return nsa_cache_seqlens
 
 
-def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
@@ -170,9 +221,8 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
-        and use_nsa
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_nsa_enable_prefill_cp()
+        # and is_nsa_enable_prefill_cp()
     ):
         return True
     else:
@@ -310,6 +360,13 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     else:
         return False
 
+def use_pcp(forward_batch):
+    if (forward_batch.nsa_cp_metadata is not None
+        and forward_batch.forward_mode.is_context_parallel_extend()):
+            return True
+    else:
+        return False
+
 
 def cp_attn_tp_all_gather_reorganazied_into_tensor(
     input_: torch.Tensor, total_len, attn_tp_size, forward_batch, stream_op
@@ -333,7 +390,18 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dtype=input_.dtype,
     )
     # step2
-    get_attention_tp_group().cp_all_gather_into_tensor_async(
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] cp_attn_tp_all_gather_reorganazied_into_tensor: "
+            "attn_tp_size=%s total_len=%s max_len=%s pad_size=%s %s",
+            attn_tp_size,
+            total_len,
+            max_len,
+            pad_size,
+            _pcp_tensor_debug_summary("input", input_),
+        )
+    
+    get_pcp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
     # step3
@@ -350,7 +418,6 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dim=0,
     )
     return outputs
-
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
@@ -395,6 +462,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         )
         return output_tensor
 
+
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
@@ -408,10 +476,25 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
         )
     )
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] cp_all_gather_rerange_output: cp_size=%s outputs_list_len=%s "
+            "reverse_split_len=%s cp_reverse_index=%s %s",
+            cp_size,
+            len(outputs_list),
+            forward_batch.nsa_cp_metadata.reverse_split_len,
+            forward_batch.nsa_cp_metadata.cp_reverse_index,
+            _pcp_tensor_debug_summary("gathered", output_tensor),
+        )
     output_tensor = torch.cat(
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] cp_all_gather_rerange_output_done: %s",
+            _pcp_tensor_debug_summary("output", output_tensor),
+        )
     return output_tensor
 
 
@@ -496,7 +579,6 @@ def prepare_input_dp_with_cp_dsa(
     kv_len,
     cp_rank,
     cp_size,
-    seqs_len,
     device
 ):
     if is_nsa_prefill_cp_round_robin_split():
@@ -634,9 +716,5 @@ def prepare_input_dp_with_cp_dsa(
             head_end_global=head_end_global,
             tail_start_global=tail_start_global,
             tail_end_global=tail_end_global,
-            kv_len_prev=kv_len_prev,
-            kv_len_next=kv_len_next,
-            actual_seq_q_prev=actual_seq_q_prev,
-            actual_seq_q_next=actual_seq_q_next,
         )
     return cp_metadata

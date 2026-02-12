@@ -298,10 +298,15 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
-    if pcp_size>1:
-        _ATTN_DP_SIZE = 1
-        _LOCAL_ATTN_DP_SIZE = 1
+    if pcp_size > 1:
+        # PCP reuses attention-TP partitioning but should not expose logical DP to
+        # downstream paths that index `global_num_tokens` by DP rank.
+        _ATTN_PCP_RANK = _ATTN_DP_RANK
         _ATTN_PCP_SIZE = pcp_size
+        _ATTN_DP_RANK = 0
+        _ATTN_DP_SIZE = 1
+        _LOCAL_ATTN_DP_RANK = 0
+        _LOCAL_ATTN_DP_SIZE = 1
 
     tp_group = get_tp_group()
     # Trick to solve circular references
@@ -310,7 +315,7 @@ def initialize_dp_attention(
     use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
     group_ranks = [
         list(range(head,head + _ATTN_TP_SIZE))
-        for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE) 
+        for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
     ]
     _ATTN_TP_GROUP = GroupCoordinator(
         group_ranks,
@@ -333,11 +338,11 @@ def initialize_dp_attention(
     )
 
 def get_pcp_rank() -> int:
-    assert _ATTN_PCP_RANK is not None, "dp attention not initialized!"
+    assert _ATTN_PCP_RANK is not None, "pcp attention not initialized!"
     return _ATTN_PCP_RANK
 
 def get_pcp_size() -> int:
-    assert _ATTN_PCP_SIZE is not None, "dp attention not initialized!"
+    assert _ATTN_PCP_SIZE is not None, "pcp attention not initialized!"
     return _ATTN_PCP_SIZE
 
 
@@ -599,22 +604,41 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
-def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
+def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
+    # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
+    # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
+    # but communicate on PCP group (not attention-TP group).
+    cp_rank_count = len(forward_batch.nsa_cp_metadata.max_rank_len)
     max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
 
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
-        input_tensor = F.pad(input_tensor, (0, 0, 0, pad_size),mode="constant",value=0)
+        input_tensor = F.pad(
+            input_tensor,
+            (0, 0, 0, pad_size),
+            mode="constant",
+            value=0,
+        )
     all_shuffled_sensor = torch.empty(
-        max_len * pcp_size,
+        max_len * cp_rank_count,
         input_tensor.shape[-1],
         dtype=input_tensor.dtype,
         device=input_tensor.device,
     )
 
-    get_pcp_group().all_gather_into_tensor(all_shuffled_sensor, input_tensor)
+    pcp_group = get_pcp_group()
+    assert (
+        pcp_group.world_size == cp_rank_count
+    ), f"pcp metadata/group mismatch: cp_rank_count={cp_rank_count}, pcp_group.world_size={pcp_group.world_size}"
+    pcp_group.all_gather_into_tensor(all_shuffled_sensor, input_tensor)
 
-    splitted_tensor = list(torch.split(all_shuffled_sensor, forward_batch.nsa_cp_metadata.max_rank_len, dim=0))
+    splitted_tensor = list(
+        torch.split(
+            all_shuffled_sensor,
+            forward_batch.nsa_cp_metadata.max_rank_len,
+            dim=0,
+        )
+    )
     output_tensor = torch.cat(
         [
             splitted_tensor[index][:per_rank_len]
@@ -633,4 +657,3 @@ def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
     return outputs
-    
