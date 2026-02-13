@@ -928,6 +928,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 next_tokens=0,
                 inner_precise=0,
+                softmax_lse_flag=True,
             )
 
             mask_out = mask_out.squeeze(0)
@@ -957,7 +958,8 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=0,
             scale=layer.scaling,
             next_tokens=0,
-            inner_precise=0
+            inner_precise=0,
+            softmax_lse_flag=True,
         )
         nomask_out = nomask_out.squeeze(0)
         nomask_lse = nomask_lse.squeeze(0)
