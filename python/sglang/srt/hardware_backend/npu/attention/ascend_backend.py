@@ -898,9 +898,6 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=q.dtype,
             )
 
-        k_mask = torch.index_select(k, 0, kv_mask_idx)
-        v_mask = torch.index_select(v, 0, kv_mask_idx)
-
         
         q_4d = q.unsqueeze(0)
         mask_out = None
@@ -911,6 +908,8 @@ class AscendAttnBackend(AttentionBackend):
             curr_atten_mask = atten_mask.unsqueeze(0).unsqueeze(0)
 
         if kv_mask_idx.shape[0] > 0:
+            k_mask = torch.index_select(k, 0, kv_mask_idx)
+            v_mask = torch.index_select(v, 0, kv_mask_idx)
             v_mask_4d = v_mask.unsqueeze(0)
             k_mask_4d = k_mask.unsqueeze(0)
             sparse_mode = 3 if (q.shape[0] != 1 and curr_atten_mask is not None) else 0
@@ -935,12 +934,11 @@ class AscendAttnBackend(AttentionBackend):
             mask_lse = mask_lse.squeeze(0)
             if mask_lse.dim() == 2:
                 mask_lse = mask_lse.unsqueeze(-1)
-            mask_lse = mask_lse.transpose(0, 1)
 
         print(f"after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
 
         if kv_nomask_idx.shape[0] == 0:
-            return mask_out[0]
+            return mask_out
 
         k_nomask = torch.index_select(k, 0, kv_nomask_idx).unsqueeze(0)
         v_nomask = torch.index_select(v, 0, kv_nomask_idx).unsqueeze(0)
@@ -959,16 +957,16 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=0,
             scale=layer.scaling,
             next_tokens=0,
-            inner_precise = 0
+            inner_precise=0
         )
         nomask_out = nomask_out.squeeze(0)
         nomask_lse = nomask_lse.squeeze(0)
-        if nomask_lse.dim()==2:
+        if nomask_lse.dim() == 2:
             nomask_lse = nomask_lse.unsqueeze(-1)
         nomask_lse = nomask_lse.transpose(0, 1)
 
         if mask_out is None:
-            return nomask_out[0]
+            return nomask_out
         
         print(f"after nomask attention caclulate {nomask_out.shape=}, {nomask_lse.shape=}")
 
@@ -989,6 +987,8 @@ class AscendAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         seq_len = q.shape[0]
+        if seq_len == 0:
+            return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
         split_len = (seq_len + 1) // 2
 
         q_head, q_tail = torch.split(q, [split_len, seq_len - split_len], dim=0)
@@ -1025,7 +1025,10 @@ class AscendAttnBackend(AttentionBackend):
             layer=layer,
             atten_mask=mask_tail,
         )
-        output = torch.cat([output_head, output_tail], dim=0)
+        output = [output_head, output_tail]
+        if q_tail.shape[0] > 0:
+            output.append(output_tail)
+        output = torch.cat(output, dim=0)
 
         return output.reshape(seq_len, -1)
 
