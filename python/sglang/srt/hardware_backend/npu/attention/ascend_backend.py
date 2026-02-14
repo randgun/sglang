@@ -635,7 +635,7 @@ class AscendAttnBackend(AttentionBackend):
                 v.unsqueeze(0),
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                input_layout="BSND",
                 atten_mask=self.fia_mask.unsqueeze(0) if attn_mask else None,
                 sparse_mode=3 if attn_mask else 0,
                 scale=layer.scaling,
@@ -1012,7 +1012,8 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if self.pcp_group.world_size > 1:
-                attn_output = forward_ring_zig(q, k, v, layer)
+                attn_output = self.forward_ring_zig(q, k, v, layer)
+                return attn_output
 
             if sinks is not None:
                 attn_out = attention_sinks_prefill_triton(
