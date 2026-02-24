@@ -913,7 +913,7 @@ class AscendAttnBackend(AttentionBackend):
             v_mask_4d = v_mask.unsqueeze(0)
             k_mask_4d = k_mask.unsqueeze(0)
             sparse_mode = 3 if (q.shape[0] != 1 and curr_atten_mask is not None) else 0
-            print(f"start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}, {kv_mask_idx.max().item()=}\
+            print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}, {kv_mask_idx.max().item()=}\
              , {kv_nomask_idx.max().item()=},{k_mask.shape[0]=},{sparse_mode=},{curr_atten_mask.shape=}")
 
             mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
@@ -936,7 +936,7 @@ class AscendAttnBackend(AttentionBackend):
             if mask_lse.dim() == 2:
                 mask_lse = mask_lse.transpose(0, 1).unsqueeze(-1)
 
-        print(f"after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
+        print(f"+++ after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
 
         if kv_nomask_idx.shape[0] == 0:
             return mask_out
@@ -1117,7 +1117,8 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_fia:
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=}")
+                if torch.distributed.get_rank() == 0:
+                    print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=}")
                 if use_pcp(forward_batch):
                     attn_output = self.forward_fia_pcp(
                         q=q,
