@@ -629,34 +629,7 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     # but communicate on PCP group (not attention-TP group).
     cp_rank_count = len(forward_batch.cp_metadata.max_rank_len)
     max_len = forward_batch.cp_metadata.max_rank_len[0]
-
-    # if cp_rank_count <= 1:
-    #     if _is_pcp_precision_debug_enabled():
-    #         logger.info(
-    #             "[pcp-debug] pcp_ag_rearange_output_skip: cp_rank_count=%s pcp_size_arg=%s %s",
-    #             cp_rank_count,
-    #             pcp_size,
-    #             _pcp_tensor_debug_summary("input", input_tensor),
-    #         )
-    #     return input_tensor
-
     pad_size = max_len - input_tensor.shape[0]
-    # if _is_pcp_precision_debug_enabled():
-    #     logger.info(
-    #         "[pcp-debug] pcp_ag_rearange_output_enter: "
-    #         "pcp_size_arg=%s cp_rank_count=%s max_len=%s pad_size=%s "
-    #         "max_rank_len=%s per_rank_actual_token=%s reverse_split_len=%s "
-    #         "cp_reverse_index=%s %s",
-    #         pcp_size,
-    #         cp_rank_count,
-    #         max_len,
-    #         pad_size,
-    #         forward_batch.cp_metadata.max_rank_len,
-    #         forward_batch.cp_metadata.per_rank_actual_token,
-    #         forward_batch.cp_metadata.reverse_split_len,
-    #         forward_batch.cp_metadata.cp_reverse_index,
-    #         _pcp_tensor_debug_summary("input", input_tensor),
-    #     )
 
     if pad_size > 0:
         input_tensor = F.pad(
@@ -702,16 +675,5 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     outputs = torch.cat(
         [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
     )
-
-    # if _is_pcp_precision_debug_enabled():
-    #     logger.info(
-    #         "[pcp-debug] pcp_ag_rearange_output_done: gathered_sum=%s "
-    #         "post_trim_cksum=%s post_reverse_cksum=%s expected_total_token=%s %s",
-    #         float(all_shuffled_sensor.sum().item()) if all_shuffled_sensor.numel() else 0.0,
-    #         float(output_tensor.sum().item()) if output_tensor.numel() else 0.0,
-    #         float(outputs.sum().item()) if outputs.numel() else 0.0,
-    #         sum(forward_batch.cp_metadata.reverse_split_len),
-    #         _pcp_tensor_debug_summary("output", outputs),
-    #     )
 
     return outputs

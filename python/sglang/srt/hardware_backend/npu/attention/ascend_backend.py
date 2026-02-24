@@ -912,8 +912,8 @@ class AscendAttnBackend(AttentionBackend):
             k_mask_4d = k_mask.unsqueeze(0)
             sparse_mode = 3 if (q.shape[0] != 1 and atten_mask is not None) else 0
             if torch.distributed.get_rank() == 0:
-                print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}, {kv_mask_idx.max().item()=}\
-             , {kv_nomask_idx.max().item()=},{k_mask.shape[0]=},{sparse_mode=}")
+                print(f"+++ start to fia attention with mask and nomask, {q_4d.shape=}, {k_mask_4d.shape=}, {v_mask_4d.shape=}, {kv_mask_idx.max().item()=}\
+             , {kv_nomask_idx.max().item()=},{k_mask_4d.shape[0]=},{sparse_mode=}")
 
             mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
                 q_4d,
@@ -1014,6 +1014,8 @@ class AscendAttnBackend(AttentionBackend):
             if q_tail_len > 0:
                 mask_tail = self.fia_mask[:q_tail_len, :q_tail_len].contiguous()
 
+        print(f"+++ start to fia attention with mask and nomask, {q_head.shape=}, {k.shape=}, {v.shape=}, {kv_with_q_head_mask_idx.max().item()=}\
+             , {kv_with_q_head_nomask_idx.max().item()=},{k.shape[0]=},")
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
             k=k,
