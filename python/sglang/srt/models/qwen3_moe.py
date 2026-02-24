@@ -463,7 +463,6 @@ class Qwen3MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.pcp_size = get_pcp_size() if self.enable_prefill_cp else None
-        self.cp_size = get_attention_tp_size()
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -575,8 +574,12 @@ class Qwen3MoeAttention(nn.Module):
 
 
         if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1 and use_pcp(forward_batch):
+            if self.layer_id==0 or self.layer_id == 1 and torch.distributed.get_rank()==0:
+                print(f"attention rerange before, {self.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{k[:,:5]}") 
             k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
             v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
+            if self.layer_id==0 or self.layer_id == 1 and torch.distributed.get_rank()==0:
+                print(f"attention rerange after, {self.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{k[:,:5]}") 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -838,7 +841,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        if self.layer_id==0 or self.layer_id == 1:
+        if self.layer_id==0 or self.layer_id == 1 and torch.distributed.get_rank()==0:
             print(f"after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:5]}") 
 
         if should_allreduce_fusion:
@@ -976,7 +979,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1:
+        if self.enable_prefill_cp and self.pcp_size > 1:
             if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
