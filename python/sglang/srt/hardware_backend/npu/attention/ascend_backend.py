@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from re import S
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -889,97 +890,172 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         atten_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        kv_mask_idx = kv_mask_idx.to(k.device)
-        kv_nomask_idx = kv_nomask_idx.to(k.device)
-        if kv_mask_idx.shape[0] == 0 and kv_nomask_idx.shape[0] == 0:
-            return torch.zeros(
-                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                device=q.device,
-                dtype=q.dtype,
-            )
+        device = q.device
+        q_unsqueeze = q.unsqueeze(0)
+        kv_mask_idx = kv_mask_idx.to(device)
+        k_mask = torch.index_select(k, 0, kv_mask_idx).unsqueeze(0)
+        v_mask = torch.index_select(v, 0, kv_mask_idx).unsqueeze(0)
 
-        q_4d = q.unsqueeze(0)
-        mask_out = None
-        mask_lse = None
-        if kv_mask_idx.shape[0] > 0:
-            k_mask = torch.index_select(k, 0, kv_mask_idx)
-            v_mask = torch.index_select(v, 0, kv_mask_idx)
-            v_mask_4d = v_mask.unsqueeze(0)
-            k_mask_4d = k_mask.unsqueeze(0)
-            sparse_mode = 3 if (q.shape[0] != 1 and atten_mask is not None) else 0
+        if torch.distributed.get_rank() == 0:
+            print(f"before mask attention caclulate {q_unsqueeze.shape=}, {k_mask.shape=}, {v_mask.shape=}, {atten_mask.shape=}")
 
-            if torch.distributed.get_rank() == 0:
-                print(f"+++ start to fia attention with mask and nomask, {q_4d.shape=}, {k_mask_4d.shape=}, {v_mask_4d.shape=}, {kv_mask_idx.max().item()=}\
-             , {kv_nomask_idx.max().item()=},{k_mask_4d.shape[0]=},{sparse_mode=}")
-
-            mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
-                q_4d,
-                k_mask_4d,
-                v_mask_4d,
+        mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q_unsqueeze,
+                k_mask,
+                v_mask,
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="BSND",
                 atten_mask=atten_mask,
-                sparse_mode=sparse_mode,
+                sparse_mode=3,
                 scale=layer.scaling,
                 next_tokens=0,
                 inner_precise=0,
                 softmax_lse_flag=True,
             )
-
-            mask_out = mask_out.squeeze(0)
-            mask_lse = mask_lse.squeeze(0)
-            if mask_lse.dim() == 2:
-                mask_lse = mask_lse.transpose(0, 1).unsqueeze(-1)
-
+        output_mask = mask_out.squeeze(0)
+        output_lse_mask = mask_lse.squeeze(0).squeeze(-1)
         if torch.distributed.get_rank() == 0:
-            print(f"+++ after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
+            print(f"after mask attention caclulate {output_mask.shape=}, {output_lse_mask.shape=}")
 
-        if kv_nomask_idx.shape[0] == 0:
-            return mask_out
+        if kv_mask_idx.shape[0] == 0:
+            return output_mask
 
+        kv_nomask_idx = kv_nomask_idx.to(device)
         k_nomask = torch.index_select(k, 0, kv_nomask_idx).unsqueeze(0)
         v_nomask = torch.index_select(v, 0, kv_nomask_idx).unsqueeze(0)
-
         if torch.distributed.get_rank() == 0:
-            print(f"+++ start to fia attention with mask and nomask, {q_4d.shape=}, {k_mask_4d.shape=}, {v_mask_4d.shape=}, {kv_mask_idx.max().item()=}\
-             , {kv_nomask_idx.max().item()=},{k_nomask.shape[0]=},{sparse_mode=}")
-        
+            print(f"before nomask attention caclulate {q_unsqueeze.shape=}, {k_nomask.shape=}, {v_nomask.shape=}, {atten_mask.shape=}")
         nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
-            q_4d,
-            k_nomask,
-            v_nomask,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="BSND",
-            atten_mask=None,
-            sparse_mode=0,
-            scale=layer.scaling,
-            next_tokens=0,
-            inner_precise=0,
-            softmax_lse_flag=True,
-        )
-        nomask_out = nomask_out.squeeze(0)
-        nomask_lse = nomask_lse.squeeze(0)
-        if nomask_lse.dim() == 2:
-            nomask_lse = nomask_lse.transpose(0, 1).unsqueeze(-1)
-        # else:
-        #     nomask_lse = nomask_lse.transpose(0, 1)
-
-        if mask_out is None:
-            return nomask_out
-        
+                q_unsqueeze,
+                k_nomask,
+                v_nomask,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=atten_mask,
+                sparse_mode=3,
+                scale=layer.scaling,
+                next_tokens=0,
+                inner_precise=0,
+                softmax_lse_flag=True,
+            )
+        output_mask_nomask = nomask_out.squeeze(0)
+        output_lse_nomask = nomask_lse.squeeze(0).squeeze(-1)
+        lse_max = torch.maximum(output_lse_mask, output_lse_nomask)
+        exp_mask = torch.exp(output_lse_mask - lse_max)
+        exp_nomask = torch.exp(output_lse_nomask - lse_max)
         if torch.distributed.get_rank() == 0:
-            print(f"after nomask attention caclulate {nomask_out.shape=}, {nomask_lse.shape=}")
+            print(f"after nomask attention caclulate {output_mask_nomask.shape=}, {output_lse_nomask.shape=}")
+
+        exp_mask = exp_mask.transpose(0, 1).unsqueeze(-1)
+        exp_nomask = exp_nomask.transpose(0, 1).unsqueeze(-1)
+
+        output = (output_mask * exp_mask + output_mask_nomask * exp_nomask) / (exp_mask + exp_nomask)
+
+        return output
 
 
-        # max_lse = torch.maximum(mask_lse, nomask_lse)
-        # w1 = torch.exp(mask_lse - max_lse)
-        # w2 = torch.exp(nomask_lse - max_lse)
-        # result = (w1 * mask_out + w2 * nomask_out) / (w1 + w2)
-        # result = result.to(mask_out.dtype)
-        result = mask_out + nomask_out
-        return result 
+
+
+
+
+
+        # kv_mask_idx = kv_mask_idx.to(k.device)
+        # kv_nomask_idx = kv_nomask_idx.to(k.device)
+        # if kv_mask_idx.shape[0] == 0 and kv_nomask_idx.shape[0] == 0:
+        #     return torch.zeros(
+        #         (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+        #         device=q.device,
+        #         dtype=q.dtype,
+        #     )
+
+        # q_4d = q.unsqueeze(0)
+        # mask_out = None
+        # mask_lse = None
+        # if kv_mask_idx.shape[0] > 0:
+        #     k_mask = torch.index_select(k, 0, kv_mask_idx)
+        #     v_mask = torch.index_select(v, 0, kv_mask_idx)
+        #     v_mask_4d = v_mask.unsqueeze(0)
+        #     k_mask_4d = k_mask.unsqueeze(0)
+        #     sparse_mode = 3 if (q.shape[0] != 1 and atten_mask is not None) else 0
+
+        #     if torch.distributed.get_rank() == 0:
+        #         print(f"+++ start to fia attention with mask and nomask, {q_4d.shape=}, {k_mask_4d.shape=}, {v_mask_4d.shape=}, {kv_mask_idx.max().item()=}\
+        #      , {kv_nomask_idx.max().item()=},{k_mask_4d.shape[0]=},{sparse_mode=}")
+
+        #     mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
+        #         q_4d,
+        #         k_mask_4d,
+        #         v_mask_4d,
+        #         num_heads=layer.tp_q_head_num,
+        #         num_key_value_heads=layer.tp_k_head_num,
+        #         input_layout="BSND",
+        #         atten_mask=atten_mask,
+        #         sparse_mode=sparse_mode,
+        #         scale=layer.scaling,
+        #         next_tokens=0,
+        #         inner_precise=0,
+        #         softmax_lse_flag=True,
+        #     )
+
+        #     mask_out = mask_out.squeeze(0)
+        #     mask_lse = mask_lse.squeeze(0)
+        #     if mask_lse.dim() == 2:
+        #         mask_lse = mask_lse.transpose(0, 1).unsqueeze(-1)
+
+        # if torch.distributed.get_rank() == 0:
+        #     print(f"+++ after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
+
+        # if kv_nomask_idx.shape[0] == 0:
+        #     return mask_out
+
+        # k_nomask = torch.index_select(k, 0, kv_nomask_idx).unsqueeze(0)
+        # v_nomask = torch.index_select(v, 0, kv_nomask_idx).unsqueeze(0)
+
+        # if torch.distributed.get_rank() == 0:
+        #     print(f"+++ start to fia attention with mask and nomask, {q_4d.shape=}, {k_mask_4d.shape=}, {v_mask_4d.shape=}, {kv_mask_idx.max().item()=}\
+        #      , {kv_nomask_idx.max().item()=},{k_nomask.shape[0]=},{sparse_mode=}")
+        
+        # nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
+        #     q_4d,
+        #     k_nomask,
+        #     v_nomask,
+        #     num_heads=layer.tp_q_head_num,
+        #     num_key_value_heads=layer.tp_k_head_num,
+        #     input_layout="BSND",
+        #     atten_mask=None,
+        #     mask_lse=mask_lse,
+        #     sparse_mode=0,
+        #     scale=layer.scaling,
+        #     next_tokens=0,
+        #     inner_precise=0,
+        #     softmax_lse_flag=True,
+        # )
+
+        # nomask_out = nomask_out.squeeze(0)
+        # nomask_lse = nomask_lse.squeeze(0)
+
+        # if nomask_lse.dim() == 2:
+        #     nomask_lse = nomask_lse.transpose(0, 1).unsqueeze(-1)
+            
+        # # else:
+        # #     nomask_lse = nomask_lse.transpose(0, 1)
+
+        # if mask_out is None:
+        #     return nomask_out
+        
+        # if torch.distributed.get_rank() == 0:
+        #     print(f"after nomask attention caclulate {nomask_out.shape=}, {nomask_lse.shape=}")
+
+
+        # # max_lse = torch.maximum(mask_lse, nomask_lse)
+        # # w1 = torch.exp(mask_lse - max_lse)
+        # # w2 = torch.exp(nomask_lse - max_lse)
+        # # result = (w1 * mask_out + w2 * nomask_out) / (w1 + w2)
+        # # result = result.to(mask_out.dtype)
+        # result = mask_out + nomask_out
+        # return result 
 
     def forward_fia_pcp(
         self,
@@ -998,25 +1074,18 @@ class AscendAttnBackend(AttentionBackend):
         q_head = q_head.contiguous()
         q_tail = q_tail.contiguous()
 
-        kv_with_q_head_nomask_idx = forward_batch.cp_metadata.kv_with_q_head_nomask_idx
-        kv_with_q_head_mask_idx = forward_batch.cp_metadata.kv_with_q_head_mask_idx
-        kv_with_q_tail_nomask_idx = forward_batch.cp_metadata.kv_with_q_tail_nomask_idx
-        kv_with_q_tail_mask_idx = forward_batch.cp_metadata.kv_with_q_tail_mask_idx
+        pcp_metadata = forward_batch.cp_metadata
+        atten_mask = self.fia_mask.unsqueeze(0)
 
-        mask_head = None
-        mask_tail = None
-        if self.fia_mask is not None:
-            q_head_len = q_head.shape[0]
-            q_tail_len = q_tail.shape[0]
-            # 对角块永远需要标准下三角 Mask，所以均从 0 开始双维切片
-            if q_head_len > 0:
-                mask_head = self.fia_mask[:q_head_len, :q_head_len].contiguous()
-            if q_tail_len > 0:
-                mask_tail = self.fia_mask[:q_tail_len, :q_tail_len].contiguous()
+
+        kv_with_q_head_nomask_idx = pcp_metadata.kv_with_q_head_nomask_idx
+        kv_with_q_head_mask_idx = pcp_metadata.kv_with_q_head_mask_idx
+        kv_with_q_tail_nomask_idx = pcp_metadata.kv_with_q_tail_nomask_idx
+        kv_with_q_tail_mask_idx = pcp_metadata.kv_with_q_tail_mask_idx
 
         print(f"+++ start to fia attention with mask and nomask, {q_head.shape=}, {k.shape=}, {v.shape=}, {kv_with_q_head_mask_idx.max().item()=}\
              , {kv_with_q_head_nomask_idx.max().item()=},{k.shape[0]=},")
-        atten_mask = self.fia_mask.unsqueeze(0)
+        
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
             k=k,
@@ -1026,20 +1095,21 @@ class AscendAttnBackend(AttentionBackend):
             layer=layer,
             atten_mask=atten_mask,
         )
-        output_tail = self._fia_attention_with_mask_and_nomask(
-            q=q_tail,
-            k=k,
-            v=v,
-            kv_mask_idx=kv_with_q_tail_mask_idx,
-            kv_nomask_idx=kv_with_q_tail_nomask_idx,
-            layer=layer,
-            atten_mask=atten_mask,
-        )
-        output = [output_head]
-        if q_tail.shape[0] > 0:
-            output.append(output_tail)
-        output = torch.cat(output, dim=0)
 
+        output=[output_head]
+        if q_tail.shape[0]>0:
+            output_tail = self._fia_attention_with_mask_and_nomask(
+                q=q_tail,
+                k=k,
+                v=v,
+                kv_mask_idx=kv_with_q_tail_mask_idx,
+                kv_nomask_idx=kv_with_q_tail_nomask_idx,
+                layer=layer,
+                atten_mask=atten_mask,
+            )
+            output.append(output_tail)
+
+        output = torch.cat(output, dim=0)
         return output.reshape(seq_len, -1)
 
     def forward_extend(
