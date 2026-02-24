@@ -582,7 +582,7 @@ class Qwen3MoeAttention(nn.Module):
                 print(f"+++ attention rerange after, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{q.sum()=},{v.sum()=}") 
         inner_state = q, k, v, forward_batch
         if self.attn.layer_id==0 and torch.distributed.get_rank()==0:
-            print(f"+++ output resule, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{q.sum()=},{v.sum()=}")
+            print(f"+++ output result, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{q.sum()=},{v.sum()=}")
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
@@ -814,7 +814,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
-        if self.layer_id==0:
+        if self.layer_id==0 and torch.distributed.get_rank()==0:
             print(f"+++ prepare attn and capture, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:3]}") 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -826,7 +826,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if self.layer_id==0:
+        if self.layer_id==0 and torch.distributed.get_rank()==0:
             print(f"+++ prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:3]}") 
 
         should_allreduce_fusion = (
@@ -843,7 +843,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        if self.layer_id==0 or self.layer_id == 1 and torch.distributed.get_rank()==0:
+        if self.layer_id==0 and torch.distributed.get_rank()==0:
             print(f"+++ after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:3]}") 
 
         if should_allreduce_fusion:
