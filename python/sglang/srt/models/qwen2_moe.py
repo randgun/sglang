@@ -635,8 +635,8 @@ class Qwen2MoeModel(nn.Module):
             residual = None
             if self.enable_prefill_cp and use_pcp(forward_batch):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-                if self.layer_id==0 or self.layer_id == 1 and torch.distributed.get_rank()==0:
-                    print(f"cp split and rebuild data, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:5]}") 
+                if torch.distributed.get_rank()==0:
+                    print(f"cp split and rebuild hidden states,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:5]}") 
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -644,6 +644,8 @@ class Qwen2MoeModel(nn.Module):
 
         if self.enable_prefill_cp and use_pcp(forward_batch):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            if torch.distributed.get_rank()==0:
+                    print(f"cp split and rebuild position,{torch.distributed.get_rank()=},{positions.sum()=},{positions[:,:5]}") 
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
