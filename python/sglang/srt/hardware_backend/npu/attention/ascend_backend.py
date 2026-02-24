@@ -934,7 +934,7 @@ class AscendAttnBackend(AttentionBackend):
             mask_out = mask_out.squeeze(0)
             mask_lse = mask_lse.squeeze(0)
             if mask_lse.dim() == 2:
-                mask_lse = mask_lse.unsqueeze(-1)
+                mask_lse = mask_lse.transpose(0, 1).unsqueeze(-1)
 
         print(f"after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
 
@@ -964,8 +964,9 @@ class AscendAttnBackend(AttentionBackend):
         nomask_out = nomask_out.squeeze(0)
         nomask_lse = nomask_lse.squeeze(0)
         if nomask_lse.dim() == 2:
-            nomask_lse = nomask_lse.unsqueeze(-1)
-        nomask_lse = nomask_lse.transpose(0, 1)
+            nomask_lse = nomask_lse.transpose(0, 1).unsqueeze(-1)
+        else:
+            nomask_lse = nomask_lse.transpose(0, 1)
 
         if mask_out is None:
             return nomask_out
@@ -1005,9 +1006,13 @@ class AscendAttnBackend(AttentionBackend):
         mask_head = None
         mask_tail = None
         if self.fia_mask is not None:
-            if self.fia_mask.shape[0] == seq_len:
-                mask_head = self.fia_mask[:split_len].contiguous()
-                mask_tail = self.fia_mask[split_len:].contiguous()
+            q_head_len = q_head.shape[0]
+            q_tail_len = q_tail.shape[0]
+            # 对角块永远需要标准下三角 Mask，所以均从 0 开始双维切片
+            if q_head_len > 0:
+                mask_head = self.fia_mask[:q_head_len, :q_head_len].contiguous()
+            if q_tail_len > 0:
+                mask_tail = self.fia_mask[:q_tail_len, :q_tail_len].contiguous()
 
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
