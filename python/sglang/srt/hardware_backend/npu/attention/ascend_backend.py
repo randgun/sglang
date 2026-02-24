@@ -898,18 +898,16 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=q.dtype,
             )
 
-        
         q_4d = q.unsqueeze(0)
         mask_out = None
         mask_lse = None
-
-
         if kv_mask_idx.shape[0] > 0:
             k_mask = torch.index_select(k, 0, kv_mask_idx)
             v_mask = torch.index_select(v, 0, kv_mask_idx)
             v_mask_4d = v_mask.unsqueeze(0)
             k_mask_4d = k_mask.unsqueeze(0)
             sparse_mode = 3 if (q.shape[0] != 1 and atten_mask is not None) else 0
+
             if torch.distributed.get_rank() == 0:
                 print(f"+++ start to fia attention with mask and nomask, {q_4d.shape=}, {k_mask_4d.shape=}, {v_mask_4d.shape=}, {kv_mask_idx.max().item()=}\
              , {kv_nomask_idx.max().item()=},{k_mask_4d.shape[0]=},{sparse_mode=}")
@@ -934,7 +932,8 @@ class AscendAttnBackend(AttentionBackend):
             if mask_lse.dim() == 2:
                 mask_lse = mask_lse.transpose(0, 1).unsqueeze(-1)
 
-        print(f"+++ after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
+        if torch.distributed.get_rank() == 0:
+            print(f"+++ after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
 
         if kv_nomask_idx.shape[0] == 0:
             return mask_out
@@ -970,14 +969,16 @@ class AscendAttnBackend(AttentionBackend):
         if mask_out is None:
             return nomask_out
         
-        print(f"after nomask attention caclulate {nomask_out.shape=}, {nomask_lse.shape=}")
+        if torch.distributed.get_rank() == 0:
+            print(f"after nomask attention caclulate {nomask_out.shape=}, {nomask_lse.shape=}")
 
 
-        max_lse = torch.maximum(mask_lse, nomask_lse)
-        w1 = torch.exp(mask_lse - max_lse)
-        w2 = torch.exp(nomask_lse - max_lse)
-        result = (w1 * mask_out + w2 * nomask_out) / (w1 + w2)
-        result = result.to(mask_out.dtype)
+        # max_lse = torch.maximum(mask_lse, nomask_lse)
+        # w1 = torch.exp(mask_lse - max_lse)
+        # w2 = torch.exp(nomask_lse - max_lse)
+        # result = (w1 * mask_out + w2 * nomask_out) / (w1 + w2)
+        # result = result.to(mask_out.dtype)
+        result = mask_out + nomask_out
         return result 
 
     def forward_fia_pcp(
