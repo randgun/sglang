@@ -1082,9 +1082,9 @@ class AscendAttnBackend(AttentionBackend):
         kv_with_q_head_mask_idx = pcp_metadata.kv_with_q_head_mask_idx
         kv_with_q_tail_nomask_idx = pcp_metadata.kv_with_q_tail_nomask_idx
         kv_with_q_tail_mask_idx = pcp_metadata.kv_with_q_tail_mask_idx
-
-        print(f"+++ start to fia attention with mask and nomask, {q_head.shape=}, {k.shape=}, {v.shape=}, {kv_with_q_head_mask_idx.max().item()=}\
-             , {kv_with_q_head_nomask_idx.max().item()=},{k.shape[0]=},")
+        if torch.distributed.get_rank() == 0:
+            print(f"+++ start to fia attention with mask and nomask, {q_head.shape=}, {k.shape=}, {v.shape=}, {kv_with_q_head_mask_idx.max().item()=}\
+                , {kv_with_q_head_nomask_idx.max().item()=},{k.shape[0]=},")
         
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,

@@ -31,21 +31,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _is_pcp_precision_debug_enabled() -> bool:
-    return get_bool_env_var("SGLANG_PCP_DEBUG_PRECISION")
-
-
-def _pcp_tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
-    if tensor.numel() == 0:
-        return (
-            f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-            f"device={tensor.device} sum=0.0"
-        )
-    return (
-        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-        f"device={tensor.device} sum={float(tensor.sum().item())}"
-    )
-
 
 
 

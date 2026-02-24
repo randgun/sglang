@@ -25,54 +25,6 @@ from sglang.srt.utils.common import ceil_align, ceil_div
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-logger = logging.getLogger(__name__)
-
-
-def _is_pcp_precision_debug_enabled() -> bool:
-    return os.getenv("SGLANG_PCP_DEBUG_PRECISION", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _pcp_tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
-    if tensor is None:
-        return f"{name}=None"
-    if tensor.numel() == 0:
-        return (
-            f"{name}(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-            "numel=0, empty=True)"
-        )
-
-    t = tensor.detach()
-    if t.dtype.is_floating_point or t.is_complex():
-        tf = t.float()
-        finite = torch.isfinite(tf)
-        finite_count = int(finite.sum().item())
-        total = tf.numel()
-        finite_tf = tf[finite]
-        if finite_count > 0:
-            min_v = float(finite_tf.min().item())
-            max_v = float(finite_tf.max().item())
-            mean_v = float(finite_tf.mean().item())
-            std_v = float(finite_tf.std(unbiased=False).item())
-        else:
-            min_v = max_v = mean_v = std_v = float("nan")
-        abs_max = float(tf.abs().max().item())
-        return (
-            f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={total}, "
-            f"finite={finite_count}/{total}, min={min_v:.6e}, max={max_v:.6e}, "
-            f"mean={mean_v:.6e}, std={std_v:.6e}, abs_max={abs_max:.6e})"
-        )
-
-    ti = t.to(torch.int64)
-    return (
-        f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={ti.numel()}, "
-        f"min={int(ti.min().item())}, max={int(ti.max().item())})"
-    )
-
 
 @dataclass
 class ContextParallelMetadata:

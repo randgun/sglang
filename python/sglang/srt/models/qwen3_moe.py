@@ -814,8 +814,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
-        if self.layer_id==0 and torch.distributed.get_rank()==0:
+        if self.layer_id==0 and torch.distributed.get_rank in (0,1,2,3,4):
             print(f"+++ prepare attn and capture, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -826,8 +827,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if self.layer_id==0 and torch.distributed.get_rank()==0:
-            print(f"+++ prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+        if self.layer_id==0 and torch.distributed.get_rank() in (0,1,2,3,4):
+            print(f"+++ after attention and prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -843,7 +844,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        if self.layer_id==0 and torch.distributed.get_rank()==0:
+        if self.layer_id==0 and torch.distributed.get_rank() in (0,1,2,3,4):
             print(f"+++ after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if should_allreduce_fusion:
@@ -989,9 +990,9 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_size,
                     input_ids.device,
                 )
-                if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 1:
-                    print(f"pcp metadata {forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
-                        {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}")
+                if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
+                    print(f"+++ pcp metadata {forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
+                    {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}")
         hidden_states = self.model(
             input_ids,
             positions,
