@@ -903,7 +903,6 @@ class AscendAttnBackend(AttentionBackend):
         mask_out = None
         mask_lse = None
 
-        atten_mask = self.fia_mask.unsqueeze(0),
 
         if kv_mask_idx.shape[0] > 0:
             k_mask = torch.index_select(k, 0, kv_mask_idx)
@@ -1016,6 +1015,7 @@ class AscendAttnBackend(AttentionBackend):
 
         print(f"+++ start to fia attention with mask and nomask, {q_head.shape=}, {k.shape=}, {v.shape=}, {kv_with_q_head_mask_idx.max().item()=}\
              , {kv_with_q_head_nomask_idx.max().item()=},{k.shape[0]=},")
+        atten_mask = self.fia_mask.unsqueeze(0)
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
             k=k,
@@ -1023,7 +1023,7 @@ class AscendAttnBackend(AttentionBackend):
             kv_mask_idx=kv_with_q_head_mask_idx,
             kv_nomask_idx=kv_with_q_head_nomask_idx,
             layer=layer,
-            atten_mask=mask_head,
+            atten_mask=atten_mask,
         )
         output_tail = self._fia_attention_with_mask_and_nomask(
             q=q_tail,
@@ -1032,7 +1032,7 @@ class AscendAttnBackend(AttentionBackend):
             kv_mask_idx=kv_with_q_tail_mask_idx,
             kv_nomask_idx=kv_with_q_tail_nomask_idx,
             layer=layer,
-            atten_mask=mask_tail,
+            atten_mask=atten_mask,
         )
         output = [output_head, output_tail]
         if q_tail.shape[0] > 0:
