@@ -574,12 +574,12 @@ class Qwen3MoeAttention(nn.Module):
 
 
         if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1 and use_pcp(forward_batch):
-            if self.layer_id==0 or self.layer_id == 1 and torch.distributed.get_rank()==0:
-                print(f"attention rerange before, {self.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{k[:,:5]}") 
+            if self.attn.layer_id==0 or self.attn.layer_id == 1 and torch.distributed.get_rank()==0:
+                print(f"attention rerange before, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{k[:,:5]}")  
             k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
             v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
-            if self.layer_id==0 or self.layer_id == 1 and torch.distributed.get_rank()==0:
-                print(f"attention rerange after, {self.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{k[:,:5]}") 
+            if self.attn.layer_id==0 or self.attn.layer_id == 1 and torch.distributed.get_rank()==0:
+                print(f"attention rerange after, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{k[:,:5]}") 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
