@@ -84,9 +84,14 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
+    process_shared_expert,
+    wait_share_stream,
+    process_routed_expert,
+    wait_routed_stream,
 )
 
 _is_hip = is_hip()
@@ -95,9 +100,14 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
 
 
 class Glm4MoeMLP(nn.Module):
@@ -293,10 +303,29 @@ class Glm4MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+
+        if not _is_npu or forward_batch.forward_mode.is_extend():
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.use_qk_norm:
+                q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
+                self.rotary_emb.get_cos_sin_with_position(positions)
+            q, k, v = split_qkv_rmsnorm_rope(
+                qkv,
+                self.rotary_emb.position_sin,
+                self.rotary_emb.position_cos,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                eps=self.q_norm.variance_epsilon,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                q_bias=getattr(self.q_norm, "bias", None),
+                k_bias=getattr(self.k_norm, "bias", None),
+            )
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -554,10 +583,17 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+        )
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if is_prefill:
+                shared_output = process_shared_expert(hidden_states, self._forward_shared_experts)
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -568,10 +604,16 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+
+        if is_prefill:
+            final_hidden_states = process_routed_expert(hidden_states, topk_output, self.experts)
+            wait_share_stream()
+            wait_routed_stream()
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if shared_output is not None:
             x = shared_output
