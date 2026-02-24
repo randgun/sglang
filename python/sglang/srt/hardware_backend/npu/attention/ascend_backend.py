@@ -943,7 +943,7 @@ class AscendAttnBackend(AttentionBackend):
         v_nomask = torch.index_select(v, 0, kv_nomask_idx).unsqueeze(0)
 
         if torch.distributed.get_rank() == 0:
-            print(f"start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}, {kv_mask_idx.max().item()=}\
+            print(f"+++ start to fia attention with mask and nomask, {q_4d.shape=}, {k_mask_4d.shape=}, {v_mask_4d.shape=}, {kv_mask_idx.max().item()=}\
              , {kv_nomask_idx.max().item()=},{k_nomask.shape[0]=},{sparse_mode=}")
         
         nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
@@ -964,8 +964,8 @@ class AscendAttnBackend(AttentionBackend):
         nomask_lse = nomask_lse.squeeze(0)
         if nomask_lse.dim() == 2:
             nomask_lse = nomask_lse.transpose(0, 1).unsqueeze(-1)
-        else:
-            nomask_lse = nomask_lse.transpose(0, 1)
+        # else:
+        #     nomask_lse = nomask_lse.transpose(0, 1)
 
         if mask_out is None:
             return nomask_out
@@ -1034,7 +1034,7 @@ class AscendAttnBackend(AttentionBackend):
             layer=layer,
             atten_mask=atten_mask,
         )
-        output = [output_head, output_tail]
+        output = [output_head]
         if q_tail.shape[0] > 0:
             output.append(output_tail)
         output = torch.cat(output, dim=0)
