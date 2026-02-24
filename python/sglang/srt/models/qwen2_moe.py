@@ -678,7 +678,7 @@ class Qwen2MoeModel(nn.Module):
                             else None
                         ),
                     )
-                    if self.layer_id==0 and torch.distributed.get_rank() in (0,1):
+                    if layer.layer_id == 0 and torch.distributed.get_rank() in (0,1):
                         print(f"+++ hidden_states and positions,{torch.distributed.get_rank()=},{hidden_states.sum()=},{positions[:]}") 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
