@@ -951,6 +951,7 @@ class AscendAttnBackend(AttentionBackend):
         exp_nomask = exp_nomask.transpose(0, 1).unsqueeze(-1)
 
         output = (output_mask * exp_mask + output_mask_nomask * exp_nomask) / (exp_mask + exp_nomask)
+        output = output.to(mask_out.dtype)
 
         return output
 
