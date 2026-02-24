@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from re import S
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
