@@ -694,11 +694,12 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-                hidden_states = pcp_ag_rearange_output(
-                hidden_states,
-                self.pcp_size,
-                forward_batch,
-            )
+                if self.enable_prefill_cp and use_pcp(forward_batch):
+                    hidden_states = pcp_ag_rearange_output(
+                    hidden_states.contiguous(),
+                    self.pcp_size,
+                    forward_batch,
+                )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
