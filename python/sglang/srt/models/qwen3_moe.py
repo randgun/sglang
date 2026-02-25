@@ -814,7 +814,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
-        if self.layer_id==0 and torch.distributed.get_rank in (0,1,2,3,4):
+        if self.layer_id==0 and torch.distributed.get_rank() in (0,1,2,3,4):
             print(f"+++ prepare attn and capture, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if hidden_states.shape[0] != 0:
