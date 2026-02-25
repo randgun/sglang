@@ -694,6 +694,12 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = pcp_ag_rearange_output(
+                hidden_states,
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
 

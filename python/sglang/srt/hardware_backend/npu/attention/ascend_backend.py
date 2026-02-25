@@ -917,7 +917,7 @@ class AscendAttnBackend(AttentionBackend):
         if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
             print(f"+++ after mask attention caclulate {output_mask.shape=}, {output_lse_mask.shape=}")
 
-        if kv_mask_idx.shape[0] == 0:
+        if kv_nomask_idx.shape[0] == 0:
             return output_mask
 
         kv_nomask_idx = kv_nomask_idx.to(device)
@@ -932,8 +932,8 @@ class AscendAttnBackend(AttentionBackend):
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="BSND",
-                atten_mask=atten_mask,
-                sparse_mode=3,
+                atten_mask=None,
+                sparse_mode=0,
                 scale=layer.scaling,
                 next_tokens=0,
                 inner_precise=0,
