@@ -612,7 +612,6 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
     # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
     # but communicate on PCP group (not attention-TP group).
-    cp_rank_count = len(forward_batch.cp_metadata.max_rank_len)
     max_len = forward_batch.cp_metadata.max_rank_len[0]
     pad_size = max_len - input_tensor.shape[0]
 
@@ -625,26 +624,29 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
         )
 
     all_shuffled_sensor = torch.empty(
-        max_len * cp_rank_count,
+        max_len * pcp_size,
         input_tensor.shape[-1],
         dtype=input_tensor.dtype,
         device=input_tensor.device,
     )
 
     pcp_group = get_pcp_group()
-    assert (
-        pcp_group.world_size == cp_rank_count
-    ), f"pcp metadata/group mismatch: cp_rank_count={cp_rank_count}, pcp_group.world_size={pcp_group.world_size}"
-    pcp_group.all_gather_into_tensor(all_shuffled_sensor, input_tensor)
-    
-    outputs_list = [torch.split(all_shuffled_sensor,forward_batch.cp_metadata.reverse_split_len,dim=0)]
-    outputs = torch.cat(
-        [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index],dim=0
-        )
-    total_actual_tokens = sum(forward_batch.cp_metadata.per_rank_actual_token)
-    outputs = outputs[:total_actual_tokens]
-    return outputs
 
+    assert (
+        pcp_group.world_size == pcp_size
+    ), f"pcp metadata/group mismatch: pcp_size={pcp_size}, pcp_group.world_size={pcp_group.world_size}"
+
+    pcp_group.all_gather_into_tensor(
+        all_shuffled_sensor, input_tensor
+        )
+    
+    # outputs_list = [torch.split(all_shuffled_sensor,forward_batch.cp_metadata.reverse_split_len,dim=0)]
+    # outputs = torch.cat(
+    #     [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index],dim=0
+    #     )
+    # total_actual_tokens = sum(forward_batch.cp_metadata.per_rank_actual_token)
+    # outputs = outputs[:total_actual_tokens]
+    # return outputs
 
     splitted_tensor = list(
         torch.split(
