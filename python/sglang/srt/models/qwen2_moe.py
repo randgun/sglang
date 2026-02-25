@@ -645,7 +645,8 @@ class Qwen2MoeModel(nn.Module):
         if self.enable_prefill_cp and use_pcp(forward_batch):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
             if torch.distributed.get_rank() in (0,1):
-                print(f"+++ cp split and rebuild position,{torch.distributed.get_rank()=},{positions.sum()=},{positions[:]}") 
+                print(f"+++ cp split and rebuild position,{torch.distributed.get_rank()=},{positions.sum()=},{positions=},{forward_batch.cp_metadata.split_list=},\
+                    {forward_batch.extend_seq_lens=},{forward_batch.extend_seq_lens.sum()=}") 
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:

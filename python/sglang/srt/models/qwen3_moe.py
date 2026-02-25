@@ -983,16 +983,17 @@ class Qwen3MoeForCausalLM(nn.Module):
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
         if self.enable_prefill_cp and self.pcp_size > 1:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+            cur_cp_seq_len = len(input_ids) // (self.pcp_size*2)
+            if can_cp_split(len(cur_cp_seq_len), self.pcp_size, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
+                    torch.tensor(len(input_ids)),
                     self.pcp_rank,
                     self.pcp_size,
                     input_ids.device,
                 )
                 if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
                     print(f"+++ pcp metadata {forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
-                    {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}")
+                    {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
         hidden_states = self.model(
             input_ids,
             positions,
