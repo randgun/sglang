@@ -623,6 +623,7 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
             mode="constant",
             value=0,
         )
+
     all_shuffled_sensor = torch.empty(
         max_len * cp_rank_count,
         input_tensor.shape[-1],
@@ -635,6 +636,15 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
         pcp_group.world_size == cp_rank_count
     ), f"pcp metadata/group mismatch: cp_rank_count={cp_rank_count}, pcp_group.world_size={pcp_group.world_size}"
     pcp_group.all_gather_into_tensor(all_shuffled_sensor, input_tensor)
+    
+    outputs_list = [torch.split(all_shuffled_sensor,forward_batch.cp_metadata.reverse_split_len,dim=0)]
+    outputs = torch.cat(
+        [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index],dim=0
+        )
+    total_actual_tokens = sum(forward_batch.cp_metadata.per_rank_actual_token)
+    outputs = outputs[:total_actual_tokens]
+    return outputs
+
 
     splitted_tensor = list(
         torch.split(
