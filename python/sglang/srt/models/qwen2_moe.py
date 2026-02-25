@@ -696,7 +696,7 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
                 hidden_states = pcp_ag_rearange_output(
                 hidden_states,
-                self.cp_size,
+                self.pcp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
