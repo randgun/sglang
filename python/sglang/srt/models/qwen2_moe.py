@@ -698,7 +698,6 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states,
                 self.pcp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
             )
         if len(aux_hidden_states) == 0:
             return hidden_states
