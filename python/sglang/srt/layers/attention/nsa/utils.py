@@ -600,7 +600,7 @@ def prepare_input_dp_with_cp_dsa(
         device=device, dtype=torch.int32
     )    
 
-    attn_mask_seqlens = torch.tensor([seq_per_batch, seq_per_batch], dtype=torch.int32)
+    attn_mask_seqlens = torch.tensor([[seq_per_batch], [seq_per_batch]], dtype=torch.int32)
 
     cp_metadata = ContextParallelMetadata(
         split_list=split_list,

@@ -939,7 +939,7 @@ class AscendAttnBackend(AttentionBackend):
             next_tokens=0,
             inner_precise=0,
             softmax_lse_flag=True,
-            actual_seq_lengths_kv=kv_nomask_seqlens,
+            actual_seq_lengths_kv=kv_mask_seqlens,
             actual_seq_lengths=q_seqlens,
         )
         # if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
@@ -947,11 +947,10 @@ class AscendAttnBackend(AttentionBackend):
 
         attn_output = mask_out
         attn_lse = mask_lse
-        if k_nomask is not None:
-            attn_output, attn_lse = self._update_out_and_lse(
-                torch.stack([nomask_out, mask_out], dim=0),
-                torch.stack([nomask_lse, mask_lse], dim=0),
-            )
+        attn_output, attn_lse = self._update_out_and_lse(
+            torch.stack([nomask_out, mask_out], dim=0),
+            torch.stack([nomask_lse, mask_lse], dim=0),
+        )
         return attn_output,attn_lse
 
     def _update_out_and_lse(
@@ -992,7 +991,7 @@ class AscendAttnBackend(AttentionBackend):
         head_attn_nomask_seqlens = pcp_metadata.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = pcp_metadata.tail_attn_nomask_seqlens
         
-        output_head = self._fia_attention_with_mask_and_nomask(
+        output_head, attn_lse_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
             k=k,
             v=v,
@@ -1009,7 +1008,7 @@ class AscendAttnBackend(AttentionBackend):
 
         output=[output_head]
         if q_tail.shape[0]>0:
-            output_tail = self._fia_attention_with_mask_and_nomask(
+            output_tail, attn_lse_tail = self._fia_attention_with_mask_and_nomask(
                 q=q_tail,
                 k=k,
                 v=v,
