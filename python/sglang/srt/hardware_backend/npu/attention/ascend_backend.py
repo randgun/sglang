@@ -939,7 +939,7 @@ class AscendAttnBackend(AttentionBackend):
             next_tokens=0,
             inner_precise=0,
             softmax_lse_flag=True,
-            actual_seq_lengths_kv=kv_mask_seqlens,
+            actual_seq_lengths_kv=kv_nomask_seqlens,
             actual_seq_lengths=q_seqlens,
         )
         if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
@@ -988,9 +988,9 @@ class AscendAttnBackend(AttentionBackend):
         kv_with_q_head_mask_idx = pcp_metadata.kv_with_q_head_mask_idx
         kv_with_q_tail_nomask_idx = pcp_metadata.kv_with_q_tail_nomask_idx
         kv_with_q_tail_mask_idx = pcp_metadata.kv_with_q_tail_mask_idx
-        attn_mask_seqlens = pcp_metadata.attn_mask_seqlens.view(-1).tolist()
-        head_attn_nomask_seqlens = pcp_metadata.head_attn_nomask_seqlens.view(-1).tolist()
-        tail_attn_nomask_seqlens = pcp_metadata.tail_attn_nomask_seqlens.view(-1).tolist()
+        attn_mask_seqlens = pcp_metadata.attn_mask_seqlens
+        head_attn_nomask_seqlens = pcp_metadata.head_attn_nomask_seqlens
+        tail_attn_nomask_seqlens = pcp_metadata.tail_attn_nomask_seqlens
         
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
