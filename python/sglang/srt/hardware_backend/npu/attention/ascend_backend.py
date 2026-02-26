@@ -892,6 +892,10 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         atten_mask: torch.Tensor = None,
     ) -> torch.Tensor:
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k.shape=}, {v.shape=}, {kv_mask_idx.max().item()=}\
+                , {kv_nomask_idx.max().item()=},{k.shape[0]=},{q_seqlens=},{kv_mask_seqlens=},{kv_nomask_seqlens=}")
+
         kv_mask_idx = kv_mask_idx.to(k.device)
         k_mask = torch.index_select(k, 0, kv_mask_idx)
         v_mask = torch.index_select(v, 0, kv_mask_idx)
@@ -912,6 +916,8 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=kv_mask_seqlens,
             actual_seq_lengths=q_seqlens,
         )
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=},  {mask_out[:2, :5]=}")
 
         if kv_nomask_idx.shape[0] == 0:
             return mask_out
@@ -935,6 +941,8 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=kv_nomask_seqlens,
             actual_seq_lengths=q_seqlens,
         )
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            print(f"+++ fia pcp nomask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {nomask_out.sum()=},  {nomask_out[:2, :5]=}")
 
         output, _ = self._update_out_and_lse(
             torch.stack([nomask_out, mask_out], dim=0),
