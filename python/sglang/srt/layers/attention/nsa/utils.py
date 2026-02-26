@@ -461,7 +461,11 @@ def _compute_attention_metadata(
     tail_end_global,
     attn_mask_seqlens
 ):
-    """Compute attention metadata for prefill checkpointing."""
+    head_chunk_len = head_end_global - head_start_global
+    tail_chunk_len = tail_end_global - tail_start_global
+    head_q_seqlens = [head_chunk_len] 
+    tail_q_seqlens = [tail_chunk_len]
+
     # Compute nomask seqlens
     head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
     tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
@@ -481,6 +485,8 @@ def _compute_attention_metadata(
 
     attn_mask_seqlens = torch.cumsum(attn_mask_seqlens[0], dim=0).tolist()
     cp_metadata.attn_mask_seqlens = attn_mask_seqlens
+    cp_metadata.head_q_seqlens = head_q_seqlens
+    cp_metadata.tail_q_seqlens = tail_q_seqlens
 
     return cp_metadata
 

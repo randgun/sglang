@@ -944,7 +944,7 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths=q_seqlens,
         )
         if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
-            print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=},  {mask_out[:2, :5]=}")
+            print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=},  {mask_out[:2, :5,:5]=}")
 
         attn_output = mask_out
         attn_lse = mask_lse
@@ -976,8 +976,10 @@ class AscendAttnBackend(AttentionBackend):
         if seq_len == 0:
             return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
         split_len = (seq_len + 1) // 2
+        tail_len = seq_len - split_len
 
-        q_head, q_tail = torch.split(q, [split_len, seq_len - split_len], dim=0)
+        q_head, q_tail = torch.split(q, [split_len, tail_len], dim=0)
+
         q_head = q_head.contiguous()
         q_tail = q_tail.contiguous()
 
@@ -992,6 +994,9 @@ class AscendAttnBackend(AttentionBackend):
         attn_mask_seqlens = pcp_metadata.attn_mask_seqlens
         head_attn_nomask_seqlens = pcp_metadata.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = pcp_metadata.tail_attn_nomask_seqlens
+
+        head_q_seqlens = pcp_metadata.head_q_seqlens
+        tail_q_seqlens = pcp_metadata.tail_q_seqlens
         
         output_head, attn_lse_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
@@ -1000,7 +1005,7 @@ class AscendAttnBackend(AttentionBackend):
             kv_mask_idx=kv_with_q_head_mask_idx,
             kv_nomask_idx=kv_with_q_head_nomask_idx,
             kv_nomask_seqlens=head_attn_nomask_seqlens,
-            q_seqlens=attn_mask_seqlens,
+            q_seqlens=head_q_seqlens,
             kv_mask_seqlens=attn_mask_seqlens,
             layer=layer,
             atten_mask=atten_mask,
@@ -1016,15 +1021,17 @@ class AscendAttnBackend(AttentionBackend):
                 v=v,
                 kv_mask_idx=kv_with_q_tail_mask_idx,
                 kv_nomask_idx=kv_with_q_tail_nomask_idx,
-                q_seqlens=attn_mask_seqlens,
+                q_seqlens=tail_q_seqlens,
                 kv_nomask_seqlens=tail_attn_nomask_seqlens,
                 kv_mask_seqlens=attn_mask_seqlens,
                 layer=layer,
                 atten_mask=atten_mask,
             )
-            output.append(output_tail)
             if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
                 print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
+            output = torch.cat([output_head,output_tail], dim=0)
+        else:
+            output = output_head
         
         output = torch.cat(output, dim=0)
         if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
