@@ -458,7 +458,8 @@ def _compute_attention_metadata(
     head_start_global,
     head_end_global,
     tail_start_global,
-    tail_end_global
+    tail_end_global,
+    attn_mask_seqlens
 ):
     """Compute attention metadata for prefill checkpointing."""
     # Compute nomask seqlens
@@ -477,6 +478,9 @@ def _compute_attention_metadata(
     cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
     cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
     cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
+    attn_mask_seqlens = torch.cumsum(attn_mask_seqlens[0], dim=0).tolist()
+    cp_metadata.attn_mask_seqlens = attn_mask_seqlens
+
     return cp_metadata
 
 
@@ -582,7 +586,6 @@ def prepare_input_dp_with_cp_dsa(
     kv_len_next = tail_start_global
     actual_seq_q_prev = split_list[head_chunk_id]
     actual_seq_q_next = split_list[tail_chunk_id]
-
     kv_len_prev = head_start_global
     kv_len_next = tail_start_global
     actual_seq_q_prev = split_list[head_chunk_id]
@@ -595,6 +598,7 @@ def prepare_input_dp_with_cp_dsa(
     actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
         device=device, dtype=torch.int32
     )    
+    attn_mask_seqlens=torch.tensor([actual_seq_q_prev,actual_seq_q_next],device=device, dtype=torch.int32)
     cp_metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
@@ -621,5 +625,6 @@ def prepare_input_dp_with_cp_dsa(
             head_end_global=head_end_global,
             tail_start_global=tail_start_global,
             tail_end_global=tail_end_global,
+            attn_mask_seqlens=attn_mask_seqlens,
         )
     return cp_metadata
