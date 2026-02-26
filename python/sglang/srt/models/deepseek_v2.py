@@ -2908,7 +2908,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
                 )
         elif self.enable_prefill_cp:
@@ -2917,7 +2916,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     len(input_ids),
                     self.pcp_rank,
                     self.pcp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
                 )
 

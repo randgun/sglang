@@ -1117,7 +1117,7 @@ class AscendAttnBackend(AttentionBackend):
         
         output = torch.cat(output, dim=0)
         if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
-            print(f"{layer.layer_id=} === rank:{torch.distributed.get_rank()} {output.sum()=},  {output[:5, :5]=}")
+            print(f"+++ fia pcp output is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output.sum()=},  {output[:5, :5]=}")
         return output.reshape(seq_len, -1)
 
     def forward_extend(
@@ -1236,7 +1236,8 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
-
+                if torch.distributed.get_rank() == 0  and layer.layer_id in (0,1):
+                    print(f"+++ fia no pcp output is {attn_output[:5, :5]=}")
             else:
                 causal = True
                 if (
