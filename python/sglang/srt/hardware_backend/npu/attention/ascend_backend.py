@@ -895,6 +895,30 @@ class AscendAttnBackend(AttentionBackend):
         if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
             print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k.shape=}, {v.shape=}, {kv_mask_idx.max().item()=}\
                 , {kv_nomask_idx.max().item()=},{k.shape[0]=},{q_seqlens=},{kv_mask_seqlens=},{kv_nomask_seqlens=}")
+        if kv_nomask_idx.shape[0] != 0:
+            kv_nomask_idx = kv_nomask_idx.to(k.device)
+            k_nomask = torch.index_select(k, 0, kv_nomask_idx)
+            v_nomask = torch.index_select(v, 0, kv_nomask_idx)
+            nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q,
+                k_nomask,
+                v_nomask,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="TND",
+                atten_mask=None,
+                sparse_mode=0,
+                antiquant_mode = 0,
+                scale=layer.scaling,
+                next_tokens=0,
+                inner_precise=0,
+                antiquant_scale=None,
+                softmax_lse_flag=True,
+                actual_seq_lengths_kv=kv_nomask_seqlens,
+                actual_seq_lengths=q_seqlens,
+            )
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            print(f"+++ fia pcp nomask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {nomask_out.sum()=},  {nomask_out[:2, :5]=}")
 
         kv_mask_idx = kv_mask_idx.to(k.device)
         k_mask = torch.index_select(k, 0, kv_mask_idx)
@@ -909,6 +933,8 @@ class AscendAttnBackend(AttentionBackend):
             input_layout="TND",
             atten_mask=atten_mask,
             sparse_mode=3,
+            antiquant_mode = 0,
+            antiquant_scale=None,
             scale=layer.scaling,
             next_tokens=0,
             inner_precise=0,
@@ -919,36 +945,14 @@ class AscendAttnBackend(AttentionBackend):
         if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
             print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=},  {mask_out[:2, :5]=}")
 
-        if kv_nomask_idx.shape[0] == 0:
-            return mask_out
-
-        kv_nomask_idx = kv_nomask_idx.to(k.device)
-        k_nomask = torch.index_select(k, 0, kv_nomask_idx)
-        v_nomask = torch.index_select(v, 0, kv_nomask_idx)
-        nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
-            q,
-            k_nomask,
-            v_nomask,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=None,
-            sparse_mode=0,
-            scale=layer.scaling,
-            next_tokens=0,
-            inner_precise=0,
-            softmax_lse_flag=True,
-            actual_seq_lengths_kv=kv_nomask_seqlens,
-            actual_seq_lengths=q_seqlens,
-        )
-        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
-            print(f"+++ fia pcp nomask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {nomask_out.sum()=},  {nomask_out[:2, :5]=}")
-
-        output, _ = self._update_out_and_lse(
-            torch.stack([nomask_out, mask_out], dim=0),
-            torch.stack([nomask_lse, mask_lse], dim=0),
-        )
-        return output.to(mask_out.dtype)
+        attn_output = mask_out
+        attn_lse = mask_lse
+        if k_nomask is not None:
+            attn_output, attn_lse = self._update_out_and_lse(
+                torch.stack([nomask_out, mask_out], dim=0),
+                torch.stack([nomask_lse, mask_lse], dim=0),
+            )
+        return attn_output,attn_lse
 
     def _update_out_and_lse(
         self,
@@ -994,8 +998,8 @@ class AscendAttnBackend(AttentionBackend):
             v=v,
             kv_mask_idx=kv_with_q_head_mask_idx,
             kv_nomask_idx=kv_with_q_head_nomask_idx,
-            q_seqlens=attn_mask_seqlens,
             kv_nomask_seqlens=head_attn_nomask_seqlens,
+            q_seqlens=attn_mask_seqlens,
             kv_mask_seqlens=attn_mask_seqlens,
             layer=layer,
             atten_mask=atten_mask,
@@ -1143,7 +1147,7 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
                 if torch.distributed.get_rank() == 0  and layer.layer_id in (0,1):
-                    print(f"+++ fia no pcp output is {attn_out.sum()=},{attn_output[:5, :5]=}")
+                    print(f"+++ fia no pcp output is {attn_output.sum()=},{attn_output[:5, :5]=}")
             else:
                 causal = True
                 if (
