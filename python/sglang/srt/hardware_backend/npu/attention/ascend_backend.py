@@ -895,7 +895,8 @@ class AscendAttnBackend(AttentionBackend):
         if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
             print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k.shape=}, {v.shape=}, {kv_mask_idx.max().item()=}\
                 , {kv_nomask_idx.max().item()=},{k.shape[0]=},{q_seqlens=},{kv_mask_seqlens=},{kv_nomask_seqlens=}")
-        if kv_nomask_idx.shape[0] != 0:
+        has_no_mask = (kv_nomask_idx.shape[0] != 0)
+        if has_no_mask:
             kv_nomask_idx = kv_nomask_idx.to(k.device)
             k_nomask = torch.index_select(k, 0, kv_nomask_idx)
             v_nomask = torch.index_select(v, 0, kv_nomask_idx)
@@ -917,8 +918,8 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv=kv_nomask_seqlens,
                 actual_seq_lengths=q_seqlens,
             )
-        # if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
-        #     print(f"+++ fia pcp nomask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {nomask_out.sum()=},  {nomask_out[:2, :5]=}")
+            if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+                print(f"+++ fia pcp nomask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {nomask_out.sum()=},  {nomask_out[:2, :5]=}")
 
         kv_mask_idx = kv_mask_idx.to(k.device)
         k_mask = torch.index_select(k, 0, kv_mask_idx)
@@ -942,15 +943,16 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=kv_mask_seqlens,
             actual_seq_lengths=q_seqlens,
         )
-        # if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
-        #     print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=},  {mask_out[:2, :5]=}")
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=},  {mask_out[:2, :5]=}")
 
         attn_output = mask_out
         attn_lse = mask_lse
-        attn_output, attn_lse = self._update_out_and_lse(
-            torch.stack([nomask_out, mask_out], dim=0),
-            torch.stack([nomask_lse, mask_lse], dim=0),
-        )
+        if has_no_mask:
+            attn_output, attn_lse = self._update_out_and_lse(
+                torch.stack([nomask_out, mask_out], dim=0),
+                torch.stack([nomask_lse, mask_lse], dim=0),
+            )
         return attn_output,attn_lse
 
     def _update_out_and_lse(
