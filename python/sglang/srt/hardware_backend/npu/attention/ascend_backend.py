@@ -895,7 +895,7 @@ class AscendAttnBackend(AttentionBackend):
         k_mask = torch.index_select(k, 0, kv_mask_idx).unsqueeze(0)
         v_mask = torch.index_select(v, 0, kv_mask_idx).unsqueeze(0)
 
-        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
             print(f"+++ before mask attention caclulate {q_unsqueeze.shape=}, {k_mask.shape=}, {v_mask.shape=}, {atten_mask.shape=}")
 
         mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
@@ -914,7 +914,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         output_mask = mask_out.squeeze(0)
         output_lse_mask = mask_lse.squeeze(0).squeeze(-1)
-        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+        if torch.distributed.get_rank() == 0  and layer.layer_id in (0,1):
             print(f"+++ after mask attention caclulate {output_mask.shape=}, {output_lse_mask.shape=}")
 
         if kv_nomask_idx.shape[0] == 0:
@@ -923,7 +923,7 @@ class AscendAttnBackend(AttentionBackend):
         kv_nomask_idx = kv_nomask_idx.to(device)
         k_nomask = torch.index_select(k, 0, kv_nomask_idx).unsqueeze(0)
         v_nomask = torch.index_select(v, 0, kv_nomask_idx).unsqueeze(0)
-        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
             print(f"+++ before nomask attention caclulate {q_unsqueeze.shape=}, {k_nomask.shape=}, {v_nomask.shape=}, {atten_mask.shape=}")
         nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
                 q_unsqueeze,
@@ -944,7 +944,7 @@ class AscendAttnBackend(AttentionBackend):
         lse_max = torch.maximum(output_lse_mask, output_lse_nomask)
         exp_mask = torch.exp(output_lse_mask - lse_max)
         exp_nomask = torch.exp(output_lse_nomask - lse_max)
-        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
             print(f"+++ after nomask attention caclulate {output_mask_nomask.shape=}, {output_lse_nomask.shape=}")
 
         exp_mask = exp_mask.transpose(0, 1).unsqueeze(-1)
@@ -1082,9 +1082,11 @@ class AscendAttnBackend(AttentionBackend):
         kv_with_q_head_mask_idx = pcp_metadata.kv_with_q_head_mask_idx
         kv_with_q_tail_nomask_idx = pcp_metadata.kv_with_q_tail_nomask_idx
         kv_with_q_tail_mask_idx = pcp_metadata.kv_with_q_tail_mask_idx
-        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
             print(f"+++ start to fia attention with mask and nomask, {q_head.shape=}, {k.shape=}, {v.shape=}, {kv_with_q_head_mask_idx.max().item()=}\
                 , {kv_with_q_head_nomask_idx.max().item()=},{k.shape[0]=},")
+            print(f"+++ start to fia attention with mask and nomask, {q_tail.shape=}, {k.shape=}, {v.shape=}, {kv_with_q_tail_mask_idx.max().item()=}\
+                , {kv_with_q_tail_nomask_idx.max().item()=},{k.shape[0]=},")
         
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
@@ -1095,6 +1097,8 @@ class AscendAttnBackend(AttentionBackend):
             layer=layer,
             atten_mask=atten_mask,
         )
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            print(f"+++ output head is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_head.sum()=},  {output_head[:5, :5]=}")
 
         output=[output_head]
         if q_tail.shape[0]>0:
@@ -1108,8 +1112,12 @@ class AscendAttnBackend(AttentionBackend):
                 atten_mask=atten_mask,
             )
             output.append(output_tail)
-
+            if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+                print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:5, :5]=}")
+        
         output = torch.cat(output, dim=0)
+        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            print(f"{layer.layer_id=} === rank:{torch.distributed.get_rank()} {output.sum()=},  {output[:5, :5]=}")
         return output.reshape(seq_len, -1)
 
     def forward_extend(
@@ -1190,8 +1198,9 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_fia:
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
-                    print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=}")
+                if torch.distributed.get_rank() == 0  and layer.layer_id in (0,1):
+                    print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=},{q[:5, :5]=},{k[:5, :5]=},{v[:5, :5]=}")
+
                 if use_pcp(forward_batch):
                     attn_output = self.forward_fia_pcp(
                         q=q,

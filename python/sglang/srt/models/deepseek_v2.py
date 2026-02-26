@@ -2912,10 +2912,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     input_ids.device,
                 )
         elif self.enable_prefill_cp:
-            cur_cp_seq_len = len(input_ids) // (self.pcp_size * 2)
-            if can_cp_split(cur_cp_seq_len, self.pcp_size, forward_batch):
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    cur_cp_seq_len,
+                    len(input_ids),
                     self.pcp_rank,
                     self.pcp_size,
                     forward_batch.seq_lens_cpu.tolist(),
