@@ -190,6 +190,9 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     result = torch.cat(
         [input_list[i] for i in forward_batch.cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
+    
+    if torch.distributed.get_rank() in range(5):
+        print(f"cp split and rebuild data,{forward_batch.cp_metadata.split_list=},{forward_batch.cp_metadata.zigzag_index=}")
     return result
 
 
