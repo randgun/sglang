@@ -204,6 +204,9 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
             f"cp size {cp_size}"
         )
         return nsa_cp_round_robin_split_data(positions)
+    print(f"[global_rank={torch.distributed.get_rank()}] "
+          f"zigzag_index={forward_batch.cp_metadata.zigzag_index}, "
+          f"positions_before={positions[:8].tolist()}")
 
     position_id_list = list(
         torch.split(positions, forward_batch.cp_metadata.split_list, dim=-1)
@@ -212,6 +215,8 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         [position_id_list[i] for i in forward_batch.cp_metadata.zigzag_index],
         dim=-1,
     )
+    print(f"[global_rank={torch.distributed.get_rank()}] "
+          f"positions_after={positions.tolist()}")
     return positions
 
 

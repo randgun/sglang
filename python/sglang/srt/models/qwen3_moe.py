@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_context_parallel_rank,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -964,7 +965,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         # PCP (Prefill Context Parallelism) configuration
         self.enable_prefill_cp = is_enable_prefill_cp()
         if self.enable_prefill_cp:
-            self.pcp_rank = get_pcp_rank()
+            self.pcp_rank = get_context_parallel_rank()
             self.pcp_size = get_pcp_size()
         else:
             self.pcp_rank = self.pcp_size = None
@@ -990,6 +991,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_size,
                     input_ids.device,
                 )
+                print(f"[rank={torch.distributed.get_rank()}] "
+                        f"pcp_rank={self.pcp_rank}, "
+                        f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
+                
                 if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
                     print(f"+++ pcp metadata {forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
                     {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
