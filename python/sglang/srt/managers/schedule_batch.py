@@ -61,7 +61,6 @@ from sglang.srt.disaggregation.utils import (
     calculate_cp_transfer_metadata,
 )
 from sglang.srt.distributed.parallel_state import (
-    get_context_parallel_rank,
     get_context_parallel_world_size,
     get_tensor_model_parallel_rank,
 )
@@ -74,6 +73,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_pcp_rank,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
@@ -825,6 +825,8 @@ class Req:
         
         # For CP mode KV transfer
         self.cp_metadata: Optional["ContextParallelMetadata"] = None
+        # For CP mode extra allocated KV indices (padding) to be freed on finish
+        self.cp_overallocated_kv_indices: Optional[torch.Tensor] = None
 
     @property
     def seqlen(self) -> int:
@@ -1143,6 +1145,7 @@ class Req:
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.cp_overallocated_kv_indices = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1530,13 +1533,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         seq_lens = [len(r.fill_ids) for r in reqs]
+        seq_lens_actual = seq_lens.copy()
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
 
         # Check if CP mode is enabled
         enable_cp = is_enable_prefill_cp()
+        server_args = get_global_server_args()
+        # Compatibility mode for non-PD + PCP:
+        # allocate full-sequence KV slots (like pcp=1) so decode can always
+        # observe a complete sequence view on each TP rank.
+        force_full_alloc_non_pd_cp = (
+            enable_cp and server_args.disaggregation_mode == "null"
+        )
         if enable_cp:
-            server_args = get_global_server_args()
             if not server_args.disable_radix_cache:
                 raise ValueError(
                     "CP mode requires radix cache to be disabled. "
@@ -1553,7 +1563,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # Get CP configuration
             cp_size = get_context_parallel_world_size()
-            cp_rank = get_context_parallel_rank()
+            cp_rank = get_pcp_rank()
             page_size = self.token_to_kv_pool_allocator.page_size
             """
             CP Mode Memory Allocation Example:
@@ -1567,9 +1577,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             
             # Calculate CP metadata for each request
             cp_extend_tokens_list = []
-            extend_lens = []
+            extend_lens_alloc = []
+            extend_lens_actual = []
+            seq_lens_alloc = []
             for i, req in enumerate(reqs):
                 actual_seq_len = len(req.fill_ids)
+                seq_lens_actual[i] = actual_seq_len
                 # Calculate CP metadata
                 req.cp_metadata = calculate_cp_transfer_metadata(
                     actual_seq_len=actual_seq_len,
@@ -1577,55 +1590,76 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     cp_rank=cp_rank,
                     page_size=page_size,
                 )
+                # Precompute per-rank valid ranges in original sequence index space.
+                prefix_offsets = [0]
+                for block_len in req.cp_metadata.split_list:
+                    prefix_offsets.append(prefix_offsets[-1] + block_len)
+                rank_valid_ranges = []
+                for block_idx in req.cp_metadata.zigzag_index:
+                    block_start = prefix_offsets[block_idx]
+                    block_end = prefix_offsets[block_idx + 1]
+                    if block_start < actual_seq_len:
+                        valid_end = min(block_end, actual_seq_len)
+                        rank_valid_ranges.append((block_start, valid_end))
+                req.cp_metadata.rank_valid_ranges = rank_valid_ranges
+                # Build actual block lengths (intersected with real sequence length).
+                cp_block_num = cp_size * 2
+                block_actual_lens = []
+                for block_idx in range(cp_block_num):
+                    block_start = prefix_offsets[block_idx]
+                    block_end = prefix_offsets[block_idx + 1]
+                    if block_start >= actual_seq_len:
+                        block_actual_lens.append(0)
+                    else:
+                        block_actual_lens.append(min(block_end, actual_seq_len) - block_start)
+                # Per-rank actual token counts and max rank length.
+                per_rank_actual_token = []
+                for r in range(cp_size):
+                    head = r
+                    tail = cp_block_num - 1 - r
+                    per_rank_actual_token.append(
+                        block_actual_lens[head] + block_actual_lens[tail]
+                    )
+                max_rank_len = max(per_rank_actual_token) if per_rank_actual_token else 0
+                req.cp_metadata.per_rank_actual_token = per_rank_actual_token
+                req.cp_metadata.max_rank_len = [max_rank_len] * cp_size
+                # Reverse split lengths in zigzag order, clipped to actual length.
+                reverse_split_len = []
+                for r in range(cp_size):
+                    reverse_split_len.append(block_actual_lens[r])
+                    reverse_split_len.append(block_actual_lens[cp_block_num - 1 - r])
+                req.cp_metadata.reverse_split_len = reverse_split_len
+                req.cp_metadata.total_seq_lens = actual_seq_len
 
-                # Update seq_lens to aligned length for CP mode
-                seq_lens[i] = req.cp_metadata.aligned_seq_len
-
-                # Calculate extend tokens for current CP_Rank
+                # Calculate extend tokens for current CP_Rank (allocation length)
                 prefix_len = len(req.prefix_indices)
                 cp_extend_tokens = (
                     sum(req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index)
                     - prefix_len
                 )
                 cp_extend_tokens_list.append(cp_extend_tokens)
-                extend_lens.append(cp_extend_tokens)
-                
-                # 验证点1: extend_tokens计算正确性
-                calculated_extend = sum(req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index) - prefix_len
-                is_correct = (cp_extend_tokens == calculated_extend)
-                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点1: extend_tokens计算 | "
-                      f"req_id={req.rid} | calculated={calculated_extend} | actual={cp_extend_tokens} | "
-                      f"是否符合预期={'✓' if is_correct else '✗'}")
-                
-                # 验证点2: zigzag_index长度检查
-                zigzag_len = len(req.cp_metadata.zigzag_index)
-                is_zigzag_correct = (zigzag_len == 2)
-                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点2: zigzag_index长度 | "
-                      f"req_id={req.rid} | zigzag_index={req.cp_metadata.zigzag_index} | "
-                      f"length={zigzag_len} | 是否符合预期={'✓' if is_zigzag_correct else '✗'} (期望=2)")
-                
-                # 验证点3: split_list块大小一致性
-                split_list_values = [req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index]
-                total_blocks_size = sum(split_list_values)
-                is_blocks_correct = (total_blocks_size == cp_extend_tokens + prefix_len)
-                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点3: 块大小计算 | "
-                      f"req_id={req.rid} | split_list[zigzag]={split_list_values} | "
-                      f"total_blocks={total_blocks_size} | extend+prefix={cp_extend_tokens + prefix_len} | "
-                      f"是否符合预期={'✓' if is_blocks_correct else '✗'}")
+                extend_lens_alloc.append(cp_extend_tokens)
+                extend_lens_actual.append(actual_seq_len - prefix_len)
+                # For allocation only, synthesize seq_len = prefix + local-alloc
+                seq_lens_alloc.append(prefix_len + cp_extend_tokens)
 
-            # Update extend_num_tokens for CP mode
-            extend_num_tokens = sum(cp_extend_tokens_list)
-            
-            # 验证点4: 总extend_num_tokens计算
-            expected_total = sum(extend_lens)
-            is_total_correct = (extend_num_tokens == expected_total)
-            print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点4: 总extend_num_tokens | "
-                  f"calculated={expected_total} | actual={extend_num_tokens} | "
-                  f"是否符合预期={'✓' if is_total_correct else '✗'}")
+            extend_num_tokens_actual = sum(extend_lens_actual)
+            if force_full_alloc_non_pd_cp:
+                # Compatibility mode: allocate with full actual sequence length.
+                extend_num_tokens = extend_num_tokens_actual
+                seq_lens = seq_lens_actual.copy()
+                extend_lens = extend_lens_actual
+            else:
+                # Default CP mode: allocate by local zigzag block lengths.
+                extend_num_tokens = sum(cp_extend_tokens_list)
+                seq_lens = seq_lens_alloc
+                extend_lens = extend_lens_alloc
         else:
             # Non-CP mode: keep original logic
             extend_lens = [r.extend_input_len for r in reqs]
             extend_num_tokens = sum(len(ids) for ids in input_ids)
+            extend_lens_actual = extend_lens
+            extend_num_tokens_actual = extend_num_tokens
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1677,7 +1711,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
 
-        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+        seq_lens_for_req = seq_lens_actual if enable_cp else seq_lens
+        for i, (req, seq_len, pre_len) in enumerate(
+            zip(reqs, seq_lens_for_req, prefix_lens)
+        ):
             req.req_pool_idx = req_pool_indices[i]
             if enable_cp:
                 actual_seq_len = req.cp_metadata.actual_seq_len
@@ -1794,7 +1831,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
-        self.out_cache_loc = out_cache_loc
+        if enable_cp and not force_full_alloc_non_pd_cp:
+            # Build compact out_cache_loc for forward: only keep real tokens in zigzag order.
+            compact_out_cache_loc = []
+            pt = 0
+            for req in reqs:
+                cp_metadata = req.cp_metadata
+                actual_seq_len = cp_metadata.actual_seq_len
+                for block_idx in cp_metadata.zigzag_index:
+                    block_size = cp_metadata.split_list[block_idx]
+                    block_token_start = 0
+                    for j in range(block_idx):
+                        block_token_start += cp_metadata.split_list[j]
+                    block_token_end = block_token_start + block_size
+
+                    if block_token_start < actual_seq_len:
+                        write_size = min(block_token_end, actual_seq_len) - block_token_start
+                        if write_size > 0:
+                            compact_out_cache_loc.append(
+                                out_cache_loc[pt : pt + write_size]
+                            )
+                    # Always advance by full block size (allocation length)
+                    pt += block_size
+
+            if compact_out_cache_loc:
+                self.out_cache_loc = torch.cat(compact_out_cache_loc)
+            else:
+                self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
+                    self.device, non_blocking=True
+                )
+        else:
+            self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
@@ -1816,7 +1883,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     del pixel_values
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
-        self.seq_lens_sum = sum(seq_lens)
+        if enable_cp:
+            # Restore forward-visible lengths to actual sequence lengths.
+            self.seq_lens = torch.tensor(seq_lens_actual, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+            self.seq_lens_cpu = torch.tensor(seq_lens_actual, dtype=torch.int64)
+            self.extend_lens = extend_lens_actual
+            self.extend_num_tokens = extend_num_tokens_actual
+            self.seq_lens_sum = sum(seq_lens_actual)
+        else:
+            self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -1843,7 +1920,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if self.model_config.is_encoder_decoder:
-            self.prepare_encoder_info_extend(input_ids, seq_lens)
+            self.prepare_encoder_info_extend(
+                input_ids, seq_lens_actual if enable_cp else seq_lens
+            )
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(

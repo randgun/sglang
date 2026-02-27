@@ -10,12 +10,12 @@ import triton.language as tl
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.distributed.parallel_state import (
     get_context_parallel_world_size,
-    get_context_parallel_rank,
 )
 
 if TYPE_CHECKING:
@@ -94,8 +94,11 @@ def write_cache_indices(
     reqs: list["Req"] | None = None,
 ):
     # Check if CP is enabled
-    enable_cp = get_context_parallel_world_size() > 1
-    cp_rank = get_context_parallel_rank() if enable_cp else -1
+    enable_cp = is_enable_prefill_cp()
+    server_args = get_global_server_args()
+    force_full_alloc_non_pd_cp = (
+        enable_cp and server_args.disaggregation_mode == "null"
+    )
 
     if support_triton(get_global_server_args().attention_backend) and not enable_cp:
         prefix_pointers = torch.tensor(
@@ -127,13 +130,16 @@ def write_cache_indices(
                 prefix_tensors[i],
             )
 
-            if enable_cp:
+            if enable_cp and not force_full_alloc_non_pd_cp:
                 if reqs is None:
                     raise ValueError("reqs must be provided when CP mode is enabled")
                 cp_metadata = reqs[i].cp_metadata
                 actual_seq_len = cp_metadata.actual_seq_len
                 out_offset = pt
-                written_blocks = []
+                overallocated_chunks = []
+
+                page_size = get_global_server_args().page_size
+                aligned_actual_len = ceil_align(actual_seq_len, page_size)
 
                 for block_idx in cp_metadata.zigzag_index:
                     block_size = cp_metadata.split_list[block_idx]
@@ -144,126 +150,51 @@ def write_cache_indices(
                         block_token_start += cp_metadata.split_list[j]
                     block_token_end = block_token_start + block_size
 
-                    # Skip if block exceeds actual sequence length
-                    if block_token_start >= actual_seq_len:
-                        break
+                    # Calculate write range within actual sequence
+                    if block_token_start < actual_seq_len:
+                        extend_block_start = block_token_start
+                        extend_block_end = min(block_token_end, actual_seq_len)
+                        write_size = extend_block_end - extend_block_start
 
-                    # Calculate write range
-                    extend_block_start = block_token_start
-                    extend_block_end = min(block_token_end, actual_seq_len)
+                        if write_size > 0:
+                            # Write to req_to_token_pool
+                            req_to_token_pool.write(
+                                (req_idx, slice(extend_block_start, extend_block_end)),
+                                out_cache_loc[out_offset : out_offset + write_size],
+                            )
 
-                    # Calculate number of KV indices to write
-                    write_size = extend_block_end - extend_block_start
+                        # Collect padding indices in this block (if any),
+                        # but only those fully beyond aligned_actual_len to avoid double-free.
+                        if write_size < block_size:
+                            free_start = max(write_size, aligned_actual_len - block_token_start)
+                            if free_start < block_size:
+                                overallocated_chunks.append(
+                                    out_cache_loc[out_offset + free_start : out_offset + block_size]
+                                )
+                    else:
+                        # Entire block is beyond actual sequence length: all are padding
+                        free_start = max(0, aligned_actual_len - block_token_start)
+                        if free_start < block_size:
+                            overallocated_chunks.append(
+                                out_cache_loc[out_offset + free_start : out_offset + block_size]
+                            )
 
-                    # Write to req_to_token_pool
-                    req_to_token_pool.write(
-                        (req_idx, slice(extend_block_start, extend_block_end)),
-                        out_cache_loc[out_offset : out_offset + write_size],
-                    )
+                    # Always advance by full block size to stay aligned with allocation
+                    out_offset += block_size
 
-                    written_blocks.append({
-                        'block_idx': block_idx,
-                        'token_range': (extend_block_start, extend_block_end),
-                        'write_size': write_size,
-                        'kv_indices_sample': out_cache_loc[out_offset : out_offset + min(5, write_size)].cpu().tolist()
-                    })
-                    out_offset += write_size
+                # Stash overallocated indices on request for later free
+                if overallocated_chunks:
+                    new_overalloc = torch.cat(overallocated_chunks)
+                    if reqs[i].cp_overallocated_kv_indices is None:
+                        reqs[i].cp_overallocated_kv_indices = new_overalloc
+                    else:
+                        reqs[i].cp_overallocated_kv_indices = torch.cat(
+                            [reqs[i].cp_overallocated_kv_indices, new_overalloc]
+                        )
+                else:
+                    if reqs[i].cp_overallocated_kv_indices is None:
+                        reqs[i].cp_overallocated_kv_indices = None
                 
-                # 验证点7: 写入的KV indices数量
-                written_indices = req_to_token_pool.req_to_token[req_idx, :actual_seq_len].cpu().tolist()
-                non_zero_count = len([x for x in written_indices if x != 0 and x != -1])
-                expected_written = sum(block['write_size'] for block in written_blocks)
-                is_written_count_correct = (non_zero_count == expected_written)
-                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点7: 写入KV indices数量 | "
-                      f"req_id={reqs[i].rid if reqs else 'N/A'} | "
-                      f"written_count={non_zero_count} | expected={expected_written} | "
-                      f"是否符合预期={'✓' if is_written_count_correct else '✗'}")
-                
-                # 验证点8: 写入的token范围正确性
-                all_ranges_valid = True
-                for block_info in written_blocks:
-                    start, end = block_info['token_range']
-                    if not (0 <= start < actual_seq_len) or not (0 < end <= actual_seq_len):
-                        all_ranges_valid = False
-                        break
-                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点8: 写入token范围 | "
-                      f"req_id={reqs[i].rid if reqs else 'N/A'} | actual_seq_len={actual_seq_len} | "
-                      f"所有块范围是否在[0, {actual_seq_len})内={'✓' if all_ranges_valid else '✗'}")
-                
-                # 验证点9: 块覆盖范围完整性
-                total_written_range = sum(
-                    end - start for block_info in written_blocks
-                    for start, end in [block_info['token_range']]
-                )
-                expected_range = sum(
-                    cp_metadata.split_list[j] for j in cp_metadata.zigzag_index
-                )
-                is_range_correct = (total_written_range <= expected_range)
-                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点9: 块覆盖范围 | "
-                      f"req_id={reqs[i].rid if reqs else 'N/A'} | "
-                      f"total_written_range={total_written_range} | expected_range={expected_range} | "
-                      f"是否符合预期={'✓' if is_range_correct else '✗'} (written <= expected)")
-                
-                # 验证点10: req_to_token_pool写入位置正确性
-                # 验证每个块写入的位置是否与预期的块位置匹配
-                out_offset_check = pt
-                all_positions_correct = True
-                all_kv_match = True
-                position_details = []
-                
-                for block_info in written_blocks:
-                    block_idx = block_info['block_idx']
-                    start, end = block_info['token_range']
-                    write_size = block_info['write_size']
-                    
-                    # 计算这个块在原始序列中的预期位置
-                    expected_block_start = 0
-                    for j in range(block_idx):
-                        expected_block_start += cp_metadata.split_list[j]
-                    expected_block_end = expected_block_start + cp_metadata.split_list[block_idx]
-                    
-                    # 实际写入的位置应该等于预期的块位置（受actual_seq_len限制）
-                    actual_write_start = start
-                    actual_write_end = end
-                    expected_write_start = max(0, expected_block_start)
-                    expected_write_end = min(expected_block_end, actual_seq_len)
-                    
-                    is_position_correct = (actual_write_start == expected_write_start and 
-                                          actual_write_end == expected_write_end)
-                    
-                    if not is_position_correct:
-                        all_positions_correct = False
-                    
-                    # 验证写入的KV indices是否与分配的out_cache_loc一致
-                    written_kv_indices = req_to_token_pool.req_to_token[req_idx, actual_write_start:actual_write_end].cpu()
-                    expected_kv_indices = out_cache_loc[out_offset_check:out_offset_check + write_size].cpu()
-                    
-                    # 检查是否匹配（排除-1和0的情况）
-                    written_valid = written_kv_indices[written_kv_indices > 0]
-                    expected_valid = expected_kv_indices[expected_kv_indices > 0]
-                    is_kv_match = len(written_valid) == len(expected_valid)
-                    if is_kv_match and len(written_valid) > 0:
-                        is_kv_match = torch.allclose(written_valid.float(), expected_valid.float(), atol=1e-5)
-                    
-                    if not is_kv_match:
-                        all_kv_match = False
-                    
-                    position_details.append({
-                        'block_idx': block_idx,
-                        'expected_range': (expected_block_start, expected_block_end),
-                        'actual_write_range': (actual_write_start, actual_write_end),
-                        'expected_write_range': (expected_write_start, expected_write_end),
-                        'is_position_correct': is_position_correct,
-                        'is_kv_match': is_kv_match,
-                    })
-                    
-                    out_offset_check += write_size
-                
-                print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点10: req_to_token_pool写入位置 | "
-                      f"req_id={reqs[i].rid if reqs else 'N/A'} | "
-                      f"所有块写入位置是否正确={'✓' if all_positions_correct else '✗'} | "
-                      f"所有KV indices是否匹配={'✓' if all_kv_match else '✗'} | "
-                      f"position_details={position_details}")
             else:
                 req_to_token_pool.write(
                     (req_idx, slice(prefix_len, seq_len)),
@@ -526,40 +457,6 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
         )
     
-    # 验证点5: 内存分配大小正确性
-    enable_cp = get_context_parallel_world_size() > 1
-    if enable_cp:
-        cp_rank = get_context_parallel_rank()
-        allocated_size = len(out_cache_loc)
-        expected_size = batch.extend_num_tokens
-        is_alloc_correct = (allocated_size == expected_size)
-        print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点5: 内存分配大小 | "
-              f"allocated={allocated_size} | expected={expected_size} | "
-              f"是否符合预期={'✓' if is_alloc_correct else '✗'}")
-        
-        # 验证点6: 每个请求分配的内存大小
-        if batch.reqs is not None and len(batch.reqs) > 0:
-            extend_lens_list = extend_lens_cpu.tolist()
-            total_allocated = 0
-            for i, req in enumerate(batch.reqs):
-                if i < len(extend_lens_list):
-                    req_extend = extend_lens_list[i]
-                    start_idx = sum(extend_lens_list[:i])
-                    end_idx = start_idx + req_extend
-                    allocated_for_req = end_idx - start_idx
-                    is_req_alloc_correct = (allocated_for_req == req_extend)
-                    req_id = req.rid if hasattr(req, 'rid') else f"req_{i}"
-                    print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点6: 请求内存分配 | "
-                          f"req_id={req_id} | "
-                          f"allocated={allocated_for_req} | expected={req_extend} | "
-                          f"是否符合预期={'✓' if is_req_alloc_correct else '✗'}")
-                    total_allocated += allocated_for_req
-            
-            is_total_alloc_correct = (total_allocated == expected_size)
-            print(f"[CP_MEM_VERIFY] cp_rank={cp_rank} | 验证点6: 总分配内存 | "
-                  f"total_allocated={total_allocated} | expected={expected_size} | "
-                  f"是否符合预期={'✓' if is_total_alloc_correct else '✗'}")
-
     # Write to req_to_token_pool
     write_cache_indices(
         out_cache_loc,
@@ -665,6 +562,82 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    if getattr(req, "cp_overallocated_kv_indices", None) is not None:
+        from sglang.srt.distributed.parallel_state import (
+            get_context_parallel_world_size,
+        )
+
+        if get_context_parallel_world_size() > 1:
+            page_size = get_global_server_args().page_size
+            allocator = tree_cache.token_to_kv_pool_allocator
+            goto_free_cp_overalloc = True
+
+            # (a) 璁＄畻 overalloc 椤甸泦鍚?
+            overalloc_indices = req.cp_overallocated_kv_indices
+            # Defensive: never free dummy page 0 if it appears in CP overalloc.
+            num_page0_overalloc = (overalloc_indices < page_size).sum().item()
+            if num_page0_overalloc > 0:
+                overalloc_indices = overalloc_indices[overalloc_indices >= page_size]
+            overalloc_pages = torch.unique(overalloc_indices // page_size)
+
+            # (b) 璁＄畻鏈?rank 鏈夋晥鍖洪棿椤甸泦鍚堬紙metadata锛?
+            # NOTE: overalloc_pages are physical page ids from allocator outputs.
+            # Do not filter them by logical token ranges from cp_metadata.
+
+            # (c) 璁＄畻宸插啓椤甸泦鍚堬紙req_to_token_pool锛?
+            committed_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.kv_committed_len
+            ]
+            committed_indices = committed_indices[committed_indices > 0]
+            written_pages = (
+                torch.unique(committed_indices // page_size)
+                if committed_indices.numel() > 0
+                else torch.empty(0, device=allocator.device, dtype=torch.int64)
+            )
+
+            # (d) 璁＄畻 allocator 宸?free 鐨勯〉
+            free_pages = allocator.free_pages
+            release_pages = allocator.release_pages
+            pending_free_pages = torch.empty(
+                (0,), device=allocator.device, dtype=torch.int64
+            )
+            # If we are inside a free-group, pages freed earlier in this group
+            # are not yet reflected in free_pages/release_pages. Include them
+            # to avoid double-free.
+            if not getattr(allocator, "is_not_in_free_group", True):
+                free_group = getattr(allocator, "free_group", [])
+                if free_group:
+                    pending_indices = torch.cat(free_group)
+                    if pending_indices.numel() > 0:
+                        pending_free_pages = torch.unique(
+                            pending_indices // page_size
+                        )
+            if release_pages.numel() > 0 or pending_free_pages.numel() > 0:
+                already_free_pages = torch.unique(
+                    torch.cat((free_pages, release_pages, pending_free_pages))
+                )
+            else:
+                already_free_pages = free_pages
+
+            mask_written = ~torch.isin(overalloc_pages, written_pages)
+            overalloc_pages = overalloc_pages[mask_written]
+
+            mask_free = ~torch.isin(overalloc_pages, already_free_pages)
+            overalloc_pages = overalloc_pages[mask_free]
+
+            if goto_free_cp_overalloc and overalloc_pages.numel() > 0:
+                to_free_indices = (
+                    overalloc_pages[:, None] * page_size
+                    + torch.arange(
+                        page_size, device=allocator.device, dtype=torch.int64
+                    )
+                ).reshape(-1)
+                allocator.free(to_free_indices)
+        else:
+            tree_cache.token_to_kv_pool_allocator.free(req.cp_overallocated_kv_indices)
+
+        req.cp_overallocated_kv_indices = None
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 
