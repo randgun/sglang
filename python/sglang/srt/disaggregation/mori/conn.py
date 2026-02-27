@@ -434,11 +434,18 @@ class MoriKVManager(CommonKVManager):
     ) -> None:
         if not infos:
             return
+        if getattr(self, "pcp_size", 1) > 1:
+            prefill_rank = (
+                (self.pcp_rank * self.attn_tp_size + self.attn_tp_rank) * self.pp_size
+                + self.pp_rank
+            )
+        else:
+            prefill_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
         payload = [
             MORI_GUARD,
             str(bootstrap_room).encode("ascii"),
             str(int(status)).encode("ascii"),
-            str(self.attn_tp_rank * self.pp_size + self.pp_rank).encode("ascii"),
+            str(prefill_rank).encode("ascii"),
             failure_reason.encode("utf-8") if failure_reason else b"",
         ]
         for info in infos:
