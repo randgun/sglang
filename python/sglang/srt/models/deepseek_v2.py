@@ -2904,21 +2904,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     ) -> torch.Tensor:
         if self.enable_prefill_cp and self.use_nsa:
             if can_cp_split(len(input_ids), self.cp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
                 )
         elif self.enable_prefill_cp:
-            cur_cp_seq_len = len(input_ids) // (self.pcp_size * 2)
-            if can_cp_split(cur_cp_seq_len, self.pcp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    cur_cp_seq_len,
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
                     self.pcp_rank,
                     self.pcp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
                 )
 

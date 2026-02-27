@@ -16,6 +16,7 @@
 import logging
 from typing import Iterable, Optional, Tuple
 
+from python.sglang.srt.distributed.parallel_state import get_context_parallel_rank
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -218,9 +219,13 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
         self.use_nsa = is_deepseek_nsa(config)
         self.enable_prefill_cp = is_nsa_enable_prefill_cp()  if self.use_nsa else is_enable_prefill_cp()
-        if self.enable_prefill_cp and self.use_nsa:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+        if self.enable_prefill_cp:
+            if self.use_nsa:
+                self.cp_rank = get_attention_tp_rank()
+                self.cp_size = get_attention_tp_size()
+            else:
+                self.cp_size = self.pcp_size = get_pcp_size()
+                self.cp_rank = self.pcp_rank = get_context_parallel_rank()
         else:
             self.cp_rank = None
             self.cp_size = None
@@ -247,7 +252,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.enable_prefill_cp and self.use_nsa:
             if can_cp_split(len(input_ids), self.cp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
@@ -255,9 +260,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     input_ids.device,
                 )
         elif self.enable_prefill_cp:
-            cur_cp_seq_len = len(input_ids) // (self.pcp_size * 2)
-            if can_cp_split(cur_cp_seq_len, self.pcp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,

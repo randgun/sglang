@@ -657,7 +657,6 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
-        print(f"reduce_scatter_tensor: output_shape={output.shape} input_shape={input.shape},world_size={self.world_size}")
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -732,7 +731,6 @@ class GroupCoordinator:
             ):
                 pynccl_comm.all_gather(output, input)
         else:
-            print(f"all_gather_into_tensor: output_shape={output.shape} input_shape={input.shape}, group_size={self.world_size}")
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
             )
