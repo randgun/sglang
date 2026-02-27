@@ -408,29 +408,58 @@ class MooncakeKVManager(CommonKVManager):
           * decode_page_idx = 10976 // 32 = 343
         """
         pages_per_block = cp_metadata.split_list[0] // page_size
+        zigzag_len = len(cp_metadata.zigzag_index)
+        prefill_len = int(prefill_page_indices.shape[0])
+        if prefill_len > 0:
+            max_prefill_page = int(prefill_page_indices.max())
+            max_block_idx_zigzag = max_prefill_page // pages_per_block
+        else:
+            max_prefill_page = -1
+            max_block_idx_zigzag = -1
         
+        # Prefer block_page_counts if provided (zigzag order)
+        use_block_counts = (
+            cp_metadata.block_page_counts is not None
+            and len(cp_metadata.block_page_counts) == zigzag_len
+            and sum(cp_metadata.block_page_counts) == prefill_len
+        )
+        if use_block_counts:
+            decode_page_indices = []
+            for zigzag_pos, original_block_idx in enumerate(cp_metadata.zigzag_index):
+                count = cp_metadata.block_page_counts[zigzag_pos]
+                if count <= 0:
+                    continue
+                block_token_start = sum(
+                    cp_metadata.split_list[j] for j in range(original_block_idx)
+                )
+                for local_page_idx in range(count):
+                    page_token_start = block_token_start + local_page_idx * page_size
+                    decode_page_indices.append(page_token_start // page_size)
+            return np.array(decode_page_indices, dtype=np.int32)
+
+        # Fallback to legacy mapping using global page indices
         decode_page_indices = []
         for prefill_page_idx in prefill_page_indices:
-            # Get block position in zigzag_index
-            block_idx_zigzag = prefill_page_idx // pages_per_block
-            
-            # Get the original block index
-            original_block_idx = cp_metadata.zigzag_index[block_idx_zigzag]
-            
+            # Convert global page index to global block index
+            original_block_idx = prefill_page_idx // pages_per_block
+            # Map global block index to zigzag position for this CP rank
+            block_idx_zigzag = cp_metadata.zigzag_index.index(original_block_idx)
+
             # Calculate page offset within the block
             page_offset_in_block = prefill_page_idx % pages_per_block
-            
+
             # Calculate block start token position in original request
-            block_token_start = sum(cp_metadata.split_list[j] 
-                                   for j in range(original_block_idx))
-            
+            block_token_start = sum(
+                cp_metadata.split_list[j] for j in range(original_block_idx)
+            )
+
             # Calculate page start token position in original request
             page_token_start = block_token_start + page_offset_in_block * page_size
-            
+
             # Calculate Decode page index
             decode_page_idx = page_token_start // page_size
             decode_page_indices.append(decode_page_idx)
-        
+
         return np.array(decode_page_indices, dtype=np.int32)
 
     def send_kvcache(
@@ -889,7 +918,14 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
-                local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                if getattr(self, "pcp_size", 1) > 1:
+                    local_rank = (
+                        (self.pcp_rank * self.attn_tp_size + self.attn_tp_rank)
+                        * self.pp_size
+                        + self.pp_rank
+                    )
+                else:
+                    local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -924,11 +960,14 @@ class MooncakeKVManager(CommonKVManager):
                             ]
 
                         if kv_chunk.cp_metadata is not None:
-                            mapped_dst_kv_indices = self._map_cp_page_indices(
+                            mapped_logical_pages = self._map_cp_page_indices(
                                 kv_chunk.prefill_kv_indices,
                                 kv_chunk.cp_metadata,
                                 self.kv_args.page_size,
                             )
+                            mapped_dst_kv_indices = req.dst_kv_indices[
+                                mapped_logical_pages
+                            ]
                         else:
                             mapped_dst_kv_indices = chunked_dst_kv_indice
 
@@ -1077,6 +1116,26 @@ class MooncakeKVManager(CommonKVManager):
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
 
+                if status == KVPoll.Success:
+                    bootstrap_addr = None
+                    with self.connection_lock:
+                        for addr, rooms in self.addr_to_rooms_tracker.items():
+                            if bootstrap_room in rooms:
+                                bootstrap_addr = addr
+                                break
+                    if bootstrap_addr:
+                        prefill_attn_tp_size = self.prefill_attn_tp_size_table.get(
+                            bootstrap_addr
+                        )
+                        prefill_pp_size = self.prefill_pp_size_table.get(bootstrap_addr)
+                        prefill_pcp_size = self.prefill_pcp_size_table.get(
+                            bootstrap_addr
+                        )
+                        if prefill_attn_tp_size and prefill_pp_size:
+                            pp_rank = prefill_rank % prefill_pp_size
+                            tmp = prefill_rank // prefill_pp_size
+                            attn_tp_rank = tmp % prefill_attn_tp_size
+                            pcp_rank = tmp // prefill_attn_tp_size
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
@@ -1236,6 +1295,8 @@ class MooncakeKVManager(CommonKVManager):
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_pp_size_table:
                 del self.prefill_pp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_pcp_size_table:
+                del self.prefill_pcp_size_table[failed_bootstrap_addr]
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []

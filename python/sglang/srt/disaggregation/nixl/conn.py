@@ -255,6 +255,8 @@ class NixlKVManager(CommonKVManager):
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_pp_size_table:
                 del self.prefill_pp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_pcp_size_table:
+                del self.prefill_pcp_size_table[failed_bootstrap_addr]
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
