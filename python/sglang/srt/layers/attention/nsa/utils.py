@@ -82,6 +82,9 @@ class ContextParallelMetadata:
     per_rank_actual_token: Optional[List[int]] = None
     reverse_split_len: Optional[List[int]] = None
     cp_reverse_index: Optional[List[int]] = None
+    # Per-rank valid ranges (in original sequence index space), computed
+    # by intersecting each zigzag block with [0, actual_seq_len).
+    rank_valid_ranges: Optional[List[Tuple[int, int]]] = None
     kv_len_prev: int = -1
     kv_len_next: int = -1
     actual_seq_q_prev: int = -1
@@ -103,6 +106,8 @@ class ContextParallelMetadata:
     cp_rank: Optional[int] = None
     aligned_seq_len: Optional[int] = None
     actual_seq_len: Optional[int] = None
+    # Per-block page counts for CP KV transfer (zigzag order)
+    block_page_counts: Optional[List[int]] = None
 
 
 
@@ -247,14 +252,31 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     cp_metadata = _get_cp_metadata(forward_batch)
     assert cp_metadata is not None, "CP metadata is not available"
 
-    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_data: input_shape={input_.shape}, split_list={cp_metadata.split_list}, zigzag_index={cp_metadata.zigzag_index}")
+    if cp_metadata.rank_valid_ranges is not None:
+        # Use rank_valid_ranges to select real tokens only.
+        parts = []
+        expected = 0
+        for start, end in cp_metadata.rank_valid_ranges:
+            if end > start:
+                expected += end - start
+                parts.append(input_[start:end])
+        if not parts:
+            return input_.new_empty((0, *input_.shape[1:]))
+        result = torch.cat(parts, dim=0).contiguous()
+        if result.shape[0] != expected:
+            logger.warning(
+                "cp_split_and_rebuild_data: unexpected token count, got=%s expected=%s",
+                result.shape[0],
+                expected,
+            )
+        return result
+
     input_list = list(
         torch.split(input_, cp_metadata.split_list, dim=0)
     )
     result = torch.cat(
         [input_list[i] for i in cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
-    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_data: output_shape={result.shape}")
     return result
 
 
@@ -270,7 +292,24 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     cp_metadata = _get_cp_metadata(forward_batch)
     assert cp_metadata is not None, "CP metadata is not available"
 
-    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_position: input_shape={positions.shape}, split_list={cp_metadata.split_list}, zigzag_index={cp_metadata.zigzag_index}")
+    if cp_metadata.rank_valid_ranges is not None:
+        parts = []
+        expected = 0
+        for start, end in cp_metadata.rank_valid_ranges:
+            if end > start:
+                expected += end - start
+                parts.append(positions[..., start:end])
+        if not parts:
+            return positions.new_empty((*positions.shape[:-1], 0))
+        result = torch.cat(parts, dim=-1).contiguous()
+        if result.shape[-1] != expected:
+            logger.warning(
+                "cp_split_and_rebuild_position: unexpected token count, got=%s expected=%s",
+                result.shape[-1],
+                expected,
+            )
+        return result
+
     position_id_list = list(
         torch.split(positions, cp_metadata.split_list, dim=-1)
     )
@@ -278,7 +317,6 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         [position_id_list[i] for i in cp_metadata.zigzag_index],
         dim=-1,
     )
-    print(f"[CP_SPLIT_DEBUG] cp_split_and_rebuild_position: output_shape={positions.shape}")
     return positions
 
 

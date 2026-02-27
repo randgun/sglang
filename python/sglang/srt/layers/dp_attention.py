@@ -298,6 +298,10 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
+    # Always initialize PCP metadata so get_pcp_size() is safe even when PCP is disabled.
+    _ATTN_PCP_RANK = 0
+    _ATTN_PCP_SIZE = 1
+
     if pcp_size > 1:
         # PCP reuses attention-TP partitioning but should not expose logical DP to
         # downstream paths that index `global_num_tokens` by DP rank.
@@ -608,9 +612,63 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
     # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
     # but communicate on PCP group (not attention-TP group).
-    cp_rank_count = len(forward_batch.nsa_cp_metadata.max_rank_len)
-    max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
+    pcp_group = get_pcp_group()
+    tp_group = get_tp_group()
+    can_use_tp_group = (
+        getattr(pcp_group, "world_size", None) == getattr(tp_group, "world_size", None)
+        and getattr(pcp_group, "ranks", None) == getattr(tp_group, "ranks", None)
+    )
+    # Default strategy: prefer tp_group when it has the same rank set as pcp_group.
+    comm_group = tp_group if can_use_tp_group else pcp_group
+    cp_rank_count = pcp_group.world_size
+    cp_metadata = (
+        forward_batch.gqa_cp_metadata
+        if forward_batch.gqa_cp_metadata is not None
+        else forward_batch.nsa_cp_metadata
+    )
+    if cp_metadata is None:
+        raise ValueError(
+            f"pcp_ag_rearange_output requires cp metadata, got None "
+            f"(forward_mode={getattr(forward_batch, 'forward_mode', None)})"
+        )
+    max_len = cp_metadata.max_rank_len[0]
 
+    if (
+        cp_metadata.max_rank_len is None
+        or len(cp_metadata.max_rank_len) != cp_rank_count
+    ):
+        if cp_metadata.per_rank_actual_token is not None:
+            max_len = max(cp_metadata.per_rank_actual_token)
+        else:
+            total_len = cp_metadata.total_seq_lens
+            max_len = (total_len + cp_rank_count - 1) // cp_rank_count
+        cp_metadata.max_rank_len = [max_len] * cp_rank_count
+
+    if (
+        cp_metadata.per_rank_actual_token is None
+        or len(cp_metadata.per_rank_actual_token) != cp_rank_count
+    ):
+        raise ValueError(
+            "pcp metadata invalid per_rank_actual_token: "
+            f"len={None if cp_metadata.per_rank_actual_token is None else len(cp_metadata.per_rank_actual_token)} "
+            f"cp_rank_count={cp_rank_count}"
+        )
+    if (
+        cp_metadata.reverse_split_len is None
+        or len(cp_metadata.reverse_split_len) == 0
+    ):
+        raise ValueError(
+            f"pcp metadata invalid reverse_split_len={cp_metadata.reverse_split_len}"
+        )
+    if (
+        cp_metadata.cp_reverse_index is None
+        or len(cp_metadata.cp_reverse_index) != len(cp_metadata.reverse_split_len)
+    ):
+        raise ValueError(
+            "pcp metadata invalid cp_reverse_index: "
+            f"len(cp_reverse_index)={None if cp_metadata.cp_reverse_index is None else len(cp_metadata.cp_reverse_index)} "
+            f"len(reverse_split_len)={len(cp_metadata.reverse_split_len)}"
+        )
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
         input_tensor = F.pad(
@@ -626,16 +684,18 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
         device=input_tensor.device,
     )
 
-    pcp_group = get_pcp_group()
     assert (
         pcp_group.world_size == cp_rank_count
     ), f"pcp metadata/group mismatch: cp_rank_count={cp_rank_count}, pcp_group.world_size={pcp_group.world_size}"
-    pcp_group.all_gather_into_tensor(all_shuffled_sensor, input_tensor)
+    assert (
+        getattr(comm_group, "world_size", None) == cp_rank_count
+    ), f"comm group size mismatch: cp_rank_count={cp_rank_count}, comm_group.world_size={getattr(comm_group, 'world_size', None)}"
+    comm_group.all_gather_into_tensor(all_shuffled_sensor, input_tensor)
 
     splitted_tensor = list(
         torch.split(
             all_shuffled_sensor,
-            forward_batch.nsa_cp_metadata.max_rank_len,
+            cp_metadata.max_rank_len,
             dim=0,
         )
     )
@@ -643,17 +703,17 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
         [
             splitted_tensor[index][:per_rank_len]
             for index, per_rank_len in enumerate(
-                forward_batch.nsa_cp_metadata.per_rank_actual_token
+                cp_metadata.per_rank_actual_token
             )
         ],
         dim=0,
     )
     outputs_list = list(
         torch.split(
-            output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
+            output_tensor, cp_metadata.reverse_split_len, dim=0
         )
     )
     outputs = torch.cat(
-        [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
+        [outputs_list[i] for i in cp_metadata.cp_reverse_index], dim=0
     )
     return outputs

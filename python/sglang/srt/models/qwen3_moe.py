@@ -19,7 +19,6 @@
 
 import logging
 import math
-import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -101,15 +100,6 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-
-
-def _is_pcp_precision_debug_enabled() -> bool:
-    return os.getenv("SGLANG_PCP_DEBUG_PRECISION", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -544,6 +534,20 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if (
+            hidden_states.shape[0] == 0
+            and self.enable_prefill_cp
+            and use_pcp(forward_batch)
+        ):
+            # Avoid NPU rope on empty tensors; still participate in PCP comms.
+            empty_kv = torch.empty(
+                (0, self.kv_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
+            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -570,33 +574,31 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if (
+            hidden_states.shape[0] == 0
+            and self.enable_prefill_cp
+            and use_pcp(forward_batch)
+        ):
+            # Avoid rope on empty tensors; still participate in PCP comms.
+            empty_kv = torch.empty(
+                (0, self.kv_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
+            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
         if self.enable_prefill_cp and use_pcp(forward_batch):
-            if _is_pcp_precision_debug_enabled():
-                logger.info(
-                    "[pcp-debug] before pcp_ag_rearange_output: layer=%s k_shape=%s "
-                    "v_shape=%s k_dtype=%s v_dtype=%s",
-                    self.attn.layer_id,
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    k.dtype,
-                    v.dtype,
-                )
-            k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
-            v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
-            if _is_pcp_precision_debug_enabled():
-                logger.info(
-                    "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
-                    "v_shape=%s k_dtype=%s v_dtype=%s",
-                    self.attn.layer_id,
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    k.dtype,
-                    v.dtype,
-                )
+            k = pcp_ag_rearange_output(
+                k.contiguous(), self.pcp_size, forward_batch
+            )
+            v = pcp_ag_rearange_output(
+                v.contiguous(), self.pcp_size, forward_batch
+            )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -663,7 +665,10 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
-            return hidden_states, forward_batch, None
+            # In CP mode, still participate in pcp all_gather to avoid
+            # communicator mismatch when some ranks have zero tokens.
+            if not (self.enable_prefill_cp and use_pcp(forward_batch)):
+                return hidden_states, forward_batch, None
         if not _is_npu or forward_batch.forward_mode.is_extend():
             return self.forward_prepare_native(
                 positions=positions,
@@ -831,12 +836,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
-        if hidden_states.shape[0] != 0:
+        if hidden_states.shape[0] != 0 or (
+            self.enable_prefill_cp and use_pcp(forward_batch)
+        ):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
