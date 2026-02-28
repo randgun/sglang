@@ -896,6 +896,7 @@ class AscendAttnBackend(AttentionBackend):
             print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k.shape=}, {v.shape=}, {kv_mask_idx.max().item()=}\
                 , {kv_nomask_idx.max().item()=},{k.shape[0]=},{q_seqlens=},{kv_mask_seqlens=},{kv_nomask_seqlens=}")
         has_no_mask = (kv_nomask_idx.shape[0] != 0) and (sum(kv_nomask_seqlens) != 0)
+        
         if has_no_mask:
             kv_nomask_idx = kv_nomask_idx.to(k.device)
             k_nomask = torch.index_select(k, 0, kv_nomask_idx)
@@ -926,6 +927,12 @@ class AscendAttnBackend(AttentionBackend):
         kv_mask_idx = kv_mask_idx.to(k.device)
         k_mask = torch.index_select(k, 0, kv_mask_idx)
         v_mask = torch.index_select(v, 0, kv_mask_idx)
+
+        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+            print(f"HEAD: k_mask positions should be token0,token1")
+            print(f"HEAD: k_mask[:2, 0, :3] = {k_mask[:2, 0, :3]}")
+            # 对比 forward_fia_pcp 里 k 的前3个元素
+            print(f"全局k[0,:3]={k[0,0,:3]}, 全局k[6,:3]={k[6,0,:3]}")
 
         mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
             q,
@@ -990,6 +997,9 @@ class AscendAttnBackend(AttentionBackend):
 
         pcp_metadata = forward_batch.cp_metadata
         atten_mask = self.fia_mask
+        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+            print(f"+++ fia_mask shape={self.fia_mask.shape}")
+            print(f"+++ fia_mask=\n{self.fia_mask}")
 
 
         kv_with_q_head_nomask_idx = pcp_metadata.kv_with_q_head_nomask_idx
@@ -1022,6 +1032,9 @@ class AscendAttnBackend(AttentionBackend):
 
         output=[output_head]
         if q_tail.shape[0]>0:
+            if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
+                print(f"TAIL: k_mask should be token6,token7")
+                print(f"TAIL: k_mask[:2, 0, :3] = {k_mask[:2, 0, :3]}")
             output_tail, attn_lse_tail = self._fia_attention_with_mask_and_nomask(
                 q=q_tail,
                 k=k,
