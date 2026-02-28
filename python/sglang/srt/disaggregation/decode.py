@@ -297,6 +297,15 @@ class DecodePreallocQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+
+        if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
+            kv_args.dequant_unit_num = self.token_to_kv_pool.get_dequant_unit_num()
+            (
+                kv_args.dequant_scale_data_ptrs,
+                kv_args.dequant_scale_data_lens,
+                kv_args.dequant_scale_item_lens,
+            ) = self.token_to_kv_pool.get_contiguous_scale_buf_infos()
+
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.

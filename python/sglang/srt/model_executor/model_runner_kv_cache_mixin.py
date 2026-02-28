@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -508,10 +509,16 @@ class ModelRunnerKVCacheMixin:
                 )
             else:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMHAC8TokenToKVPool,
                     NPUMHATokenToKVPool,
                 )
 
-                self.token_to_kv_pool = NPUMHATokenToKVPool(
+                NPUTokenPoolClass = (
+                    NPUMHATokenToKVPool
+                    if not envs.SGLANG_NPU_ENABLE_KVCACHE_C8
+                    else NPUMHAC8TokenToKVPool
+                )
+                self.token_to_kv_pool = NPUTokenPoolClass(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,

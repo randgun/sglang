@@ -310,6 +310,8 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
+    # C8
+    SGLANG_NPU_ENABLE_KVCACHE_C8 = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)

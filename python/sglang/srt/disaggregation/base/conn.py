@@ -40,6 +40,11 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    # for npu c8
+    dequant_unit_num: int
+    dequant_scale_data_ptrs: List[int]
+    dequant_scale_data_lens: List[int]
+    dequant_scale_item_lens: List[int]
 
 
 class KVPoll:

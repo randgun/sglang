@@ -4259,6 +4259,7 @@ def wait_routed_stream():
         cur_stream = torch.get_device_module().current_stream()
         cur_stream.wait_stream(stream)
 
+
 def process_shared_expert(hidden_states, forward_func):
     """
     PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
@@ -4274,6 +4275,7 @@ def process_shared_expert(hidden_states, forward_func):
     with torch.get_device_module().stream(stream):
         shared_output = forward_func(hidden_states)
     return shared_output
+
 
 def process_routed_expert(hidden_states, topk_output, forward_func):
     """

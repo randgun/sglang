@@ -23,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.environ import temp_set_env
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -36,7 +37,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
-from sglang.srt.environ import temp_set_env
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,9 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.needs_quant_draft = get_global_server_args().speculative_draft_model_quantization
+        self.needs_quant_draft = (
+            get_global_server_args().speculative_draft_model_quantization
+        )
         self.quant_config = quant_config if self.needs_quant_draft else None
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -158,8 +160,8 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             cxt = contextlib.nullcontext()
         else:
             unquant_patch = {
-                'SGLANG_DEEPEP_BF16_DISPATCH': '1',
-                'DEEP_NORMAL_MODE_USE_INT8_QUANT': '0'
+                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "DEEP_NORMAL_MODE_USE_INT8_QUANT": "0",
             }
             cxt = temp_set_env(allow_sglang=True, **unquant_patch)
 
