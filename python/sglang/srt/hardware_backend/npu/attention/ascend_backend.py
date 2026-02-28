@@ -1032,9 +1032,6 @@ class AscendAttnBackend(AttentionBackend):
 
         output=[output_head]
         if q_tail.shape[0]>0:
-            if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
-                print(f"TAIL: k_mask should be token6,token7")
-                print(f"TAIL: k_mask[:2, 0, :3] = {k_mask[:2, 0, :3]}")
             output_tail, attn_lse_tail = self._fia_attention_with_mask_and_nomask(
                 q=q_tail,
                 k=k,
@@ -1174,7 +1171,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
-                if torch.distributed.get_rank() == 0  and layer.layer_id in (0,1):
+                if torch.distributed.get_rank() in (0,4) and layer.layer_id==0:
                     print(f"+++ fia results output is {attn_output.sum()=},{attn_output[:5, :5]=}")
             else:
                 causal = True

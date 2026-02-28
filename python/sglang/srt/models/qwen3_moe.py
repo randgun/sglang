@@ -821,7 +821,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
         if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            print(f"+++ prepare attn and capture, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+            print(f"+++[Qwen3MoeDecoderLayer] prepare attn and capture last layer outputs, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -834,7 +834,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            print(f"+++ after attention and prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+            print(f"+++[Qwen3MoeDecoderLayer] after attention and prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -851,7 +851,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
         if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            print(f"+++ after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+            print(f"+++[Qwen3MoeDecoderLayer] after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -996,13 +996,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_size,
                     input_ids.device,
                 )
-                print(f"[rank={torch.distributed.get_rank()}] "
+                if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
+                    print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
+                    {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
+                    print(f"[rank={torch.distributed.get_rank()}] "
                         f"pcp_rank={self.pcp_rank}, "
                         f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
-                
-                if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
-                    print(f"+++ pcp metadata {forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
-                    {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
+
         hidden_states = self.model(
             input_ids,
             positions,
