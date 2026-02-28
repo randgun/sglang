@@ -582,12 +582,6 @@ class Qwen3MoeAttention(nn.Module):
 
         if self.enable_prefill_cp and use_pcp(forward_batch):
             if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    self.attn,
-                    forward_batch.out_cache_loc,
-                    k,
-                    v,
-                )
                 print(f"+++[Qwen3MoeAttention] before _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")  
             k,v = self._rebuild_pcp_kv(k, v, forward_batch)
             if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
@@ -647,7 +641,6 @@ class Qwen3MoeAttention(nn.Module):
                     )
                     if enable_fused_set_kv_buffer(forward_batch)
                     and self.compatible_with_fused_kv_buffer
-                    and not self.enable_prefill_cp
                     else None
                 ),
             )
@@ -681,14 +674,11 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states
 
         q, k, v, fb = inner_state
-        if self.enable_prefill_cp and use_pcp(forward_batch):
-            save_kv_cache = False
-        else:
-            must_save_kv = self._used_fused_qk_norm_rope_last_call
-            save_kv_cache = must_save_kv or not (
-                enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
-            )
+        must_save_kv = self._used_fused_qk_norm_rope_last_call
+        save_kv_cache = must_save_kv or not (
+            enable_fused_set_kv_buffer(forward_batch)
+            and self.compatible_with_fused_kv_buffer
+        )
 
         attn_output = self.attn(
             q,
