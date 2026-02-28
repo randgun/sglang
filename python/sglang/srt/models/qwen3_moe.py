@@ -561,6 +561,12 @@ class Qwen3MoeAttention(nn.Module):
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
+    
+    def _rebuild_pcp_kv(self, k, v, forward_batch):
+        kv = torch.cat([k, v], dim=-1)
+        kv_full = pcp_ag_rearange_output(kv.contiguous(), self.pcp_size, forward_batch)
+        k, v = kv_full.split(split_size=self.kv_size, dim=-1)
+        return k, v
 
     def forward_prepare_native(
         self,
@@ -574,15 +580,14 @@ class Qwen3MoeAttention(nn.Module):
 
 
         if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1 and use_pcp(forward_batch):
-            if self.attn.layer_id==0 and (torch.distributed.get_rank()==0 or torch.distributed.get_rank()==5) :
-                print(f"+++ attention rerange before, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{q.sum()=},{v.sum()=}")  
-            k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
-            v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
-            if self.attn.layer_id==0 and (torch.distributed.get_rank()==0 or torch.distributed.get_rank()==5) :
-                print(f"+++ attention rerange after, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{q.sum()=},{v.sum()=}") 
+            if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
+                print(f"+++ before _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")  
+            k,v = self._rebuild_pcp_kv(k, v, forward_batch)
+            if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
+                print(f"+++ after _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")  
+
         inner_state = q, k, v, forward_batch
-        if self.attn.layer_id == 0 and (torch.distributed.get_rank()==0 or torch.distributed.get_rank()==4) :
-            print(f"+++ output result, {self.attn.layer_id=},{torch.distributed.get_rank()=},{k.sum()=},{q.sum()=},{v.sum()=}")
+        
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
@@ -814,7 +819,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
-        if self.layer_id==0 and torch.distributed.get_rank() in range(8):
+        if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
             print(f"+++ prepare attn and capture, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if hidden_states.shape[0] != 0:
@@ -827,7 +832,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if self.layer_id==0 and torch.distributed.get_rank() in range(8):
+        if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
             print(f"+++ after attention and prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         should_allreduce_fusion = (
@@ -844,7 +849,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        if self.layer_id==0 and torch.distributed.get_rank() in range(8):
+        if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
             print(f"+++ after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if should_allreduce_fusion:

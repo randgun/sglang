@@ -892,7 +892,7 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         atten_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        if torch.distributed.get_rank() == 0 and layer.layer_id in range(8):
+        if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
             print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k.shape=}, {v.shape=}, {kv_mask_idx.max().item()=}\
                 , {kv_nomask_idx.max().item()=},{k.shape[0]=},{q_seqlens=},{kv_mask_seqlens=},{kv_nomask_seqlens=}")
         has_no_mask = (kv_nomask_idx.shape[0] != 0) and (sum(kv_nomask_seqlens) != 0)
@@ -900,7 +900,7 @@ class AscendAttnBackend(AttentionBackend):
             kv_nomask_idx = kv_nomask_idx.to(k.device)
             k_nomask = torch.index_select(k, 0, kv_nomask_idx)
             v_nomask = torch.index_select(v, 0, kv_nomask_idx)
-            if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
                 print(f"+++ fia pcp nomask k is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {k_nomask.sum()=},  {k_nomask[:2, :5,:5]=}")
             nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
                 q,
@@ -920,7 +920,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv=kv_nomask_seqlens,
                 actual_seq_lengths=q_seqlens,
             )
-            if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
                 print(f"+++ fia pcp nomask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {nomask_out.sum()=},  {nomask_out[:2, :5,:5]=}")
 
         kv_mask_idx = kv_mask_idx.to(k.device)
@@ -945,7 +945,7 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=kv_mask_seqlens,
             actual_seq_lengths=q_seqlens,
         )
-        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+        if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
             print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=},  {mask_out[:2, :5,:5]=}")
 
         attn_output = mask_out
@@ -964,7 +964,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         lse_final = torch.logsumexp(lse_list, dim=0, keepdim=False)
         out_final = torch.sum(torch.exp(lse_list - lse_final) * out_list, dim=0)
-        return out_final, lse_final
+        return out_final, lse_final.squeeze(0)
 
     def forward_fia_pcp(
         self,
@@ -985,7 +985,7 @@ class AscendAttnBackend(AttentionBackend):
         q_head = q_head.contiguous()
         q_tail = q_tail.contiguous()
 
-        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+        if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
             print(f"+++ fia pcp q is {layer.layer_id=} {seq_len=} {split_len=} {tail_len=}")
 
         pcp_metadata = forward_batch.cp_metadata
@@ -1002,6 +1002,8 @@ class AscendAttnBackend(AttentionBackend):
 
         head_q_seqlens = pcp_metadata.head_q_seqlens
         tail_q_seqlens = pcp_metadata.tail_q_seqlens
+        head_kv_mask_seqlens = [kv_with_q_head_mask_idx.shape[0]]
+        tail_kv_mask_seqlens = [kv_with_q_tail_mask_idx.shape[0]]
         
         output_head, attn_lse_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
@@ -1009,13 +1011,13 @@ class AscendAttnBackend(AttentionBackend):
             v=v,
             kv_mask_idx=kv_with_q_head_mask_idx,
             kv_nomask_idx=kv_with_q_head_nomask_idx,
+            kv_mask_seqlens=head_kv_mask_seqlens,
             kv_nomask_seqlens=head_attn_nomask_seqlens,
             q_seqlens=head_q_seqlens,
-            kv_mask_seqlens=attn_mask_seqlens,
             layer=layer,
             atten_mask=atten_mask,
         )
-        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+        if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
             print(f"+++ output head is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_head.sum()=},  {output_head[:2, :5,:5]=}")
 
         output=[output_head]
@@ -1028,16 +1030,16 @@ class AscendAttnBackend(AttentionBackend):
                 kv_nomask_idx=kv_with_q_tail_nomask_idx,
                 q_seqlens=tail_q_seqlens,
                 kv_nomask_seqlens=tail_attn_nomask_seqlens,
-                kv_mask_seqlens=attn_mask_seqlens,
+                kv_mask_seqlens=tail_kv_mask_seqlens,
                 layer=layer,
                 atten_mask=atten_mask,
             )
-            if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+            if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
                 print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
             output = torch.cat([output_head,output_tail], dim=0)
         else:
             output = torch.cat(output, dim=0)
-        if torch.distributed.get_rank() == 0 and layer.layer_id in (0,1):
+        if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
             print(f"+++ fia pcp output is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output.sum()=},  {output[:5, :5,:5]=}")
         return output.reshape(seq_len, -1).to(q.dtype)
 
@@ -1100,6 +1102,8 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
+                print(f"[KV DECODE SAVE] {k_cache.shape=},k_cache slot0={k_cache[0,0,:3]},slot1={k_cache[1,0,:3]},slot4={k_cache[4,0,:3]}")
 
             if sinks is not None:
                 attn_out = attention_sinks_prefill_triton(
@@ -1832,6 +1836,8 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if layer.layer_id == 0 and torch.distributed.get_rank() in (0, 4):
+                print(f"[KV DECODE READ]  {k_cache.shape=},k_cache slot0={k_cache[0,0,:3]},slot1={k_cache[1,0,:3]},slot4={k_cache[4,0,:3]}")
 
             if sinks is not None:
                 attn_out = attention_sinks_triton(
