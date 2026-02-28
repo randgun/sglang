@@ -11,6 +11,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -1283,9 +1284,23 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
-                )
+                if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
+                    k = k.view(-1, layer.tp_k_head_num * layer.qk_head_dim)
+                    v = v.view(-1, layer.tp_v_head_num * layer.qk_head_dim)
+                    k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k)
+                    v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        forward_batch.out_cache_loc,
+                        k_quant,
+                        v_quant,
+                        k_dynamic_scale,
+                        v_dynamic_scale,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, v
+                    )
 
         if sinks is not None:
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1313,6 +1328,8 @@ class AscendAttnBackend(AttentionBackend):
                 layer.layer_id
             ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
+            if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
+                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id).view(2, -1)
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:
@@ -1331,6 +1348,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8 else None,
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
@@ -1349,6 +1367,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8 else None,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )

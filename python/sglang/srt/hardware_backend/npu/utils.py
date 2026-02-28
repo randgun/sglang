@@ -124,6 +124,7 @@ def npu_format_cast(
         return tensor
 
     import torch_npu
+
     tmp = torch_npu.npu_format_cast(tensor, acl_format.value)
     tensor.untyped_storage().resize_(0)
 

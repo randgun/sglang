@@ -63,6 +63,7 @@ def npu_wrapper_rmsnorm_forward(func):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
+
             out, residual_out = add_rmsnorm_bias(
                 x,
                 residual,
@@ -72,6 +73,7 @@ def npu_wrapper_rmsnorm_forward(func):
             )
             return out.to(x.dtype), residual_out
         from sgl_kernel_npu.norm.rmsnorm_bias import rmsnorm_bias
+
         out = rmsnorm_bias(
             x,
             self.weight.data,

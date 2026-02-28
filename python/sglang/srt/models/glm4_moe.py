@@ -90,14 +90,14 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_npu,
     is_non_idle_and_non_empty,
+    is_npu,
     log_info_on_rank0,
     make_layers,
-    process_shared_expert,
-    wait_share_stream,
     process_routed_expert,
+    process_shared_expert,
     wait_routed_stream,
+    wait_share_stream,
 )
 from sglang.srt.environ import envs
 
@@ -114,7 +114,6 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
-
 
 
 class Glm4MoeMLP(nn.Module):
@@ -293,13 +292,13 @@ class Glm4MoeAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             if self.use_qk_norm:
                 q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-                head_dim=self.head_dim,
-                alt_stream=self.alt_stream,
-            )
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=self.head_dim,
+                    alt_stream=self.alt_stream,
+                )
             q, k = self.rotary_emb(positions, q, k)
         else:
             if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
@@ -588,7 +587,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             if is_prefill:
-                shared_output = process_shared_expert(hidden_states, self._forward_shared_experts)
+                shared_output = process_shared_expert(
+                    hidden_states, self._forward_shared_experts
+                )
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
