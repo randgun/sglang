@@ -704,8 +704,8 @@ class Qwen2MoeModel(nn.Module):
                 self.pcp_size,
                 forward_batch,
                 )
-            if layer.layer_id == 0 and torch.distributed.get_rank() in (0,4):
-                print(f"+++[Qwen2MoeModel] model output hidden states after pcp ag rearange output,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]}")
+            if torch.distributed.get_rank() in (0,4):
+                print(f"+++[Qwen2MoeModel] model output hidden states after pcp ag rearange output,{torch.distributed.get_rank()=},{hidden_states.sum()=}")
         if len(aux_hidden_states) == 0:
             return hidden_states
 

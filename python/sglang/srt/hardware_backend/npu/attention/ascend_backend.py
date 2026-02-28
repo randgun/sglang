@@ -997,10 +997,6 @@ class AscendAttnBackend(AttentionBackend):
 
         pcp_metadata = forward_batch.cp_metadata
         atten_mask = self.fia_mask
-        if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
-            print(f"+++ fia_mask shape={self.fia_mask.shape}")
-            print(f"+++ fia_mask=\n{self.fia_mask}")
-
 
         kv_with_q_head_nomask_idx = pcp_metadata.kv_with_q_head_nomask_idx
         kv_with_q_head_mask_idx = pcp_metadata.kv_with_q_head_mask_idx
