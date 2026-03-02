@@ -645,10 +645,10 @@ class Qwen2MoeModel(nn.Module):
         if self.enable_prefill_cp and use_pcp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            if torch.distributed.get_rank() in (0,4):
-                print(f"+++[Qwen2MoeModel] after cp split and rebuild position,{torch.distributed.get_rank()=},{positions.sum()=},{positions=},{forward_batch.cp_metadata.split_list=},\
-                    {forward_batch.extend_seq_lens=},{forward_batch.extend_seq_lens.sum()=}") 
-                print(f"+++[Qwen2MoeModel] after cp split and rebuild hidden states,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]}")
+            # if torch.distributed.get_rank() in (0,4):
+            #     print(f"+++[Qwen2MoeModel] after cp split and rebuild position,{torch.distributed.get_rank()=},{positions.sum()=},{positions=},{forward_batch.cp_metadata.split_list=},\
+            #         {forward_batch.extend_seq_lens=},{forward_batch.extend_seq_lens.sum()=}") 
+            #     print(f"+++[Qwen2MoeModel] after cp split and rebuild hidden states,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]}")
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -704,8 +704,8 @@ class Qwen2MoeModel(nn.Module):
                 self.pcp_size,
                 forward_batch,
                 )
-            if torch.distributed.get_rank() in (0,4):
-                print(f"+++[Qwen2MoeModel] model output hidden states after pcp ag rearange output,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]=},{hidden_states.shape=}")
+            # if torch.distributed.get_rank() in (0,4):
+            #     print(f"+++[Qwen2MoeModel] model output hidden states after pcp ag rearange output,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]=},{hidden_states.shape=}")
         if len(aux_hidden_states) == 0:
             return hidden_states
 

@@ -65,6 +65,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     prepare_input_dp_with_cp_dsa,
     is_enable_prefill_cp,
+    cp_all_gather_rerange_output,
     use_pcp,
 )
 from sglang.srt.layers.utils import get_layer_id
@@ -568,7 +569,7 @@ class Qwen3MoeAttention(nn.Module):
     
     def _rebuild_pcp_kv(self, k, v, forward_batch):
         kv = torch.cat([k, v], dim=-1)
-        kv_full = pcp_ag_rearange_output(kv.contiguous(), self.pcp_size, forward_batch)
+        kv_full = cp_all_gather_rerange_output(kv.contiguous(), self.pcp_size, forward_batch,torch.cuda.current_stream())
         k, v = kv_full.split(split_size=self.kv_size, dim=-1)
         return k, v
 
@@ -584,11 +585,11 @@ class Qwen3MoeAttention(nn.Module):
 
 
         if self.enable_prefill_cp and use_pcp(forward_batch):
-            if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
-                print(f"+++[Qwen3MoeAttention] before _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")  
+            # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
+                # print(f"+++[Qwen3MoeAttention] before _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")  
             k,v = self._rebuild_pcp_kv(k, v, forward_batch)
-            if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
-                print(f"+++[Qwen3MoeAttention] after _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")  
+            # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
+                # print(f"+++[Qwen3MoeAttention] after _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")  
 
         inner_state = q, k, v, forward_batch
         
@@ -823,8 +824,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
-        if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            print(f"+++[Qwen3MoeDecoderLayer] prepare attn and capture last layer outputs, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+        # if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
+            # print(f"+++[Qwen3MoeDecoderLayer] prepare attn and capture last layer outputs, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -836,8 +837,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            print(f"+++[Qwen3MoeDecoderLayer] after attention and prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+        # if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
+            # print(f"+++[Qwen3MoeDecoderLayer] after attention and prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -853,8 +854,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            print(f"+++[Qwen3MoeDecoderLayer] after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
+        # if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
+        #     # print(f"+++[Qwen3MoeDecoderLayer] after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}") 
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -999,12 +1000,12 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_size,
                     input_ids.device,
                 )
-                if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
-                    print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
-                    {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
-                    print(f"[rank={torch.distributed.get_rank()}] "
-                        f"pcp_rank={self.pcp_rank}, "
-                        f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
+                # if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
+                #     # print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
+                #     {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
+                #     # print(f"[rank={torch.distributed.get_rank()}] "
+                #         f"pcp_rank={self.pcp_rank}, "
+                #         f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
 
         hidden_states = self.model(
             input_ids,
