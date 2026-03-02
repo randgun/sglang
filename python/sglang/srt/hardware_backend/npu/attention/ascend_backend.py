@@ -1286,7 +1286,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
                     k = k.view(-1, layer.tp_k_head_num * layer.qk_head_dim)
-                    v = v.view(-1, layer.tp_v_head_num * layer.qk_head_dim)
+                    v = v.view(-1, layer.tp_v_head_num * layer.v_head_dim)
                     k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k)
                     v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v)
                     forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1330,6 +1330,8 @@ class AscendAttnBackend(AttentionBackend):
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
             if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
                 kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id).view(2, -1)
+                rank = torch.distributed.get_rank()
+                print(f"+++ {rank=}, {kv_dequant_scale.shape=}")
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:

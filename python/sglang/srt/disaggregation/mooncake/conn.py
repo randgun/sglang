@@ -172,6 +172,7 @@ class MooncakeKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        kv_args_register_info_class = KVArgsRegisterInfo
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -919,7 +920,7 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                        self.kv_args_register_info_class.from_zmq(waiting_req_bytes)
                     )
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
