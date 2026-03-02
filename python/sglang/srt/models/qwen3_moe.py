@@ -39,7 +39,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_rank, get_pcp_size,pcp_ag_rearange_output
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_rank, get_pcp_size,pcp_ag_rearange_output,get_attention_tp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -327,7 +327,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if is_enable_prefill_cp():
+                final_hidden_states = get_attention_tp_group().all_reduce(final_hidden_states)
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

@@ -166,8 +166,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
             return hidden_states, residual
         elif is_enable_prefill_cp():
             if hidden_states.shape[0] != 0:
-                from sglang.srt.distributed import tensor_model_parallel_all_reduce
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
         else:
