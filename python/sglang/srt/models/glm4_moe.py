@@ -579,15 +579,16 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
-        is_prefill = (
+        npu_enable_dual_stream = (
             forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_target_verify()
-        )
+        ) and self.alt_stream is not None and _is_npu
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if is_prefill:
-                shared_output = process_shared_expert(hidden_states, self._forward_shared_experts)
+            if npu_enable_dual_stream:
+                with self.alt_stream:
+                    shared_output = self._forward_shared_experts(hidden_states)
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -601,15 +602,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        if is_prefill:
-            final_hidden_states = process_routed_expert(hidden_states, topk_output, self.experts)
-            wait_share_stream()
-            wait_routed_stream()
-        else:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                topk_output=topk_output,
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+
+        if npu_enable_dual_stream:
+            cur_stream = torch.get_device_module().current_stream()
+            cur_stream.wait_stream(self.alt_stream)
 
         if shared_output is not None:
             x = shared_output
