@@ -515,7 +515,7 @@ class ModelRunnerKVCacheMixin:
 
                 NPUTokenPoolClass = (
                     NPUMHATokenToKVPool
-                    if not envs.SGLANG_NPU_ENABLE_KVCACHE_C8
+                    if not envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get()
                     else NPUMHAC8TokenToKVPool
                 )
                 self.token_to_kv_pool = NPUTokenPoolClass(

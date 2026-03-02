@@ -298,7 +298,7 @@ class DecodePreallocQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
-        if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
+        if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
             kv_args.dequant_unit_num = self.token_to_kv_pool.get_dequant_unit_num()
             (
                 kv_args.dequant_scale_data_ptrs,

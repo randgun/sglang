@@ -1284,7 +1284,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
+                if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
                     k = k.view(-1, layer.tp_k_head_num * layer.qk_head_dim)
                     v = v.view(-1, layer.tp_v_head_num * layer.v_head_dim)
                     k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k)
@@ -1328,7 +1328,7 @@ class AscendAttnBackend(AttentionBackend):
                 layer.layer_id
             ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
-            if envs.SGLANG_NPU_ENABLE_KVCACHE_C8:
+            if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
                 kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id).view(2, -1)
                 rank = torch.distributed.get_rank()
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}")
@@ -1350,7 +1350,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8 else None,
+                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get() else None,
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
@@ -1369,7 +1369,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8 else None,
+                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get() else None,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
