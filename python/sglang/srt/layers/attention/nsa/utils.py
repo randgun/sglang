@@ -277,6 +277,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     result = torch.cat(
         [input_list[i] for i in cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
+    
     return result
 
 
