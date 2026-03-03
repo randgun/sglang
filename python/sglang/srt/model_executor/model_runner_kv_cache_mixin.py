@@ -545,27 +545,6 @@ class ModelRunnerKVCacheMixin:
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
                     )
-                    
-
-                NPUTokenPoolClass = (
-                    NPUMHATokenToKVPool
-                    if not envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get()
-                    else NPUMHAC8TokenToKVPool
-                )
-                self.token_to_kv_pool = NPUTokenPoolClass(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
         elif self.use_mla_backend and is_nsa_model:
             self.token_to_kv_pool = NSATokenToKVPool(
                 self.max_total_num_tokens,
