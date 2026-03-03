@@ -209,6 +209,7 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
                     self.layer_num,
                     self.size // self.page_size + 1,
                     self.page_size,
+                    1
                 ),
                 dtype=self.dequant_scale_type,
                 device=self.device,
