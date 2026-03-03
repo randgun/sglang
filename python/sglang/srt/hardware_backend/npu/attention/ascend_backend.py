@@ -1289,7 +1289,7 @@ class AscendAttnBackend(AttentionBackend):
                     v = v.view(-1, layer.tp_v_head_num * layer.v_head_dim)
                     k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k)
                     v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v)
-                    print(f"++++ {forward_batch.out_cache_loc.shape=}")
+                    print(f"++++ {forward_batch.out_cache_loc.shape=}, {k_quant.dtype=}, {k_dynamic_scale.dtype=}")
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         forward_batch.out_cache_loc,
