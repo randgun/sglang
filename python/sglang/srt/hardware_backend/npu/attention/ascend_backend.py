@@ -895,7 +895,7 @@ class AscendAttnBackend(AttentionBackend):
         # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
         #     print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k.shape=}, {v.shape=}, {kv_mask_idx.max().item()=}\
         #         , {kv_nomask_idx.max().item()=},{k.shape[0]=},{q_seqlens=},{kv_mask_seqlens=},{kv_nomask_seqlens=}")
-        has_no_mask = (kv_nomask_idx.shape[0] != 0) and (sum(kv_nomask_seqlens) != 0)
+        has_no_mask = (kv_nomask_idx.shape[0] != 0) and (sum(kv_nomask_seqlens) > 0)
         
         if has_no_mask:
             kv_nomask_idx = kv_nomask_idx.to(k.device)
@@ -1038,8 +1038,8 @@ class AscendAttnBackend(AttentionBackend):
                 layer=layer,
                 atten_mask=atten_mask,
             )
-            if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-                print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
+            # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
+            #     print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
             output = torch.cat([output_head,output_tail], dim=0)
         else:
             output = torch.cat(output, dim=0)

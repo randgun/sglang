@@ -483,9 +483,6 @@ def _compute_attention_metadata(
     cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
     cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
     cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
-
-    attn_mask_seqlens = torch.cumsum(attn_mask_seqlens[0], dim=0).tolist()
-    cp_metadata.attn_mask_seqlens = attn_mask_seqlens
     cp_metadata.head_q_seqlens = head_q_seqlens
     cp_metadata.tail_q_seqlens = tail_q_seqlens
 
