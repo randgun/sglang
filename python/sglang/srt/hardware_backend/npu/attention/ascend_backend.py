@@ -1285,10 +1285,8 @@ class AscendAttnBackend(AttentionBackend):
                 )
             else:
                 if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
-                    k = k.view(-1, layer.tp_k_head_num * layer.qk_head_dim)
-                    v = v.view(-1, layer.tp_v_head_num * layer.v_head_dim)
-                    k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k)
-                    v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v)
+                    k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k.view(-1, layer.tp_k_head_num * layer.qk_head_dim))
+                    v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v.view(-1, layer.tp_v_head_num * layer.v_head_dim))
                     print(f"++++ {forward_batch.out_cache_loc.shape=}, {k_quant.dtype=}, {k_dynamic_scale.dtype=}")
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -1351,6 +1349,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                antiquant_mode=1,
                 antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get() else None,
             )
             output = torch.empty(
@@ -1370,6 +1369,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                antiquant_mode=1,
                 antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get() else None,
                 workspace=workspace,
                 out=[output, softmax_lse],
