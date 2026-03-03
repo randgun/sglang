@@ -207,8 +207,7 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
                 (
                     2,
                     self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
+                    (self.size // self.page_size + 1) * self.page_size,
                     1
                 ),
                 dtype=self.dequant_scale_type,
@@ -258,17 +257,18 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
 
-        print(f"+++ {self.k_dequant_scale_buffer[layer_id - self.start_layer].shape=}, {loc.view(-1, 1).shape=}, {cache_k_dequant_scale.view(-1, 1, self.k_dequant_scale_buffer.shape[-1]).shape=}")
+        print(f"+++ {self.k_dequant_scale_buffer[layer_id - self.start_layer].shape=}, {loc.view(-1, 1).shape=},\
+               {cache_k_dequant_scale.view(-1, 1, self.k_dequant_scale_buffer.shape[-1]).shape=}", flush=True)
         torch_npu.npu_scatter_nd_update_(
             self.k_dequant_scale_buffer[layer_id - self.start_layer],
             loc.view(-1, 1),
-            cache_k_dequant_scale.view(-1, 1, self.k_dequant_scale_buffer.shape[-1]),
+            cache_k_dequant_scale.view(-1, self.k_dequant_scale_buffer.shape[-1]),
         )
 
         torch_npu.npu_scatter_nd_update_(
             self.v_dequant_scale_buffer[layer_id - self.start_layer],
             loc.view(-1, 1),
-            cache_v_dequant_scale.view(-1, 1, self.v_dequant_scale_buffer.shape[-1]),
+            cache_v_dequant_scale.view(-1, self.v_dequant_scale_buffer.shape[-1]),
         )
 
     def get_scale_buffer(self, layer_id: int):
