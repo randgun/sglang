@@ -513,6 +513,40 @@ class ModelRunnerKVCacheMixin:
                     NPUMHATokenToKVPool,
                 )
 
+                if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
+                    # TODO scale type do not hard code
+                    self.token_to_kv_pool = NPUMHAC8TokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dequant_scale_type=torch.float32,
+                        dequant_offset_type=torch.float32,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                else:
+                    self.token_to_kv_pool = NPUMHATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                    
+
                 NPUTokenPoolClass = (
                     NPUMHATokenToKVPool
                     if not envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get()
