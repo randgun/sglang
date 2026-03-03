@@ -258,7 +258,7 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
         )
 
         print(f"+++ {self.k_dequant_scale_buffer[layer_id - self.start_layer].shape=}, {loc.view(-1, 1).shape=},\
-               {cache_k_dequant_scale.view(-1, 1, self.k_dequant_scale_buffer.shape[-1]).shape=}", flush=True)
+               {cache_k_dequant_scale.view(-1, self.k_dequant_scale_buffer.shape[-1]).shape=}", flush=True)
         torch_npu.npu_scatter_nd_update_(
             self.k_dequant_scale_buffer[layer_id - self.start_layer],
             loc.view(-1, 1),
