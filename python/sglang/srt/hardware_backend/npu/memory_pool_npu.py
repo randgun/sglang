@@ -182,6 +182,9 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
+        self.dequant_scale_type = dequant_scale_type
+        self.dequant_offset_type = dequant_offset_type
+
         super().__init__(
             size=size,
             page_size=page_size,
@@ -196,8 +199,6 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
             enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=enable_kv_cache_copy,
         )
-        self.dequant_scale_type = dequant_scale_type
-        self.dequant_offset_type = dequant_offset_type
 
     def _create_buffers(self):
         super()._create_buffers()
