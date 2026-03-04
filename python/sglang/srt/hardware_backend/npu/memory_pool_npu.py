@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List
 
 import torch
 import torch_npu
@@ -13,6 +13,8 @@ from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+
+from sglang.srt.hardware_backend.npu.gather_cache import gather_kv_cache_triton
 
 
 class NPUMHATokenToKVPool(MHATokenToKVPool):
@@ -271,12 +273,16 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
             cache_v_dequant_scale.view(-1, self.v_dequant_scale_buffer.shape[-1]),
         )
 
-    def get_scale_buffer(self, layer_id: int):
+    def get_scale_buffer(self, layer_id: int, block_tables: torch.Tensor, actual_seq_len_kv: List[int]):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        actual_seq_len_kv = torch.tensor(actual_seq_len_kv, dtype=torch.int32, device=self.device)
+        k_scale = gather_kv_cache_triton(self.k_dequant_scale_buffer[layer_id - self.start_layer], actual_seq_len_kv, block_tables, self.page_size)
+        v_scale = gather_kv_cache_triton(self.v_dequant_scale_buffer[layer_id - self.start_layer], actual_seq_len_kv, block_tables, self.page_size)
         return torch.stack([
-            self.k_dequant_scale_buffer[layer_id - self.start_layer],
-            self.v_dequant_scale_buffer[layer_id - self.start_layer],
+            k_scale,
+            v_scale,
         ], dim=0)
 
     def get_dequant_unit_num(self):
