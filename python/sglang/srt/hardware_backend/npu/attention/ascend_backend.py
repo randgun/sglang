@@ -1334,10 +1334,10 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
-
+            rank = torch.distributed.get_rank()
             if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
-                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, actual_seq_len_kv, self.forward_metadata.block_tables)
-                rank = torch.distributed.get_rank()
+                print(f"+++ {rank=}, {self.forward_metadata.seq_lens.shape=}")
+                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
             num_tokens = query.shape[0]
             print(f"++++ {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {kv_dequant_scale.shape=}")

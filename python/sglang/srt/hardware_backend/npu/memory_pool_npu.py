@@ -273,11 +273,10 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
             cache_v_dequant_scale.view(-1, self.v_dequant_scale_buffer.shape[-1]),
         )
 
-    def get_scale_buffer(self, layer_id: int, actual_seq_len_kv: List[int], block_tables: torch.Tensor):
+    def get_scale_buffer(self, layer_id: int, actual_seq_len_kv: torch.Tensor, block_tables: torch.Tensor):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        actual_seq_len_kv = torch.tensor(actual_seq_len_kv, dtype=torch.int32, device=self.device)
         k_scale = gather_kv_cache_triton(self.k_dequant_scale_buffer[layer_id - self.start_layer], actual_seq_len_kv, block_tables, self.page_size)
         v_scale = gather_kv_cache_triton(self.v_dequant_scale_buffer[layer_id - self.start_layer], actual_seq_len_kv, block_tables, self.page_size)
         return torch.stack([
