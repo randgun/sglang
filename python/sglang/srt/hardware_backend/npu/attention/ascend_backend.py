@@ -1284,7 +1284,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
+                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                     k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k.view(-1, layer.tp_k_head_num * layer.qk_head_dim))
                     v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v.view(-1, layer.tp_v_head_num * layer.v_head_dim))
                     print(f"++++ {forward_batch.out_cache_loc.shape=}, {k_quant.dtype=}, {k_dynamic_scale.dtype=}")
@@ -1335,7 +1335,7 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             rank = torch.distributed.get_rank()
-            if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
+            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                 print(f"+++ {rank=}, {self.forward_metadata.seq_lens.shape=}")
                 kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
@@ -1353,7 +1353,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
                 antiquant_mode=1,
-                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get() else None,
+                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_PD_ENABLE_C8.get() else None,
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
@@ -1373,7 +1373,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
                 antiquant_mode=1,
-                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get() else None,
+                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_PD_ENABLE_C8.get() else None,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )

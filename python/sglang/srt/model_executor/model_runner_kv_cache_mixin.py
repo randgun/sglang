@@ -513,7 +513,7 @@ class ModelRunnerKVCacheMixin:
                     NPUMHATokenToKVPool,
                 )
 
-                if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
+                if envs.SGLANG_NPU_PD_ENABLE_C8.get() and self.server_args.disaggregation_mode == "decode":
                     # TODO scale type do not hard code
                     self.token_to_kv_pool = NPUMHAC8TokenToKVPool(
                         self.max_total_num_tokens,

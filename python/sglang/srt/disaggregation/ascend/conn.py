@@ -81,7 +81,7 @@ class AscendKVManager(MooncakeKVManager):
             npu_id=self.kv_args.gpu_id,
             disaggregation_mode=self.disaggregation_mode,
         )
-        self.npu_c8 = envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get()
+        self.npu_c8 = envs.SGLANG_NPU_PD_ENABLE_C8.get()
 
     def register_buffer_to_engine(self):
         self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
