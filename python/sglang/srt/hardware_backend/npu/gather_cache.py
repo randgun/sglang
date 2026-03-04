@@ -94,7 +94,7 @@ def gather_kv_cache_pytorch(cache, actual_seq_len_kv, block_table, page_size):
 # =====================================================================
 def test_precision():
     print(">>> [1/2] 开始执行精度测试 (Precision Test)...")
-    device = 'cuda' # 在昇腾上调优时请改为 'npu'
+    device = 'npu' # 在昇腾上调优时请改为 'npu'
     dtype = torch.float16
     
     b, n, page_size = 16, 100, 128
