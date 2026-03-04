@@ -164,7 +164,7 @@ class AuxDataCodec:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
-
+    kv_args_register_info_class = KVArgsRegisterInfo
     def __init__(
         self,
         args: KVArgs,
@@ -172,7 +172,6 @@ class MooncakeKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
-        kv_args_register_info_class = KVArgsRegisterInfo
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()

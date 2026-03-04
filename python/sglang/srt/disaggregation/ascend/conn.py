@@ -63,6 +63,7 @@ class AscendKVArgsRegisterInfo(KVArgsRegisterInfo):
         )
 
 class AscendKVManager(MooncakeKVManager):
+    kv_args_register_info_class = AscendKVArgsRegisterInfo
     def __init__(
         self,
         args: KVArgs,
@@ -71,7 +72,6 @@ class AscendKVManager(MooncakeKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        kv_args_register_info_class = AscendKVArgsRegisterInfo
 
     def init_engine(self):
         # TransferEngine initialized on ascend.
