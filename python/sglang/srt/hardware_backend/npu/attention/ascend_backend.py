@@ -1336,9 +1336,9 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
-                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, actual_seq_len_kv, self.forward_metadata.block_tables).view(2, -1)
+                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, actual_seq_len_kv, self.forward_metadata.block_tables)
                 rank = torch.distributed.get_rank()
-                print(f"+++ {rank=}, {kv_dequant_scale.shape=}")
+                print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
             num_tokens = query.shape[0]
             print(f"++++ {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {kv_dequant_scale.shape=}")
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
