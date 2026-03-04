@@ -97,11 +97,11 @@ def test_precision():
     device = 'npu' # 在昇腾上调优时请改为 'npu'
     dtype = torch.float16
     
-    b, n, page_size = 16, 100, 128
+    b, n, page_size = 4, 100, 128
     total_slots = 10000 
     
     cache = torch.randn((total_slots, 1), device=device, dtype=dtype)
-    actual_seq_len_kv = torch.tensor([15, 32, 100, 5], device=device, dtype=torch.int32)
+    actual_seq_len_kv = torch.tensor([1500, 3200, 10000, 50], device=device, dtype=torch.int32)
     block_table = torch.randint(0, total_slots // page_size, (b, n), device=device, dtype=torch.int32)
 
     out_ref = gather_kv_cache_pytorch(cache, actual_seq_len_kv, block_table, page_size)
