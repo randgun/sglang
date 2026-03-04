@@ -84,7 +84,7 @@ def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor,
     )
 )
 def benchmark(BATCH, PAGE_SIZE, HEAD_DIM, seq_len, provider):
-    device = 'cuda' # 在昇腾上调优时请改为 'npu'
+    device = 'npu' # 在昇腾上调优时请改为 'npu'
     dtype = torch.float16
     
     # 1. 模拟底层巨大的全局 KV Cache 池子
