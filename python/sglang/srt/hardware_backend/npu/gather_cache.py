@@ -70,58 +70,92 @@ def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor,
     
     return output
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['seq_len'],       # X轴：测试不同的序列长度
-        x_vals=[2**i for i in range(8, 15)], # 从 256 测到 16384 (16K 上下文)
-        line_arg='provider',       # 不同的测试方案作为不同的线
-        line_vals=['triton'],      # 目前只测我们写的 triton 算子
-        line_names=['Triton Gather'], 
-        styles=[('blue', '-')],
-        ylabel='Bandwidth (GB/s)', # Y轴：显存带宽
-        plot_name='Paged-KV-Gather-Performance',
-        args={'BATCH': 16, 'PAGE_SIZE': 128, 'HEAD_DIM': 1},
-    )
-)
-def benchmark(BATCH, PAGE_SIZE, HEAD_DIM, seq_len, provider):
-    device = 'npu' # 在昇腾上调优时请改为 'npu'
+# =====================================================================
+# 2. PyTorch Ground Truth (基准精度实现)
+# =====================================================================
+def gather_kv_cache_pytorch(cache, actual_seq_len_kv, block_table, page_size):
+    b, n = block_table.shape
+    max_seq_len = n * page_size
+    output = torch.zeros((b, max_seq_len), device=cache.device, dtype=cache.dtype)
+    
+    for i in range(b):
+        seq_len = actual_seq_len_kv[i].item()
+        for j in range(seq_len):
+            logical_block = j // page_size
+            block_offset = j % page_size
+            physical_block = block_table[i, logical_block].item()
+            cache_idx = physical_block * page_size + block_offset
+            output[i, j] = cache[cache_idx, 0]
+            
+    return output
+
+# =====================================================================
+# 3. 精度测试模块 (Unit Test)
+# =====================================================================
+def test_precision():
+    print(">>> [1/2] 开始执行精度测试 (Precision Test)...")
+    device = 'cuda' # 在昇腾上调优时请改为 'npu'
     dtype = torch.float16
     
-    # 1. 模拟底层巨大的全局 KV Cache 池子
-    # 假设池子有 100,000 个 Token 的容量
-    total_slots = 100000 
-    # 为了模拟真实场景，我们把 head_dim 展平，把原来的 [x, 1] 扩充为模拟单头特征的 [x, head_dim]
-    # 注意：测试脚本中我们需要改一下 cache 形状以产生足够的数据量压测带宽
-    cache = torch.randn((total_slots, HEAD_DIM), device=device, dtype=dtype)
+    b, n, page_size = 16, 100, 128
+    total_slots = 10000 
     
-    # 2. 构造 block_table 和实际长度
+    cache = torch.randn((total_slots, 1), device=device, dtype=dtype)
+    actual_seq_len_kv = torch.tensor([15, 32, 100, 5], device=device, dtype=torch.int32)
+    block_table = torch.randint(0, total_slots // page_size, (b, n), device=device, dtype=torch.int32)
+
+    out_ref = gather_kv_cache_pytorch(cache, actual_seq_len_kv, block_table, page_size)
+    out_tri = gather_kv_cache_triton(cache, actual_seq_len_kv, block_table, page_size)
+
+    try:
+        torch.testing.assert_close(out_tri, out_ref, rtol=0.0, atol=0.0)
+        print("✅ 精度测试通过！Triton 算子位级一致 (Bit-exact match)。\n")
+        return True
+    except AssertionError as e:
+        print("❌ 精度测试失败！")
+        print(e)
+        return False
+
+# =====================================================================
+# 4. 性能压测模块 (Benchmark)
+# =====================================================================
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['seq_len'],       
+        x_vals=[2**i for i in range(8, 15)], # 长度从 256 到 16384
+        line_arg='provider',       
+        line_vals=['triton'],      
+        line_names=['Triton Gather'], 
+        styles=[('blue', '-')],
+        ylabel='Bandwidth (GB/s)', 
+        plot_name='Paged-KV-Gather-Performance',
+        args={'BATCH': 16, 'PAGE_SIZE': 16}, 
+    )
+)
+def benchmark(BATCH, PAGE_SIZE, seq_len, provider):
+    device = 'npu' # 在昇腾上调优时请改为 'npu'
+    dtype = torch.float16
+    total_slots = 500000 # 保证池子够大
+    
+    cache = torch.randn((total_slots, 1), device=device, dtype=dtype)
     max_num_blocks = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
     block_table = torch.randint(0, total_slots // PAGE_SIZE, (BATCH, max_num_blocks), device=device, dtype=torch.int32)
-    
-    # 模拟实际长度 (为了简单，这里假设所有请求都跑满了 seq_len)
     actual_seq_len_kv = torch.full((BATCH,), seq_len, device=device, dtype=torch.int32)
 
-    # 3. 包装测试函数
-    # 这里我们对之前的 gather_kv_cache_triton 稍微做一点适配，让它能处理 [x, head_dim] 的数据流
-    # (如果不想改算子，把 HEAD_DIM 设为 1，测纯标量搬运也可以，但数据量太小可能测不准带宽)
     def test_fn():
-        # 如果你的算子还是严格的 [x, 1]，请将上面 cache 设为 [total_slots, 1]
         gather_kv_cache_triton(cache, actual_seq_len_kv, block_table, PAGE_SIZE)
 
-    # 4. 执行 Benchmark
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(test_fn, quantiles=quantiles)
 
-    # 5. 计算有效显存带宽 (GB/s)
-    # 计算公式：(读出数据量 + 写入数据量) / 执行时间
-    # 读 Block Table: BATCH * max_num_blocks * 4 bytes (int32)
-    # 读 Actual Len: BATCH * 4 bytes (int32)
-    # 读 Cache: BATCH * seq_len * HEAD_DIM * 2 bytes (fp16)
-    # 写 Output: BATCH * seq_len * HEAD_DIM * 2 bytes (fp16)
+    # 计算有效显存带宽 (GB/s)
+    # 对于 [x, 1] 的 fp16 张量，每个 Token 数据量为 2 Bytes
+    bytes_per_token = 2
     
     num_bytes = (BATCH * max_num_blocks * 4) + \
                 (BATCH * 4) + \
-                (2 * BATCH * seq_len * HEAD_DIM * 2) # *2 for Read + Write
+                (2 * BATCH * seq_len * bytes_per_token) # *2 因为是一次读 + 一次写
                 
     gbps = num_bytes / (ms * 1e6)
     max_gbps = num_bytes / (min_ms * 1e6)
@@ -129,6 +163,16 @@ def benchmark(BATCH, PAGE_SIZE, HEAD_DIM, seq_len, provider):
     
     return gbps, max_gbps, min_gbps
 
+# =====================================================================
+# 5. 主程序入口
+# =====================================================================
 if __name__ == '__main__':
-    # 运行压测，结果会打印在控制台，并且如果你环境里有 pandas/matplotlib，还能保存出 csv 和 png 图表
-    benchmark.run(print_data=True, show_plots=False)
+    # 第一步：拦截至关重要的精度错误
+    is_accurate = test_precision()
+    
+    # 第二步：如果精度正确，则启动多维度的性能摸底
+    if is_accurate:
+        print(">>> [2/2] 开始执行性能压测 (Benchmark)...")
+        print("正在 Warmup 并测试不同 Sequence Length 下的显存带宽...")
+        # 自动调优并打印表格，你可以将 show_plots 设为 True 来保存趋势图
+        benchmark.run(print_data=True, show_plots=False)
