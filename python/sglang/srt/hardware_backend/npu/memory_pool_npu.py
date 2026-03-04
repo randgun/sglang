@@ -273,7 +273,7 @@ class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
             cache_v_dequant_scale.view(-1, self.v_dequant_scale_buffer.shape[-1]),
         )
 
-    def get_scale_buffer(self, layer_id: int, block_tables: torch.Tensor, actual_seq_len_kv: List[int]):
+    def get_scale_buffer(self, layer_id: int, actual_seq_len_kv: List[int], block_tables: torch.Tensor):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 

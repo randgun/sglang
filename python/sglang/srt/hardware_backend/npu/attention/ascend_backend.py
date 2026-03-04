@@ -1327,16 +1327,18 @@ class AscendAttnBackend(AttentionBackend):
                 layer.layer_id
             ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
-            if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
-                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id).view(2, -1)
-                rank = torch.distributed.get_rank()
-                print(f"+++ {rank=}, {kv_dequant_scale.shape=}")
+
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_len_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
+
+            if envs.SGLANG_NPU_ENABLE_KVCACHE_C8.get():
+                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, actual_seq_len_kv, self.forward_metadata.block_tables).view(2, -1)
+                rank = torch.distributed.get_rank()
+                print(f"+++ {rank=}, {kv_dequant_scale.shape=}")
             num_tokens = query.shape[0]
             print(f"++++ {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {kv_dequant_scale.shape=}")
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
