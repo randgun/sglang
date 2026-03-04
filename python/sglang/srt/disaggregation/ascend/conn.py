@@ -89,7 +89,7 @@ class AscendKVManager(MooncakeKVManager):
         self.engine.batch_register(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         )
-        if self.npu_c8:
+        if self.npu_c8 and self.disaggregation_mode == DisaggregationMode.DECODE:
             self.engine.batch_register(
                 self.kv_args.dequant_scale_data_ptrs,
                 self.kv_args.dequant_scale_data_lens,
