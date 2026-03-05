@@ -1336,9 +1336,9 @@ class AscendAttnBackend(AttentionBackend):
                 )
             rank = torch.distributed.get_rank()
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
-                max_seq_len = torch.max(actual_seq_len_kv)
+                max_seq_len = torch.max(actual_seq_len_kv).item()
                 print(f"+++ {rank=}, {self.forward_metadata.seq_lens.shape=}")
-                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
+                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, max_seq_len)
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
             num_tokens = query.shape[0]
             print(f"++++ {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {kv_dequant_scale.shape=}")
@@ -1576,7 +1576,7 @@ class AscendAttnBackend(AttentionBackend):
 
                     if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                         rank = torch.distributed.get_rank()
-                        max_seq_len = torch.max(self.forward_metadata.seq_lens_cpu_int)
+                        max_seq_len = torch.max(self.forward_metadata.seq_lens_cpu_int).item()
                         print(f"+++ {rank=}, {layer.layer_id=} {self.forward_metadata.seq_lens.shape=}", flush=True)
                         kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, max_seq_len)
                         print(f"+++ {rank=}, {layer.layer_id=} {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}, {kv_dequant_scale=}", flush=True)
