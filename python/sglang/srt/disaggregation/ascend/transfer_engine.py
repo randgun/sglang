@@ -117,7 +117,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 buffers,
                 peer_buffer_addresses,
                 lengths,
-                dequant_scale_buffers
+                dequant_scale_buffers,
                 dequant_offset_buffers,
                 dequant_unit_num,
             )
