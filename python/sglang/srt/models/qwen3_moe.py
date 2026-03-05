@@ -328,10 +328,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            if is_enable_prefill_cp():
-                final_hidden_states = get_attention_tp_group().all_reduce(final_hidden_states)
-            else:
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -569,7 +566,8 @@ class Qwen3MoeAttention(nn.Module):
     
     def _rebuild_pcp_kv(self, k, v, forward_batch):
         kv = torch.cat([k, v], dim=-1)
-        kv_full = cp_all_gather_rerange_output(kv.contiguous(), self.pcp_size, forward_batch,torch.cuda.current_stream())
+        # kv_full = cp_all_gather_rerange_output(kv.contiguous(), self.pcp_size, forward_batch,torch.cuda.current_stream())
+        kv_full = pcp_ag_rearange_output(kv.contiguous(), self.pcp_size, forward_batch)
         k, v = kv_full.split(split_size=self.kv_size, dim=-1)
         return k, v
 

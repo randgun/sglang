@@ -1041,11 +1041,13 @@ class AscendAttnBackend(AttentionBackend):
             # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
             #     print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
             output = torch.cat([output_head,output_tail], dim=0)
+            attn_lse = torch.cat([attn_lse_head,attn_lse_tail], dim=0)
         else:
             output = torch.cat(output, dim=0)
+            attn_lse = attn_lse_head
         # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
         #     print(f"+++ fia pcp output is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output.sum()=},  {output[:5, :5,:5]=}")
-        return output.reshape(seq_len, -1).to(q.dtype)
+        return output.reshape(seq_len, -1).to(q.dtype), attn_lse
 
     def forward_extend(
         self,
@@ -1134,7 +1136,7 @@ class AscendAttnBackend(AttentionBackend):
                 #     print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=},{q[:2, :5,:5]=},{k[:2, :5,:5]=},{v[:2, :5,:5]=}")
 
                 if use_pcp(forward_batch):
-                    attn_output = self.forward_fia_pcp(
+                    attn_output,attn_lse = self.forward_fia_pcp(
                         q=q,
                         k=k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
                         v=v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),

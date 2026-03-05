@@ -452,43 +452,6 @@ def calculate_cp_seq_idx(cp_chunks_len, seqs_len):
     return tuple_len
 
 
-def _compute_attention_metadata(
-    cp_metadata,
-    device,
-    seq_per_batch,
-    head_start_global,
-    head_end_global,
-    tail_start_global,
-    tail_end_global,
-    attn_mask_seqlens
-):
-    head_chunk_len = head_end_global - head_start_global
-    tail_chunk_len = tail_end_global - tail_start_global
-    head_q_seqlens = [head_chunk_len] 
-    tail_q_seqlens = [tail_chunk_len]
-
-    # Compute nomask seqlens
-    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
-    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
-    
-    # Compute indices using torch.arange for efficiency
-    kv_with_q_head_nomask_idx_tensor = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
-    kv_with_q_head_mask_idx_tensor = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
-    kv_with_q_tail_nomask_idx_tensor = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
-    kv_with_q_tail_mask_idx_tensor = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
-    
-    cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
-    cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
-    cp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx_tensor
-    cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
-    cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
-    cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
-    cp_metadata.head_q_seqlens = head_q_seqlens
-    cp_metadata.tail_q_seqlens = tail_q_seqlens
-
-    return cp_metadata
-
-
 def prepare_input_dp_with_cp_dsa(
     kv_len,
     cp_rank,
@@ -634,4 +597,39 @@ def prepare_input_dp_with_cp_dsa(
             tail_end_global=tail_end_global,
             attn_mask_seqlens=attn_mask_seqlens,
         )
+    return cp_metadata
+
+def _compute_attention_metadata(
+    cp_metadata,
+    device,
+    seq_per_batch,
+    head_start_global,
+    head_end_global,
+    tail_start_global,
+    tail_end_global,
+):
+    head_chunk_len = head_end_global - head_start_global
+    tail_chunk_len = tail_end_global - tail_start_global
+    head_q_seqlens = [head_chunk_len] 
+    tail_q_seqlens = [tail_chunk_len]
+
+    # Compute nomask seqlens
+    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
+    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
+    
+    # Compute indices using torch.arange for efficiency
+    kv_with_q_head_nomask_idx_tensor = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
+    kv_with_q_head_mask_idx_tensor = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
+    kv_with_q_tail_nomask_idx_tensor = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
+    kv_with_q_tail_mask_idx_tensor = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
+    
+    cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
+    cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
+    cp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx_tensor
+    cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
+    cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
+    cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
+    cp_metadata.head_q_seqlens = head_q_seqlens
+    cp_metadata.tail_q_seqlens = tail_q_seqlens
+
     return cp_metadata

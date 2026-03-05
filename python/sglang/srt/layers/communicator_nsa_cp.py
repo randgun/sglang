@@ -91,6 +91,7 @@ class NSACPLayerCommunicator(LayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
+            layernorm=self.post_attention_layernorm,
         )
 
 
@@ -186,6 +187,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         residual_input_mode: ScatterMode,
         output_mode: ScatterMode,
         context: CommunicateContext,
+        layernorm: torch.nn.Module,
     ):
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
@@ -209,7 +211,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-        layer_norm: Optional[torch.nn.Module] = None,
+        layer_norm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
     ):
         # for prefill: full -> attn tp scattered
@@ -223,12 +225,12 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
             return hidden_states, residual
         elif is_enable_prefill_cp():
-            # if hidden_states.shape[0] != 0:
-            #     hidden_states = get_attention_tp_group().all_reduce(hidden_states)
-            #     if layer_norm is not None:
-            #         try:
-            #             hidden_states, residual = layer_norm(hidden_states, residual)
-            #         except TypeError:
-            #             hidden_states = layer_norm(hidden_states)
+            if hidden_states.shape[0] != 0:
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                if layer_norm is not None:
+                    try:
+                        hidden_states, residual = layer_norm(hidden_states, residual)
+                    except TypeError:
+                        hidden_states = layer_norm(hidden_states)
             return hidden_states, residual
 
