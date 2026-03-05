@@ -99,3 +99,45 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 "Invalid or no transfer protocol specified, using default protocol."
             )
             return None
+        
+    def batch_transfer_with_quant_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+        dequant_scale_buffers: List[int],
+        dequant_offset_buffers: List[int],
+        dequant_unit_num: int,
+    ) -> int:
+        """Synchronously transfer data to the specified addresses in batches."""
+        try:
+            self.engine.batch_transfer_write_with_quant(
+                session_id,
+                buffers,
+                peer_buffer_addresses,
+                lengths,
+                dequant_scale_buffers
+                dequant_offset_buffers,
+                dequant_unit_num,
+            )
+        except Exception:
+            ret = -1
+            if not hasattr(self.engine, "batch_transfer_write_with_quant"):
+                raise RuntimeError(
+                    "Ascend's batch transfer requires batch_transfer_write_with_quant attr."
+                )
+
+        if ret < 0:
+            logger.debug(
+                "Failed to batch transfer data. Buffers: %s, Session: %s, "
+                "Peer addresses: %s, Dequant scale buuffers: %s, Dequant offset buffers: %s, "
+                "Dequant unit num: %s",
+                buffers,
+                session_id,
+                peer_buffer_addresses,
+                dequant_scale_buffers,
+                dequant_offset_buffers,
+                dequant_unit_num,
+            )
+        return ret

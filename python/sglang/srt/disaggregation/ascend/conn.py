@@ -364,7 +364,7 @@ class AscendKVManager(MooncakeKVManager):
             transfer_blocks.extend(tmp_blocks)
 
         src_addrs, dst_addrs, lengths, dequant_scale_addrs = zip(*transfer_blocks)
-        return self.engine.batch_transfer_write_with_quant(
+        return self.engine.batch_transfer_with_quant_sync(
             mooncake_session_id,
             list(src_addrs),
             list(dst_addrs),
