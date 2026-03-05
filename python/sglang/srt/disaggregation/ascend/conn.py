@@ -72,6 +72,7 @@ class AscendKVManager(MooncakeKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.page_size = server_args.page_size
 
     def init_engine(self):
         # TransferEngine initialized on ascend.
@@ -359,7 +360,7 @@ class AscendKVManager(MooncakeKVManager):
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
                 dequant_scale_addr = (
-                    dequant_scale_ptr + int(decode_index[0]) * dequant_scale_item_len
+                    dequant_scale_ptr + int(decode_index[0]) * dequant_scale_item_len * self.page_size
                 )
                 tmp_blocks.append((src_addr, dst_addr, length, dequant_scale_addr))
             transfer_blocks.extend(tmp_blocks)
