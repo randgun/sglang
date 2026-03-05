@@ -415,7 +415,7 @@ class AscendKVReceiver(MooncakeKVReceiver):
                 struct.pack("I", dim) for dim in state_dim_per_tensor
             )
             # C8
-            if self.npu_c8:
+            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                 dequant_scale_data_ptrs = b"".join(
                     struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.dequant_scale_data_ptrs
                 )
