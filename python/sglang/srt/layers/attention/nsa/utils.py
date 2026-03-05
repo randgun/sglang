@@ -595,7 +595,6 @@ def prepare_input_dp_with_cp_dsa(
             head_end_global=head_end_global,
             tail_start_global=tail_start_global,
             tail_end_global=tail_end_global,
-            attn_mask_seqlens=attn_mask_seqlens,
         )
     return cp_metadata
 
