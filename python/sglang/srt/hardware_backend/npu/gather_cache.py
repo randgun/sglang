@@ -40,15 +40,11 @@ def gather_paged_kv_kernel(
     tl.store(out_ptrs, data, mask=valid_seq_mask)
 
 
-def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor, block_table: torch.Tensor, page_size: int):
-    b, n = block_table.shape
-    max_seq_len = n * page_size
+def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor, block_table: torch.Tensor, page_size: int, max_seq_len: int):
+    b, _ = block_table.shape
+    # max_seq_len = n * page_size
     
     output = torch.empty((b, max_seq_len), device=cache.device, dtype=cache.dtype)
-    
-    # 🌟 关键修改 2：使用固定的 BLOCK_SIZE
-    # 无论 max_seq_len 是 10 还是 2000，BLOCK_SIZE 永远是 128。
-    # 这样底层生成的二进制机器码永远只有一份，绝不重新编译。
     BLOCK_SIZE = 128 
         
     grid = lambda meta: (

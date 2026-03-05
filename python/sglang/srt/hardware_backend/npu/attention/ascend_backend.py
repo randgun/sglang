@@ -1573,6 +1573,13 @@ class AscendAttnBackend(AttentionBackend):
                         device=query.device,
                     )
 
+                    if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                        rank = torch.distributed.get_rank()
+                        print(f"+++ {rank=}, {layer.layer_id=} {self.forward_metadata.seq_lens.shape=}", flush=True)
+                        kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
+                        print(f"+++ {rank=}, {layer.layer_id=} {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}, {kv_dequant_scale=}", flush=True)
+                        attn_output = torch.ones((num_tokens, layer.tp_q_head_num * layer.v_head_dim), device='npu', dtype=torch.bfloat16)
+
                     torch_npu._npu_paged_attention(
                         query=query,
                         key_cache=k_cache,
@@ -1610,26 +1617,20 @@ class AscendAttnBackend(AttentionBackend):
                 q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
-                    rank = torch.distributed.get_rank()
-                    print(f"+++ {rank=}, {layer.layer_id=} {self.forward_metadata.seq_lens.shape=}", flush=True)
-                    kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
-                    print(f"+++ {rank=}, {layer.layer_id=} {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}, {kv_dequant_scale=}", flush=True)
-
-                # attn_output = self.native_attn.run_sdpa_forward_decode(
-                #     q_,
-                #     o_,
-                #     k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                #     v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                #     forward_batch.req_to_token_pool.req_to_token,
-                #     forward_batch.req_pool_indices,
-                #     forward_batch.seq_lens,
-                #     forward_batch.encoder_lens,
-                #     is_cross_attention=layer.is_cross_attention,
-                #     scaling=layer.scaling,
-                #     enable_gqa=use_gqa,
-                #     causal=False,
-                # )
+                attn_output = self.native_attn.run_sdpa_forward_decode(
+                    q_,
+                    o_,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.encoder_lens,
+                    is_cross_attention=layer.is_cross_attention,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=False,
+                )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if save_kv_cache:
