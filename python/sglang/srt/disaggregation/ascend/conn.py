@@ -57,7 +57,7 @@ class AscendKVArgsRegisterInfo(KVArgsRegisterInfo):
                 if len(msg) > 11 and len(msg[11]) > 0 else []
             ),
             # C8
-            dequant_scale_data_ptrs=int(msg[12].decode("ascii")) if len(msg) > 12 else [],
+            dequant_scale_data_ptrs=list(struct.unpack(f"{len(msg[12])//8}Q", msg[12])) if len(msg) > 12 else [],
             dequant_scale_item_lens=int(msg[13].decode("ascii")) if len(msg) > 13 else [],
             dequant_unit_num=bool(int(msg[14].decode("ascii"))) if len(msg) > 14 else 0,
         )

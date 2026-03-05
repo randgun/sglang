@@ -921,6 +921,9 @@ class MooncakeKVManager(CommonKVManager):
                     self.decode_kv_args_table[mooncake_session_id] = (
                         self.kv_args_register_info_class.from_zmq(waiting_req_bytes)
                     )
+                    import torch
+                    rank = torch.distributed.get_rank()
+                    print(f"+++ {rank=}, {self.decode_kv_args_table[mooncake_session_id]=}", flush=True)
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
