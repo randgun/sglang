@@ -112,7 +112,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:
-            self.engine.batch_transfer_write_with_quant(
+            ret = self.engine.batch_transfer_write_with_quant(
                 session_id,
                 buffers,
                 peer_buffer_addresses,
