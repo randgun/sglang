@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class AscendKVArgsRegisterInfo(KVArgsRegisterInfo):
     dequant_scale_data_ptrs: List[int]
-    dequant_scale_item_lens: List[int]
+    dequant_scale_item_len: List[int]
     dequant_unit_num: int
 
     @classmethod
@@ -58,7 +58,7 @@ class AscendKVArgsRegisterInfo(KVArgsRegisterInfo):
             ),
             # C8
             dequant_scale_data_ptrs=list(struct.unpack(f"{len(msg[12])//8}Q", msg[12])) if len(msg) > 12 else [],
-            dequant_scale_item_lens=int(msg[13].decode("ascii")) if len(msg) > 13 else [],
+            dequant_scale_item_len=int(msg[13].decode("ascii")) if len(msg) > 13 else 0,
             dequant_unit_num=bool(int(msg[14].decode("ascii"))) if len(msg) > 14 else 0,
         )
 
@@ -222,7 +222,7 @@ class AscendKVManager(MooncakeKVManager):
                                 print("+++ step in send kvcache c8", flush=True)
                                 import torch
                                 rank = torch.distributed.get_rank()
-                                print(f"+++ {rank=}, {target_rank_registration_info.dequant_scale_data_ptrs=}, {target_rank_registration_info.dequant_scale_item_lens=} \
+                                print(f"+++ {rank=}, {target_rank_registration_info.dequant_scale_data_ptrs=}, {target_rank_registration_info.dequant_scale_item_len=} \
                                       {target_rank_registration_info.dequant_unit_num=}", flush=True)
                                 ret = self.send_kvcache_c8(
                                     req.mooncake_session_id,
@@ -230,7 +230,7 @@ class AscendKVManager(MooncakeKVManager):
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
                                     target_rank_registration_info.dequant_scale_data_ptrs,
-                                    target_rank_registration_info.dequant_scale_item_lens,
+                                    target_rank_registration_info.dequant_scale_item_len,
                                     target_rank_registration_info.dequant_unit_num,
                                 )
                             else:
@@ -323,7 +323,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         dequant_scale_ptrs: list[int],
-        dequant_scale_item_lens: list[int],
+        dequant_scale_item_len: int,
         dequant_unit_num: int,
     ):
         # Group by indices
@@ -338,7 +338,7 @@ class AscendKVManager(MooncakeKVManager):
                 dst_kv_ptrs[layer_id],
                 self.kv_args.kv_item_lens[layer_id],
                 dequant_scale_ptrs[layer_id],
-                dequant_scale_item_lens[layer_id],
+                dequant_scale_item_len,
             )
             for layer_id in range(num_layers)
         ]
@@ -415,20 +415,18 @@ class AscendKVReceiver(MooncakeKVReceiver):
                 struct.pack("I", dim) for dim in state_dim_per_tensor
             )
             # C8
-            dequant_scale_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.dequant_scale_data_ptrs
-            )
-            dequant_scale_item_lens = b"".join(
-                struct.pack("I", item_len)
-                for item_len in self.kv_mgr.kv_args.dequant_scale_item_lens
-            )
+            if self.npu_c8:
+                dequant_scale_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.dequant_scale_data_ptrs
+                )
+                dequant_scale_item_len = str(self.kv_mgr.kv_args.dequant_scale_item_lens[0]).encode("ascii")
+                dequant_unit_num = str(self.kv_mgr.kv_args.dequant_unit_num).encode("ascii")
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
-            dequant_unit_num = str(self.kv_mgr.kv_args.dequant_unit_num).encode("ascii")
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
@@ -447,7 +445,7 @@ class AscendKVReceiver(MooncakeKVReceiver):
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
                         dequant_scale_data_ptrs,
-                        dequant_scale_item_lens,
+                        dequant_scale_item_len,
                         dequant_unit_num,
                     ]
                 )
