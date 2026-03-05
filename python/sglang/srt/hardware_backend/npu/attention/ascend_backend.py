@@ -1336,6 +1336,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             rank = torch.distributed.get_rank()
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                max_seq_len = torch.max(actual_seq_len_kv)
                 print(f"+++ {rank=}, {self.forward_metadata.seq_lens.shape=}")
                 kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
@@ -1575,22 +1576,23 @@ class AscendAttnBackend(AttentionBackend):
 
                     if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                         rank = torch.distributed.get_rank()
+                        max_seq_len = torch.max(self.forward_metadata.seq_lens_cpu_int)
                         print(f"+++ {rank=}, {layer.layer_id=} {self.forward_metadata.seq_lens.shape=}", flush=True)
-                        kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
+                        kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, max_seq_len)
                         print(f"+++ {rank=}, {layer.layer_id=} {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}, {kv_dequant_scale=}", flush=True)
                         attn_output = torch.ones((num_tokens, layer.tp_q_head_num * layer.v_head_dim), device='npu', dtype=torch.bfloat16)
 
-                    torch_npu._npu_paged_attention(
-                        query=query,
-                        key_cache=k_cache,
-                        value_cache=v_cache,
-                        num_heads=layer.tp_q_head_num,
-                        num_kv_heads=layer.tp_k_head_num,
-                        scale_value=layer.scaling,
-                        block_table=self.forward_metadata.block_tables,
-                        context_lens=self.forward_metadata.seq_lens_cpu_int,
-                        out=attn_output,
-                    )
+                    # torch_npu._npu_paged_attention(
+                    #     query=query,
+                    #     key_cache=k_cache,
+                    #     value_cache=v_cache,
+                    #     num_heads=layer.tp_q_head_num,
+                    #     num_kv_heads=layer.tp_k_head_num,
+                    #     scale_value=layer.scaling,
+                    #     block_table=self.forward_metadata.block_tables,
+                    #     context_lens=self.forward_metadata.seq_lens_cpu_int,
+                    #     out=attn_output,
+                    # )
                 else:
                     attn_output = self.attn_alibi(
                         q=query,
