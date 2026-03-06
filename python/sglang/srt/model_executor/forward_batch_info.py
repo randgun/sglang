@@ -372,10 +372,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dimensions: Optional[list[int]] = None
 
     # Record the split metadata of the sequence number of NSA context parallels.
-    nsa_cp_metadata: Optional[ContextParallelMetadata] = None
-
-    # For GQA context parallels (e.g., Qwen3 PCP)
-    gqa_cp_metadata: Optional[ContextParallelMetadata] = None
+    cp_metadata: Optional[ContextParallelMetadata] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

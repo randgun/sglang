@@ -561,6 +561,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
+            layernorm=self.post_attention_layernorm,
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):

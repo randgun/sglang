@@ -18,6 +18,7 @@
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+from python.sglang.srt.layers.attention.nsa.utils import cp_all_gather_rerange_output
 import torch
 from torch import nn
 
@@ -27,7 +28,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled,get_pcp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -271,6 +272,7 @@ class Qwen2Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.pcp_size = get_pcp_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -378,6 +380,8 @@ class Qwen2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+        if self.enable_prefill_cp:
+            hidden_states = cp_all_gather_rerange_output(hidden_states, self.pcp_size, forward_batch, torch.npu.current_stream())
 
         if len(aux_hidden_states) == 0:
             return hidden_states
