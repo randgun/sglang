@@ -72,7 +72,7 @@ class AscendKVManager(MooncakeKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        self.page_size = server_args.page_size
+        self.page_size = 128
 
     def init_engine(self):
         # TransferEngine initialized on ascend.
