@@ -91,6 +91,7 @@ class NSACPLayerCommunicator(LayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
+            layernorm=self.post_attention_layernorm,
         )
 
 
@@ -149,11 +150,11 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         *,
         residual_input_mode,
     ):
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if nsa_use_prefill_cp(forward_batch):
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
                 get_local_dp_buffer(),
@@ -163,6 +164,16 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 hidden_states,
                 local_hidden_states,
             )
+            return hidden_states, residual
+        elif is_enable_prefill_cp():
+            if hidden_states.shape[0] != 0:
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                hidden_states, residual = layernorm(hidden_states, residual)
+            return hidden_states, residual
+        else:
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
+
             return hidden_states, residual
         
 
@@ -176,6 +187,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         residual_input_mode: ScatterMode,
         output_mode: ScatterMode,
         context: CommunicateContext,
+        layernorm: torch.nn.Module,
     ):
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
@@ -199,7 +211,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-        layer_norm: torch.nn.Module,
+        layernorm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
     ):
         # for prefill: full -> attn tp scattered
@@ -214,6 +226,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             return hidden_states, residual
         elif is_enable_prefill_cp():
             if hidden_states.shape[0] != 0:
-                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
-                hidden_states, residual = layer_norm(hidden_states, residual)
+                # hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
+
