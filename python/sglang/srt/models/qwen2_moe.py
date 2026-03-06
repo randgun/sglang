@@ -45,7 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
-    pcp_ag_rearange_output,
+    pcp_ag_rerange_output,
     get_pcp_size,
     get_pcp_rank,
 )
@@ -699,7 +699,7 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
                 
         if self.enable_prefill_cp and use_pcp(forward_batch):
-            hidden_states = pcp_ag_rearange_output(
+            hidden_states = pcp_ag_rerange_output(
                 hidden_states.contiguous(),
                 self.pcp_size,
                 forward_batch,

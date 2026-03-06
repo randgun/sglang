@@ -78,7 +78,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
     get_pcp_size,
-    pcp_ag_rearange_output
+    pcp_ag_rerange_output
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -2755,7 +2755,7 @@ class DeepseekV2Model(nn.Module):
 
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp):
             # allgather + rerrange
-            hidden_states = pcp_ag_rearange_output(
+            hidden_states = pcp_ag_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,

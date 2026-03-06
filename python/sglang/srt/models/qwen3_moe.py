@@ -39,7 +39,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_rank, get_pcp_size,pcp_ag_rearange_output,get_attention_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_rank, get_pcp_size,pcp_ag_rerange_output,get_attention_tp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -567,7 +567,7 @@ class Qwen3MoeAttention(nn.Module):
     def _rebuild_pcp_kv(self, k, v, forward_batch):
         kv = torch.cat([k, v], dim=-1)
         # kv_full = cp_all_gather_rerange_output(kv.contiguous(), self.pcp_size, forward_batch,torch.cuda.current_stream())
-        kv_full = pcp_ag_rearange_output(kv.contiguous(), self.pcp_size, forward_batch)
+        kv_full = pcp_ag_rerange_output(kv.contiguous(), self.pcp_size, forward_batch)
         k, v = kv_full.split(split_size=self.kv_size, dim=-1)
         return k, v
 

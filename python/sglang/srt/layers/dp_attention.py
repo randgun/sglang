@@ -608,7 +608,7 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
-def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
+def pcp_ag_rerange_output(input_tensor, pcp_size, forward_batch):
     # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
     # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
     # but communicate on PCP group (not attention-TP group).
