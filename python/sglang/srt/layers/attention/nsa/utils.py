@@ -462,7 +462,6 @@ def _compute_attention_metadata(
     head_end_global,
     tail_start_global,
     tail_end_global,
-    attn_mask_seqlens
 ):
     head_chunk_len = head_end_global - head_start_global
     tail_chunk_len = tail_end_global - tail_start_global
@@ -486,8 +485,6 @@ def _compute_attention_metadata(
     cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
     cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
 
-    attn_mask_seqlens = torch.cumsum(attn_mask_seqlens[0], dim=0).tolist()
-    cp_metadata.attn_mask_seqlens = attn_mask_seqlens
     cp_metadata.head_q_seqlens = head_q_seqlens
     cp_metadata.tail_q_seqlens = tail_q_seqlens
 
@@ -627,6 +624,7 @@ def prepare_input_dp_with_cp_dsa(
         actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
+        attn_mask_seqlens=attn_mask_seqlens,
     )
     if is_enable_prefill_cp():
         return _compute_attention_metadata(
@@ -637,6 +635,5 @@ def prepare_input_dp_with_cp_dsa(
             head_end_global=head_end_global,
             tail_start_global=tail_start_global,
             tail_end_global=tail_end_global,
-            attn_mask_seqlens=attn_mask_seqlens,
         )
     return cp_metadata
