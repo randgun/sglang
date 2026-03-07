@@ -22,13 +22,14 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group,get_context_parallel_rank
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -39,6 +40,9 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Constant for prefill context parallel TP size
+PREFILL_CP_ATTN_TP_SIZE = 16
 
 
 class CommonKVManager(BaseKVManager):
@@ -59,6 +63,8 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
+        self.pcp_size = server_args.prefill_context_parallel_size
+        self.pcp_rank = get_context_parallel_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_dp_size = get_attention_dp_size()
@@ -119,12 +125,21 @@ class CommonKVManager(BaseKVManager):
 
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
+        attn_tp_rank = self.attn_tp_rank
+        attn_dp_rank = self.attn_dp_rank
+        attn_tp_size = self.attn_tp_size
+        attn_dp_size = self.attn_dp_size
+        if is_enable_prefill_cp():
+            attn_dp_rank = 0
+            attn_tp_size = PREFILL_CP_ATTN_TP_SIZE
+            attn_dp_size = 1
+            attn_tp_rank = self.pcp_rank * attn_tp_size + self.attn_tp_rank
         payload = {
             "role": "Prefill",
-            "attn_tp_size": self.attn_tp_size,
-            "attn_tp_rank": self.attn_tp_rank,
-            "attn_dp_size": self.attn_dp_size,
-            "attn_dp_rank": self.attn_dp_rank,
+            "attn_tp_size": attn_tp_size,
+            "attn_tp_rank": attn_tp_rank,
+            "attn_dp_size": attn_dp_size,
+            "attn_dp_rank": attn_dp_rank,
             "pp_size": self.pp_size,
             "pp_rank": self.pp_rank,
             "system_dp_size": self.system_dp_size,

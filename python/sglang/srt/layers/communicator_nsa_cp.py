@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -31,12 +32,25 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+from sglang.srt.layers.dp_attention import get_pcp_size
+
+from sglang.srt.distributed.parallel_state import get_pcp_group
+
+from sglang.srt.layers.dp_attention import get_pcp_rank
 
 
 def nsa_enable_prefill_cp():
@@ -147,11 +161,11 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         *,
         residual_input_mode,
     ):
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if nsa_use_prefill_cp(forward_batch):
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
                 get_local_dp_buffer(),
@@ -161,7 +175,26 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 hidden_states,
                 local_hidden_states,
             )
-        return hidden_states, residual
+            return hidden_states, residual
+        elif is_enable_prefill_cp():
+            if hidden_states.shape[0] != 0:
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                hidden_states, residual = layernorm(hidden_states, residual)
+                local_hidden_states = hidden_states
+                pcp_size = get_pcp_size()
+                hidden_states = torch.empty(pcp_size, hidden_states.shape[0], hidden_states.shape[1],
+                                            device=hidden_states.device,
+                                            dtype=hidden_states.dtype)
+                get_pcp_group().cp_all_gather_into_tensor_async(
+                    hidden_states, local_hidden_states, torch.npu.current_stream()
+                )
+            return hidden_states.reshape(-1, hidden_states.shape[-1]), residual
+        else:
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
+
+            return hidden_states, residual
+
 
 
 class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
@@ -196,6 +229,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        layer_norm: Optional[torch.nn.Module] = None,
         allow_reduce_scatter: bool = False,
     ):
         # for prefill: full -> attn tp scattered
@@ -207,4 +241,21 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                 context.attn_tp_rank
             ]
             attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
-        return hidden_states, residual
+            return hidden_states, residual
+        elif is_enable_prefill_cp():
+            if hidden_states.shape[0] != 0:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                input_hidden_states = hidden_states
+                pcp_size = get_pcp_size()
+                pcp_rank = get_pcp_rank()
+                hidden_states = hidden_states.tensor_split(pcp_size)[
+                    pcp_rank
+                ]
+                # get_pcp_group().reduce_scatter_tensor(hidden_states, input_hidden_states)
+            #     if layer_norm is not None:
+            #         try:
+            #             hidden_states, residual = layer_norm(hidden_states, residual)
+            #         except TypeError:
+            #             hidden_states = layer_norm(hidden_states)
+            return hidden_states, residual
+
