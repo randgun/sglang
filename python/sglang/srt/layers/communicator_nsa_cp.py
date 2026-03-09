@@ -21,6 +21,7 @@ import torch
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
+    use_pcp,
 )
 from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
@@ -176,7 +177,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 local_hidden_states,
             )
             return hidden_states, residual
-        elif is_enable_prefill_cp():
+        elif use_pcp(forward_batch):
             if hidden_states.shape[0] != 0:
                 hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -242,12 +243,13 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             ]
             attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
             return hidden_states, residual
-        elif is_enable_prefill_cp():
+        elif use_pcp(forward_batch):
             if hidden_states.shape[0] != 0:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                input_hidden_states = hidden_states
+                # hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                # input_hidden_states = hidden_states
                 pcp_size = get_pcp_size()
                 pcp_rank = get_pcp_rank()
+                hidden_states = get_pcp_group().all_reduce(hidden_states)
                 hidden_states = hidden_states.tensor_split(pcp_size)[
                     pcp_rank
                 ]
