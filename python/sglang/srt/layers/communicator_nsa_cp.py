@@ -260,4 +260,6 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             #         except TypeError:
             #             hidden_states = layer_norm(hidden_states)
             return hidden_states, residual
+        else:
+            return hidden_states, residual
 
