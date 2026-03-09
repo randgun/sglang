@@ -690,10 +690,10 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
-        if torch.distributed.get_rank() in (0,4) and self.attn.layer_id == 0:
+        if torch.distributed.get_rank() in (0,4) and self.attn.layer_id == 0 and forward_batch.forward_mode.is_extend():
             print(f"+++ fia pcp output is {self.attn.layer_id=} === rank:{torch.distributed.get_rank()} {attn_output.sum()=},  {attn_output[:, :10]=}")
         output, _ = self.o_proj(attn_output)
-        if self.attn.layer_id == 0 and torch.distributed.get_rank() in (0,4):
+        if self.attn.layer_id == 0 and torch.distributed.get_rank() in (0,4) and forward_batch.forward_mode.is_extend():
             print(f'O========{self.attn.layer_id=},{torch.distributed.get_rank()=},{output.sum()=},{output[:, :10]}')
         return output
 
