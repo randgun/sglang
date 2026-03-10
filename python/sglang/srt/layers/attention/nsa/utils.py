@@ -17,7 +17,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     get_pcp_group,
-    get_pcp_group,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -233,14 +232,6 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     else:
         return False
 
-
-def _get_cp_metadata(forward_batch):
-    """Get CP metadata from forward_batch, prefer gqa_cp_metadata over nsa_cp_metadata."""
-    if forward_batch.gqa_cp_metadata is not None:
-        return forward_batch.gqa_cp_metadata
-    return forward_batch.nsa_cp_metadata
-
-
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
@@ -249,8 +240,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
-    cp_metadata = _get_cp_metadata(forward_batch)
-    assert cp_metadata is not None, "CP metadata is not available"
+    cp_metadata = forward_batch.cp_metadata
 
     if cp_metadata.rank_valid_ranges is not None:
         # Use rank_valid_ranges to select real tokens only.
