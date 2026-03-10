@@ -599,7 +599,7 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
-def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
+def pcp_allgather_rearrange(input_tensor,pcp_size,forward_batch):
     max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
 
     pad_size = max_len - input_tensor.shape[0]
