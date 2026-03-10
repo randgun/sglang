@@ -78,7 +78,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
     get_pcp_size,
-    pcp_ag_rearange_output
+    pcp_allgather_rearrange
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -2755,7 +2755,7 @@ class DeepseekV2Model(nn.Module):
 
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp):
             # allgather + rerrange
-            hidden_states = pcp_ag_rearange_output(
+            hidden_states = pcp_allgather_rearrange(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
@@ -2903,7 +2903,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.enable_prefill_cp and self.use_nsa:
-            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
+            if can_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
@@ -2911,7 +2911,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     input_ids.device,
                 )
         elif self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+            if can_cp_split(len(input_ids), self.pcp_size, True, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.pcp_rank,

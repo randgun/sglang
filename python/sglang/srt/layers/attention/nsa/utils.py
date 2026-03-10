@@ -474,7 +474,6 @@ def prepare_input_dp_with_cp_dsa(
     kv_len,
     cp_rank,
     cp_size,
-    seqs_len,
     device
 ):
     if is_nsa_prefill_cp_round_robin_split():

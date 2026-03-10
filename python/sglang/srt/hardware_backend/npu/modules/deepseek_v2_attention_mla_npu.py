@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dp_attention import pcp_ag_rerange_output
+from sglang.srt.layers.dp_attention import pcp_allgather_rearrange
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -77,7 +77,7 @@ def forward_mha_prepare_npu(
         latent_cache[..., : m.kv_lora_rank] = k_nope
         latent_cache[..., m.kv_lora_rank:] = k_pe
         if nsa_use_prefill_cp(forward_batch, m.enable_prefill_cp):
-            latent_cache = pcp_ag_rerange_output(
+            latent_cache = pcp_allgather_rearrange(
                 latent_cache.squeeze(1).contiguous(),
                 m.pcp_size,
                 forward_batch
@@ -414,7 +414,6 @@ def forward_dsa_core_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
-    v: torch.Tensor,
 ) -> torch.Tensor:
     attn_output = m.attn_mqa(
         q_nope_out.contiguous(),
