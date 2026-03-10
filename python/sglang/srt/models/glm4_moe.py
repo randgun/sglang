@@ -98,6 +98,7 @@ from sglang.srt.utils import (
     process_shared_expert,
     wait_share_stream,
 )
+from sglang.srt.environ import envs
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
