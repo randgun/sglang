@@ -38,7 +38,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size, pcp_ag_rearange_output
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -536,9 +536,19 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self.enable_prefill_cp and use_pcp(forward_batch):
-            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
-            positions = cp_pad_local_tokens(forward_batch, positions)
+        if (
+            hidden_states.shape[0] == 0
+            and self.enable_prefill_cp
+            and use_pcp(forward_batch)
+        ):
+            # Avoid NPU rope on empty tensors; still participate in PCP comms.
+            empty_kv = torch.empty(
+                (0, self.kv_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -565,9 +575,19 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self.enable_prefill_cp and use_pcp(forward_batch):
-            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
-            positions = cp_pad_local_tokens(forward_batch, positions)
+        if (
+            hidden_states.shape[0] == 0
+            and self.enable_prefill_cp
+            and use_pcp(forward_batch)
+        ):
+            # Avoid rope on empty tensors; still participate in PCP comms.
+            empty_kv = torch.empty(
+                (0, self.kv_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)

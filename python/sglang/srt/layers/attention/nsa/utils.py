@@ -63,7 +63,7 @@ class ContextParallelMetadata:
     actual_seq_len: Optional[int] = None
     # Per-block page counts for CP KV transfer (zigzag order)
     block_page_counts: Optional[List[int]] = None
-    is_gqa: Optional[bool] = True
+    is_gqa: Optional[bool] = False
 
 
 
@@ -91,7 +91,6 @@ def is_nsa_prefill_cp_round_robin_split():
 
 def is_enable_prefill_cp():
     return get_global_server_args().prefill_context_parallel_size > 1
-
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
@@ -167,6 +166,36 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
             ]
         )
     return nsa_cache_seqlens
+
+
+def can_cp_split(seq_len: int, cp_size: int, forward_batch):
+    if is_nsa_prefill_cp_round_robin_split():
+        cur_cp_seq_len = seq_len // cp_size
+        assert (
+            seq_len % cp_size == 0
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+    else:
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
+        # the seq data needs to be divided and recombined at twice the size of cp_size.
+        cur_cp_seq_len = seq_len // (cp_size * 2)
+    if (
+        cur_cp_seq_len != 0
+        and cp_size > 1
+        and forward_batch.forward_mode.is_context_parallel_extend()
+        and (is_enable_prefill_cp() or is_nsa_enable_prefill_cp())
+    ):
+        return True
+    else:
+        return False
+
+
+def _get_cp_metadata(forward_batch):
+    """Get CP metadata from forward_batch, prefer gqa_cp_metadata over nsa_cp_metadata."""
+    if forward_batch.gqa_cp_metadata is not None:
+        return forward_batch.gqa_cp_metadata
+    return forward_batch.nsa_cp_metadata
+
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
