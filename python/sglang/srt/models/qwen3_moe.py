@@ -38,7 +38,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size,  get_pcp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size, pcp_ag_rearange_output
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -442,7 +442,6 @@ class Qwen3MoeAttention(nn.Module):
 
         self.config = config
         self.enable_prefill_cp = is_enable_prefill_cp()
-        self.enable_prefill_cp = is_enable_prefill_cp()
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -551,7 +550,6 @@ class Qwen3MoeAttention(nn.Module):
                 device=hidden_states.device,
             )
             pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
@@ -596,7 +594,6 @@ class Qwen3MoeAttention(nn.Module):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
             pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
@@ -786,7 +783,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
         self.enable_prefill_cp = is_enable_prefill_cp()
-        self.enable_prefill_cp = is_enable_prefill_cp()
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -816,22 +812,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        if self.enable_prefill_cp:
-            self.layer_communicator = NSACPLayerCommunicator(
-                layer_scatter_modes=self.layer_scatter_modes,
-                input_layernorm=self.input_layernorm,
-                post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
-            )
-        else:
-            self.layer_communicator = LayerCommunicator(
-                layer_scatter_modes=self.layer_scatter_modes,
-                input_layernorm=self.input_layernorm,
-                post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
-            )
         if self.enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
@@ -1004,10 +984,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.model = Qwen3MoeModel(
             config,
             quant_config,
-            prefix=add_prefix("model", prefix)
-            config,
-            quant_config,
-            prefix=add_prefix("model", prefix)
+            prefix=add_prefix("model", prefix),
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

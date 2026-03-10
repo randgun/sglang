@@ -258,9 +258,6 @@ class AscendAttnBackend(AttentionBackend):
         self.is_prefill_cp_enable = model_runner.pcp_size > 1
         self.pcp_size = model_runner.pcp_size
 
-        self.is_prefill_cp_enable = model_runner.pcp_size > 1
-        self.pcp_size = model_runner.pcp_size
-
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -1050,8 +1047,8 @@ class AscendAttnBackend(AttentionBackend):
                 layer=layer,
                 atten_mask=atten_mask,
             )
-            if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-                print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
+            # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
+            #     print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
             output = torch.cat([output_head,output_tail], dim=0)
         else:
             output = torch.cat(output, dim=0)
@@ -1454,20 +1451,6 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                     layer,
                     forward_batch,
-                    save_kv_cache,
-                    q_rope=q_rope,
-                    k_rope=k_rope,
-                )
-        elif use_pcp(forward_batch):
-            q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
-            k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
-            attn_output = self.forward_mla_pcp(
-                    q_nope,
-                    k_nope,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache,
                     q_rope=q_rope,
                     k_rope=k_rope,
                 )

@@ -107,34 +107,6 @@ class ContextParallelMetadata:
     actual_seq_len: Optional[int] = None
     # Per-block page counts for CP KV transfer (zigzag order)
     block_page_counts: Optional[List[int]] = None
-
-
-
-
-@dataclass
-class ContextParallelMetadata:
-    split_list: Optional[List[int]] = None
-    max_rank_len: Optional[List[int]] = None
-    zigzag_index: Optional[List[int]] = None
-    per_rank_actual_token: Optional[List[int]] = None
-    reverse_split_len: Optional[List[int]] = None
-    cp_reverse_index: Optional[List[int]] = None
-    kv_len_prev: int = -1
-    kv_len_next: int = -1
-    actual_seq_q_prev: int = -1
-    actual_seq_q_next: int = -1
-    kv_len_prev_tensor: Optional[torch.Tensor] = None
-    kv_len_next_tensor: Optional[torch.Tensor] = None
-    actual_seq_q_prev_tensor: Optional[torch.Tensor] = None
-    actual_seq_q_next_tensor: Optional[torch.Tensor] = None
-    total_seq_lens: Optional[int] = None
-    kv_with_q_head_nomask_idx: Optional[torch.Tensor] = None
-    kv_with_q_head_mask_idx: Optional[torch.Tensor] = None
-    kv_with_q_tail_nomask_idx: Optional[torch.Tensor] = None
-    kv_with_q_tail_mask_idx: Optional[torch.Tensor] = None
-    head_attn_nomask_seqlens: Optional[torch.Tensor] = None
-    tail_attn_nomask_seqlens: Optional[torch.Tensor] = None
-    attn_mask_seqlens: Optional[torch.Tensor] = None
     is_gqa: Optional[bool] = False
 
 
@@ -160,8 +132,6 @@ def is_nsa_prefill_cp_round_robin_split():
         and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
     )
 
-def is_enable_prefill_cp():
-    return get_global_server_args().prefill_context_parallel_size > 1
 def is_enable_prefill_cp():
     return get_global_server_args().prefill_context_parallel_size > 1
 
@@ -242,7 +212,6 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
-def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
@@ -257,8 +226,7 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
         cur_cp_seq_len != 0
         and cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
-        # and is_nsa_enable_prefill_cp()
-        # and is_nsa_enable_prefill_cp()
+        and (is_enable_prefill_cp() or is_nsa_enable_prefill_cp())
     ):
         return True
     else:
@@ -304,11 +272,9 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
     input_list = list(
         torch.split(input_, cp_metadata.split_list, dim=0)
-        torch.split(input_, forward_batch.cp_metadata.split_list, dim=0)
     )
     result = torch.cat(
         [input_list[i] for i in cp_metadata.zigzag_index], dim=0
-        [input_list[i] for i in forward_batch.cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
 
     return result
@@ -346,11 +312,9 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
 
     position_id_list = list(
         torch.split(positions, cp_metadata.split_list, dim=-1)
-        torch.split(positions, forward_batch.cp_metadata.split_list, dim=-1)
     )
     positions = torch.cat(
         [position_id_list[i] for i in cp_metadata.zigzag_index],
-        [position_id_list[i] for i in forward_batch.cp_metadata.zigzag_index],
         dim=-1,
     )
     return positions
