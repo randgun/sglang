@@ -718,6 +718,9 @@ def prepare_input_dp_with_cp_dsa(
     actual_seq_q_next = split_list[tail_chunk_id]
     kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device=device, dtype=torch.int32)
     kv_len_next_tensor = torch.tensor(kv_len_next).to(device=device, dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(
+        device=device, dtype=torch.int32
+    )
     actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
         device=device, dtype=torch.int32
     )
