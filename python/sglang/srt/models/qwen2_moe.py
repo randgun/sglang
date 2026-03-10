@@ -48,9 +48,6 @@ from sglang.srt.layers.dp_attention import (
     pcp_ag_rearange_output,
     get_pcp_size,
     get_pcp_rank,
-    pcp_ag_rearange_output,
-    get_pcp_size,
-    get_pcp_rank,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -80,16 +77,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     use_pcp,
 )
-from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    prepare_input_dp_with_cp_dsa,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    is_enable_prefill_cp,
-    nsa_use_prefill_cp,
-    is_nsa_enable_prefill_cp,
-    use_pcp,
-)
+
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (

@@ -421,7 +421,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
-            gqa_cp_metadata=batch.prefill_cp_metadata,
         )
         device = model_runner.device
 
