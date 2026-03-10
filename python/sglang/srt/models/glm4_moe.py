@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -94,9 +95,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     make_layers,
-    process_routed_expert,
     process_shared_expert,
-    wait_routed_stream,
     wait_share_stream,
 )
 from sglang.srt.environ import envs
@@ -943,7 +942,11 @@ class Glm4MoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get() else None
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeDecoderLayer(
