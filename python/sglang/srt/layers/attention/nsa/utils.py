@@ -270,7 +270,6 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
     return result
 
-
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
@@ -280,7 +279,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         )
         return nsa_cp_round_robin_split_data(positions)
 
-    cp_metadata = _get_cp_metadata(forward_batch)
+    cp_metadata = forward_batch.cp_metadata
     assert cp_metadata is not None, "CP metadata is not available"
 
     if cp_metadata.rank_valid_ranges is not None:
