@@ -108,6 +108,7 @@ class ContextParallelMetadata:
     actual_seq_len: Optional[int] = None
     # Per-block page counts for CP KV transfer (zigzag order)
     block_page_counts: Optional[List[int]] = None
+    is_gqa: Optional[bool] = False
 
 
 
@@ -234,13 +235,6 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
         return False
 
 
-def _get_cp_metadata(forward_batch):
-    """Get CP metadata from forward_batch, prefer gqa_cp_metadata over nsa_cp_metadata."""
-    if forward_batch.gqa_cp_metadata is not None:
-        return forward_batch.gqa_cp_metadata
-    return forward_batch.nsa_cp_metadata
-
-
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
@@ -249,7 +243,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
-    cp_metadata = _get_cp_metadata(forward_batch)
+    cp_metadata = forward_batch.cp_metadata
     assert cp_metadata is not None, "CP metadata is not available"
 
     if cp_metadata.rank_valid_ranges is not None:
@@ -290,7 +284,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         )
         return nsa_cp_round_robin_split_data(positions)
 
-    cp_metadata = _get_cp_metadata(forward_batch)
+    cp_metadata = forward_batch.cp_metadata
     assert cp_metadata is not None, "CP metadata is not available"
 
     if cp_metadata.rank_valid_ranges is not None:
@@ -391,7 +385,7 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:
         nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
     if (
-        forward_batch.nsa_cp_metadata is not None
+        forward_batch.cp_metadata is not None
         and nsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
@@ -400,9 +394,12 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         return False
 
 def use_pcp(forward_batch):
-    if (forward_batch.nsa_cp_metadata is not None
-        and forward_batch.forward_mode.is_context_parallel_extend()):
-            return True
+    if (
+        forward_batch.cp_metadata is not None
+        and forward_batch.forward_mode.is_context_parallel_extend()
+        and is_enable_prefill_cp()
+    ):
+        return True
     else:
         return False
 
@@ -445,13 +442,13 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     )
     # step3
     outputs_list_max = list(
-        torch.split(input_tensor_all, forward_batch.nsa_cp_metadata.max_rank_len, dim=0)
+        torch.split(input_tensor_all, forward_batch.cp_metadata.max_rank_len, dim=0)
     )
     outputs = torch.cat(
         [
             outputs_list_max[index][:per_rank_len]
             for index, per_rank_len in enumerate(
-                forward_batch.nsa_cp_metadata.per_rank_actual_token
+                forward_batch.cp_metadata.per_rank_actual_token
             )
         ],
         dim=0,
@@ -505,14 +502,14 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
-        forward_batch.nsa_cp_metadata.total_seq_lens,
+        forward_batch.cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
     )
     outputs_list = list(
         torch.split(
-            output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
+            output_tensor, forward_batch.cp_metadata.reverse_split_len, dim=0
         )
     )
     if _is_pcp_precision_debug_enabled():
@@ -521,12 +518,12 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             "reverse_split_len=%s cp_reverse_index=%s %s",
             cp_size,
             len(outputs_list),
-            forward_batch.nsa_cp_metadata.reverse_split_len,
-            forward_batch.nsa_cp_metadata.cp_reverse_index,
+            forward_batch.cp_metadata.reverse_split_len,
+            forward_batch.cp_metadata.cp_reverse_index,
             _pcp_tensor_debug_summary("gathered", output_tensor),
         )
     output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
+        [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
     if _is_pcp_precision_debug_enabled():
@@ -607,10 +604,10 @@ def _compute_attention_metadata(
     
     cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
     cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
-    cp_metadata.kv_with_q_head_nomask_idx_tensor = kv_with_q_head_nomask_idx_tensor
-    cp_metadata.kv_with_q_head_mask_idx_tensor = kv_with_q_head_mask_idx_tensor
-    cp_metadata.kv_with_q_tail_nomask_idx_tensor = kv_with_q_tail_nomask_idx_tensor
-    cp_metadata.kv_with_q_tail_mask_idx_tensor = kv_with_q_tail_mask_idx_tensor
+    cp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx_tensor
+    cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
+    cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
+    cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
     return cp_metadata
 
 
@@ -618,7 +615,8 @@ def prepare_input_dp_with_cp_dsa(
     kv_len,
     cp_rank,
     cp_size,
-    device
+    device,
+    is_gqa: bool = False,
 ):
     if is_nsa_prefill_cp_round_robin_split():
         return True
@@ -728,7 +726,10 @@ def prepare_input_dp_with_cp_dsa(
     )
     actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
         device=device, dtype=torch.int32
-    )    
+    )
+    attn_mask_seqlens = torch.tensor(
+        [[seq_per_batch], [seq_per_batch]], dtype=torch.int32
+    )
     cp_metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
@@ -745,6 +746,8 @@ def prepare_input_dp_with_cp_dsa(
         actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
+        attn_mask_seqlens=attn_mask_seqlens,
+        is_gqa=is_gqa,
     )
     if is_enable_prefill_cp():
         return _compute_attention_metadata(

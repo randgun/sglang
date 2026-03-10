@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
+from python.sglang.srt.distributed.parallel_state import get_pcp_group
+from python.sglang.srt.layers.dp_attention import get_pcp_size
 import torch
 import torch_npu
 from sgl_kernel_npu.attention.sinks_attention import (
@@ -21,7 +23,16 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
-    use_pcp
+    use_pcp,
+    cp_all_gather_rerange_output
+)
+from sglang.srt.layers.dp_attention import (
+    get_pcp_group,
+    get_pcp_size
+)
+from sglang.srt.hardware_backend.npu.attention.ring_utils import (
+    RingComm,
+    update_out_and_lse
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1047,6 +1058,80 @@ class AscendAttnBackend(AttentionBackend):
         #     print(f"+++ fia pcp output is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output.sum()=},  {output[:5, :5,:5]=}")
         return output.reshape(seq_len, -1).to(q.dtype)
 
+    def forward_ring_pcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        seq_len = q.shape[0]
+        if seq_len == 0:
+            return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
+        split_len = (seq_len + 1) // 2
+ 
+        k = k.contiguous()
+        v = v.contiguous()
+        q_head, q_tail = torch.split(q, [split_len, seq_len - split_len], dim=0)
+        q_head = q_head.contiguous()
+        q_tail = q_tail.contiguous()
+ 
+        def _forward(q, k, v, layer, attn_mask):
+            attn_out, lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=self.fia_mask.unsqueeze(0) if attn_mask else None,
+                sparse_mode=3 if attn_mask else 0,
+                scale=layer.scaling,
+                next_tokens=0,
+                inner_precise=0,
+                softmax_lse_flag=True,
+            )
+            return attn_out, lse
+ 
+        comm = RingComm(get_pcp_group().device_group)
+        out, lse, out_dtype = None, None, None
+        next_k, next_v = None, None
+        pcp_size = get_pcp_size()
+        for loop in range(pcp_size):
+            if loop + 1 != pcp_size:
+                next_k, next_v = comm.send_recv_kv(k, v)
+ 
+            k_head, k_tail = torch.split(k, [split_len, seq_len - split_len], dim=0)
+            v_head, v_tail = torch.split(v, [split_len, seq_len - split_len], dim=0)
+            if loop == 0:
+                out_head, lse_head = _forward(q_head, k_head, v_head, layer, attn_mask=True)
+                out_dtype = out_head.dtype
+                out_tail1, lse_tail1 = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
+                out_tail2, lse_tail2 = _forward(q_tail, k_tail, v_tail, layer, attn_mask=True)
+                out_tail, lse_tail = update_out_and_lse(out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True)
+                block_out = torch.cat([out_head, out_tail], dim=1)
+                lse_head = lse_head.transpose(1, 2)
+                block_lse = torch.cat([lse_head, lse_tail], dim=1)
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_trans=False)
+            elif loop <= comm.pcp_rank:
+                out_head, lse_head = _forward(q_head, k_head, v_head, layer, attn_mask=False)
+                out_tail, lse_tail = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
+                block_out = torch.cat([out_head, out_tail], dim=1)
+                block_lse = torch.cat([lse_head, lse_tail], dim=2)
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            else:
+                out_tail1, lse_tail1 = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
+                out_tail2, lse_tail2 = _forward(q_tail, k_tail, v_tail, layer, attn_mask=False)
+                out_tail, lse_tail = update_out_and_lse(out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True)
+                out[:, split_len:], lse[:, split_len:] = update_out_and_lse(out[:, split_len:], lse[:, split_len:], out_tail, lse_tail, lse_trans=False)
+ 
+            if loop + 1 != pcp_size:
+                comm.wait()
+                k, v = next_k, next_v
+ 
+        return out.to(out_dtype)
+
     def forward_extend(
         self,
         q,
@@ -1134,7 +1219,7 @@ class AscendAttnBackend(AttentionBackend):
                 #     print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=},{q[:2, :5,:5]=},{k[:2, :5,:5]=},{v[:2, :5,:5]=}")
 
                 if use_pcp(forward_batch):
-                    attn_output = self.forward_fia_pcp(
+                    attn_output = self.forward_ring_pcp(
                         q=q,
                         k=k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
                         v=v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),

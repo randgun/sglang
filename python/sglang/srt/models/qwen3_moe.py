@@ -328,7 +328,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            if is_enable_prefill_cp():
+            if use_pcp(forward_batch):
                 final_hidden_states = get_attention_tp_group().all_reduce(final_hidden_states)
             else:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -999,6 +999,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_rank,
                     self.pcp_size,
                     input_ids.device,
+                    is_gqa=True,
                 )
                 # if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
                 #     # print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\

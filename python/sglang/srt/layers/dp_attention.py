@@ -621,11 +621,7 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     # Default strategy: prefer tp_group when it has the same rank set as pcp_group.
     comm_group = tp_group if can_use_tp_group else pcp_group
     cp_rank_count = pcp_group.world_size
-    cp_metadata = (
-        forward_batch.gqa_cp_metadata
-        if forward_batch.gqa_cp_metadata is not None
-        else forward_batch.nsa_cp_metadata
-    )
+    cp_metadata = forward_batch.cp_metadata
     if cp_metadata is None:
         raise ValueError(
             f"pcp_ag_rearange_output requires cp metadata, got None "

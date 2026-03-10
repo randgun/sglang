@@ -21,8 +21,8 @@ import torch
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
+    use_pcp,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -35,10 +35,13 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
+    get_attention_tp_group,
+    get_pcp_rank,
+    get_pcp_size,
     get_local_dp_buffer,
 )
+from sglang.srt.distributed.parallel_state import get_pcp_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 
 
 def nsa_enable_prefill_cp():
@@ -164,10 +167,25 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 local_hidden_states,
             )
             return hidden_states, residual
-        elif is_enable_prefill_cp():
+        elif use_pcp(forward_batch):
             if hidden_states.shape[0] != 0:
                 hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                 hidden_states, residual = layernorm(hidden_states, residual)
+                if forward_batch.cp_metadata.is_gqa:
+                    local_hidden_states = hidden_states
+                    pcp_size = get_pcp_size()
+                    hidden_states = torch.empty(
+                        pcp_size,
+                        hidden_states.shape[0],
+                        hidden_states.shape[1],
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
+                    get_pcp_group().cp_all_gather_into_tensor_async(
+                        hidden_states, local_hidden_states, torch.npu.current_stream()
+                    )
+            if forward_batch.cp_metadata.is_gqa:
+                return hidden_states.reshape(-1, hidden_states.shape[-1]), residual
             return hidden_states, residual
         else:
             if hidden_states.shape[0] != 0:
@@ -222,13 +240,16 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             ]
             attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
             return hidden_states, residual
-        elif is_enable_prefill_cp():
-            # if hidden_states.shape[0] != 0:
-            #     hidden_states = get_attention_tp_group().all_reduce(hidden_states)
-            #     if layer_norm is not None:
-            #         try:
-            #             hidden_states, residual = layer_norm(hidden_states, residual)
-            #         except TypeError:
-            #             hidden_states = layer_norm(hidden_states)
+        elif use_pcp(forward_batch):
+            if hidden_states.shape[0] != 0:
+                if not forward_batch.cp_metadata.is_gqa:
+                    hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                    hidden_states, residual = layer_norm(hidden_states, residual)
+                else:
+                    pcp_size = get_pcp_size()
+                    pcp_rank = get_pcp_rank()
+                    hidden_states = hidden_states.tensor_split(pcp_size)[pcp_rank]
+            return hidden_states, residual
+        else:
             return hidden_states, residual
 
