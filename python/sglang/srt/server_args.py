@@ -4701,15 +4701,6 @@ class ServerArgs:
             default=ServerArgs.debug_tensor_dump_output_folder,
             help="The output folder for dumping tensors.",
         )
-
-        parser.add_argument(
-            "--prefill-context-parallel-size",
-            "--pcp-size",
-            type=int,
-            default=ServerArgs.prefill_context_parallel_size,
-            help="The context parallel size used in the long sequence prefill phase of DeepSeek v3.2.",
-        )
-
         parser.add_argument(
             "--debug-tensor-dump-layers",
             type=int,
