@@ -347,6 +347,24 @@ class TopK(MultiPlatformOp):
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
+        if hidden_states.numel() == 0 or hidden_states.shape[0] == 0:
+            topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                topk_weights = torch.empty(
+                    (0, topk), dtype=torch.float32, device=hidden_states.device
+                )
+                topk_ids = torch.full(
+                    (0, topk), -1, dtype=torch.int32, device=hidden_states.device
+                )
+            empty_router_logits = (
+                router_logits
+                if router_logits is not None
+                else torch.empty((0, topk), dtype=torch.float32, device=hidden_states.device)
+            )
+            return StandardTopKOutput(topk_weights, topk_ids, empty_router_logits)
+
         return fused_topk_npu(
             hidden_states=hidden_states,
             router_logits=router_logits,

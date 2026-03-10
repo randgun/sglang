@@ -1687,16 +1687,26 @@ def initialize_model_parallel(
         group_name="pp",
     )
     global _PCP
-    pcp_tp_size = tensor_model_parallel_size // prefill_context_parallel_size
-    group_ranks = [list(range(i,get_world_size(),pcp_tp_size)) for i in range(pcp_tp_size)]
+    # Build PCP groups aligned with TP groups to avoid cross-group communication
+    # mismatches when only a subset of TP ranks process a request.
+    if prefill_context_parallel_size > 1:
+        tp_group_count = get_world_size() // tensor_model_parallel_size
+        group_ranks = []
+        for tp_group_idx in range(tp_group_count):
+            tp_base = tp_group_idx * tensor_model_parallel_size
+            for offset in range(0, tensor_model_parallel_size, prefill_context_parallel_size):
+                group_ranks.append(
+                    list(range(tp_base + offset, tp_base + offset + prefill_context_parallel_size))
+                )
+    else:
+        group_ranks = [list(range(get_world_size()))]
     _PCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_custom_allreduce= False,
+        use_custom_allreduce=False,
         group_name="pcp_tp",
     )
-
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
 ) -> Optional[torch.distributed.ProcessGroup]:
