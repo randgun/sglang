@@ -190,15 +190,6 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     else:
         return False
 
-
-def _get_cp_metadata(forward_batch):
-    """Get CP metadata from forward_batch, prefer gqa_cp_metadata over nsa_cp_metadata."""
-    if forward_batch.gqa_cp_metadata is not None:
-        return forward_batch.gqa_cp_metadata
-    return forward_batch.nsa_cp_metadata
-
-
-
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
