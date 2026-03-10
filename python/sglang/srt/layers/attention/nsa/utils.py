@@ -275,6 +275,15 @@ def nsa_cp_round_robin_split_q_seqs(
     )
     return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
 
+def use_pcp(forward_batch):
+    if (
+        forward_batch.nsa_cp_metadata is not None
+        and is_enable_prefill_cp()
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    ):
+        return True
+    else:
+        return False
 
 def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:

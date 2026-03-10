@@ -250,16 +250,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-        if self.enable_prefill_cp and self.use_nsa:
+        if self.enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, True,forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    input_ids.device,
-                )
-        elif self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.pcp_size, True,forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,

@@ -58,6 +58,7 @@ from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
+    use_pcp,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
@@ -1097,14 +1098,18 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        if self.enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
-        if self.nsa_enable_prefill_cp and self.use_nsa:
-            attn_tp_rank = 0
-            attn_tp_size = 1
-            self.cp_size = get_attention_tp_size()
+        if self.enable_prefill_cp:
+            if self.use_nsa:
+                attn_tp_rank = 0
+                attn_tp_size = 1
+                self.cp_size = get_attention_tp_size()
+            else:
+                self.pcp_size = get_pcp_size()
+                self.pcp_rank = get_context_parallel_rank()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -1503,12 +1508,19 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         # support allgather+rerrange
         latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
         latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
-        latent_cache_output = cp_all_gather_rerange_output(
-            latent_cache.contiguous(),
-            self.cp_size,
-            forward_batch,
-            torch.cuda.current_stream(),
-        )
+        if self.enable_prefill_cp and self.use_nsa:
+            latent_cache_output = cp_all_gather_rerange_output(
+                latent_cache.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+        elif self.enable_prefill_cp:
+            latent_cache_output = pcp_allgather_rearrange(
+                latent_cache.contiguous(),
+                self.pcp_size,
+                forward_batch,
+            )   
         k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
         return k_nope, k_pe
@@ -1719,7 +1731,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp) or use_pcp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -2755,11 +2767,17 @@ class DeepseekV2Model(nn.Module):
 
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp):
             # allgather + rerrange
-            hidden_states = pcp_allgather_rearrange(
+            hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+            )
+        elif use_pcp(forward_batch):
+            hidden_states = pcp_allgather_rearrange(
+                hidden_states,
+                self.pcp_size,
+                forward_batch,
             )
         if len(aux_hidden_states) == 0:
             return hidden_states

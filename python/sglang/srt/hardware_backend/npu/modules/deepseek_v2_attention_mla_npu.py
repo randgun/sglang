@@ -6,11 +6,13 @@ import torch_npu
 
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
+    is_fia_nz,
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     nsa_use_prefill_cp,
+    use_pcp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import pcp_allgather_rearrange
@@ -66,7 +68,7 @@ def forward_mha_prepare_npu(
     latent_cache = latent_cache.unsqueeze(1)
 
     if m.use_deepseek_yarn_rope:
-        if nsa_use_prefill_cp(forward_batch, m.enable_prefill_cp):
+        if use_pcp(forward_batch, m.enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         k_nope, k_pe = latent_cache.split(
             [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
@@ -76,7 +78,7 @@ def forward_mha_prepare_npu(
 
         latent_cache[..., : m.kv_lora_rank] = k_nope
         latent_cache[..., m.kv_lora_rank:] = k_pe
-        if nsa_use_prefill_cp(forward_batch, m.enable_prefill_cp):
+        if use_pcp(forward_batch, m.enable_prefill_cp):
             latent_cache = pcp_allgather_rearrange(
                 latent_cache.squeeze(1).contiguous(),
                 m.pcp_size,
@@ -241,12 +243,12 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if use_pcp(forward_batch, m.enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if use_pcp(forward_batch, m.enable_prefill_cp):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -377,12 +379,12 @@ def forward_dsa_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if use_pcp(forward_batch, m.nsa_enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if use_pcp(forward_batch, m.nsa_enable_prefill_cp):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -414,11 +416,12 @@ def forward_dsa_core_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
+    v: torch.Tensor=None,
 ) -> torch.Tensor:
     attn_output = m.attn_mqa(
         q_nope_out.contiguous(),
         k_nope.contiguous(),
-        k_nope.contiguous(),
+        k_nope.contiguous() if v is None else v.contiguous(),
         forward_batch,
         save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
         q_rope=q_pe.contiguous(),
