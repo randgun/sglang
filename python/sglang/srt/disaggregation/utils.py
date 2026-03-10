@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
-
+from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -28,6 +29,72 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+#########################
+# CP Transfer Metadata
+#########################
+
+def calculate_cp_transfer_metadata(
+    actual_seq_len: int,
+    cp_size: int,
+    cp_rank: int,
+    page_size: int,
+):
+    """
+    Calculate CP transfer metadata for a single request.
+    """
+    # Calculate alignment unit and aligned sequence length
+    alignment_unit = page_size * cp_size * 2
+    aligned_seq_len = ((actual_seq_len + alignment_unit - 1) // alignment_unit) * alignment_unit
+
+    # Calculate split_list
+    cp_block_num = cp_size * 2
+    seq_len_per_block = aligned_seq_len // cp_block_num
+    split_list = [seq_len_per_block] * cp_block_num
+
+    # Calculate zigzag_index
+    bs_per_cp_group = 1  # Currently only support batch=1
+    zigzag_index = list(
+        range(
+            cp_rank,
+            cp_rank + bs_per_cp_group * cp_block_num,
+            cp_block_num,
+        )
+    ) + list(
+        range(
+            cp_block_num - cp_rank - 1,
+            bs_per_cp_group * cp_block_num,
+            cp_block_num,
+        )
+    )
+
+    # Calculate cp_reverse_index
+    cp_reverse_index = []
+    for batch_id in range(bs_per_cp_group):
+        cp_reverse_index.extend(
+            list(
+                range(
+                    batch_id,
+                    cp_block_num * bs_per_cp_group,
+                    2 * bs_per_cp_group,
+                )
+            )
+            + list(
+                range(
+                    (cp_block_num - 1) * bs_per_cp_group + batch_id,
+                    0,
+                    -2 * bs_per_cp_group,
+                )
+            )
+        )
+
+    return ContextParallelMetadata(
+        split_list=split_list,
+        zigzag_index=zigzag_index,
+        cp_reverse_index=cp_reverse_index,
+        cp_size=cp_size,
+        aligned_seq_len=aligned_seq_len,
+        actual_seq_len=actual_seq_len,
+    )
 
 #########################
 # Synchronization
