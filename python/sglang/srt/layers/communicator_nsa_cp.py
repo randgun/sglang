@@ -228,7 +228,6 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         forward_batch: ForwardBatch,
         context: CommunicateContext,
         layer_norm: Optional[torch.nn.Module] = None,
-        layer_norm: Optional[torch.nn.Module] = None,
         allow_reduce_scatter: bool = False,
     ):
         # for prefill: full -> attn tp scattered
