@@ -13,6 +13,7 @@
 # ==============================================================================
 
 
+import logging
 from functools import partial
 from typing import Callable, Optional
 
@@ -36,6 +37,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
+    get_attention_tp_rank,
     get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -46,6 +48,8 @@ from sglang.srt.layers.dp_attention import get_pcp_size
 from sglang.srt.distributed.parallel_state import get_pcp_group
 
 from sglang.srt.layers.dp_attention import get_pcp_rank
+
+logger = logging.getLogger(__name__)
 
 
 def nsa_enable_prefill_cp():
@@ -173,6 +177,16 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
             return hidden_states, residual
         elif use_pcp(forward_batch) and forward_batch.cp_metadata.is_gqa:
             if hidden_states.shape[0] != 0:
+                logger.warning(
+                    "PCP GQA pre-all_reduce: rank=%s tp_rank=%s shape=%s numel=%s contiguous=%s split_list=%s rank_valid_ranges=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                    tuple(hidden_states.shape),
+                    hidden_states.numel(),
+                    hidden_states.is_contiguous(),
+                    getattr(forward_batch.cp_metadata, "split_list", None),
+                    getattr(forward_batch.cp_metadata, "rank_valid_ranges", None),
+                )
                 hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                 hidden_states, residual = layernorm(hidden_states, residual)
                 local_hidden_states = hidden_states
@@ -245,6 +259,16 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                 # hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 # input_hidden_states = hidden_states
                 if not forward_batch.cp_metadata.is_gqa:
+                    logger.warning(
+                        "PCP non-GQA pre-all_reduce: rank=%s tp_rank=%s shape=%s numel=%s contiguous=%s split_list=%s rank_valid_ranges=%s",
+                        torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                        get_attention_tp_rank(),
+                        tuple(hidden_states.shape),
+                        hidden_states.numel(),
+                        hidden_states.is_contiguous(),
+                        getattr(forward_batch.cp_metadata, "split_list", None),
+                        getattr(forward_batch.cp_metadata, "rank_valid_ranges", None),
+                    )
                     hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                     hidden_states, residual = layer_norm(hidden_states, residual)
                 else:
