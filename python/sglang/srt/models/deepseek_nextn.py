@@ -247,6 +247,25 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        if self.enable_prefill_cp and self.use_nsa:
+            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    input_ids.device,
+                    forward_batch.cp_metadata,
+                )
+        elif self.enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.pcp_rank,
+                    self.pcp_size,
+                    input_ids.device,
+                    forward_batch.cp_metadata,
+                )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

@@ -2900,6 +2900,25 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.enable_prefill_cp and self.use_nsa:
+            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    input_ids.device,
+                    forward_batch.cp_metadata,
+                )
+        elif self.enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.pcp_rank,
+                    self.pcp_size,
+                    input_ids.device,
+                    forward_batch.cp_metadata,
+                )
+
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors

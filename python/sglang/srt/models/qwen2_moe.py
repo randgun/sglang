@@ -758,6 +758,17 @@ class Qwen2MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Prepare PCP metadata if enabled
+        if self.enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.pcp_rank,
+                    self.pcp_size,
+                    input_ids.device,
+                    forward_batch.cp_metadata,
+                )
+
         hidden_states = self.model(
             input_ids,
             positions,
