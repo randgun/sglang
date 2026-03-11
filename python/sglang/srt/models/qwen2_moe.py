@@ -68,6 +68,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
     prepare_input_dp_with_cp_dsa,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
@@ -432,14 +433,9 @@ class Qwen2MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0 and use_pcp(forward_batch):
-            q = hidden_states.new_empty((0, self.q_size))
-            k = hidden_states.new_empty((0, self.kv_size))
-            v = hidden_states.new_empty((0, self.kv_size))
-        else:
-            qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.rotary_emb(positions, q, k)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -543,7 +539,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         )
 
-        if hidden_states.shape[0] != 0 or use_pcp(forward_batch):
+        if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -776,19 +772,15 @@ class Qwen2MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
-        if (
-            self.enable_prefill_cp
-            and self.pcp_size > 1
-            and forward_batch.cp_metadata is not None
-            and forward_batch.forward_mode.is_context_parallel_extend()
-        ):
-            forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                len(input_ids),
-                self.pcp_rank,
-                self.pcp_size,
-                input_ids.device,
-                forward_batch.cp_metadata,
-            )
+        if self.enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.pcp_rank,
+                    self.pcp_size,
+                    input_ids.device,
+                    forward_batch.cp_metadata,
+                )
 
         hidden_states = self.model(
             input_ids,

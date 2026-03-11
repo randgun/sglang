@@ -20,10 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
-    get_local_padded_pcp_layout,
     is_nsa_enable_prefill_cp,
-    pack_local_pcp_tensor,
-    unpack_local_pcp_tensor,
     use_pcp,
     cp_all_gather_rerange_output,
 )
@@ -1067,24 +1064,14 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        cp_layout = get_local_padded_pcp_layout(forward_batch.cp_metadata)
-        if q.shape[0] != cp_layout.rank_valid_len:
-            raise ValueError(
-                "Unexpected local PCP q length before padding: "
-                f"q_len={q.shape[0]} expected={cp_layout.rank_valid_len}"
-            )
-
-        q = pack_local_pcp_tensor(q.contiguous(), forward_batch.cp_metadata)
-        k = pack_local_pcp_tensor(k.contiguous(), forward_batch.cp_metadata)
-        v = pack_local_pcp_tensor(v.contiguous(), forward_batch.cp_metadata)
-        split_len = cp_layout.head_alloc_len
-        tail_len = cp_layout.tail_alloc_len
-        seq_len = split_len + tail_len
+        seq_len = q.shape[0]
         if seq_len == 0:
-            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+            return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
+        split_len = (seq_len + 1) // 2
 
-        q_head = q[:split_len]
-        q_tail = q[split_len:]
+        k = k.contiguous()
+        v = v.contiguous()
+        q_head, q_tail = torch.split(q, [split_len, seq_len - split_len], dim=0)
         q_head = q_head.contiguous()
         q_tail = q_tail.contiguous()
 
@@ -1113,10 +1100,8 @@ class AscendAttnBackend(AttentionBackend):
             if loop + 1 != pcp_size:
                 next_k, next_v = comm.send_recv_kv(k, v)
 
-            k_head = k[:split_len]
-            k_tail = k[split_len:]
-            v_head = v[:split_len]
-            v_tail = v[split_len:]
+            k_head, k_tail = torch.split(k, [split_len, seq_len - split_len], dim=0)
+            v_head, v_tail = torch.split(v, [split_len, seq_len - split_len], dim=0)
             if loop == 0:
                 out_head, lse_head = _forward(q_head, k_head, v_head, layer, attn_mask=True)
                 out_dtype = out_head.dtype
@@ -1143,8 +1128,7 @@ class AscendAttnBackend(AttentionBackend):
                 comm.wait()
                 k, v = next_k, next_v
 
-        out = out.to(out_dtype)
-        return unpack_local_pcp_tensor(out, forward_batch.cp_metadata)
+        return out.to(out_dtype)
 
     def forward_extend(
         self,
@@ -1194,7 +1178,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
-            if save_kv_cache and k is not None and v is not None and k.shape[0] != 0:
+            if save_kv_cache and k is not None and v is not None:
                 # support cross attention
                 cache_loc = (
                     forward_batch.out_cache_loc
