@@ -191,6 +191,8 @@ class DecodeRequest:
     kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    last_handshake_poll: Optional[int] = None
+    last_transfer_poll: Optional[int] = None
 
     @property
     def seqlen(self) -> int:
@@ -439,10 +441,20 @@ class DecodePreallocQueue:
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
+            # Handshake poll runs on a hot path. Cache the last non-terminal poll so
+            # any auxiliary logging/tracing layered above this loop only sees state
+            # transitions instead of identical poll results every iteration.
+            if poll == decode_req.last_handshake_poll and poll in (
+                KVPoll.Bootstrapping,
+                KVPoll.WaitingForInput,
+            ):
+                continue
+
             if poll == KVPoll.Bootstrapping:
-                pass
+                decode_req.last_handshake_poll = poll
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
+                decode_req.last_handshake_poll = poll
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -450,6 +462,7 @@ class DecodePreallocQueue:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.error(error_message)
+                decode_req.last_handshake_poll = poll
                 prepare_abort(
                     decode_req.req,
                     error_message,
@@ -830,6 +843,15 @@ class DecodeTransferQueue:
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+
+            # Transfer poll is also hot. Skip repeated non-terminal states so we
+            # only react when transfer state actually advances.
+            if poll == decode_req.last_transfer_poll and poll in (
+                KVPoll.Bootstrapping,
+                KVPoll.WaitingForInput,
+                KVPoll.Transferring,
+            ):
+                continue
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -837,6 +859,7 @@ class DecodeTransferQueue:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.error(error_message)
+                decode_req.last_transfer_poll = poll
                 prepare_abort(
                     decode_req.req,
                     error_message,
@@ -854,6 +877,7 @@ class DecodeTransferQueue:
             elif poll == KVPoll.Success:
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
+                    decode_req.last_transfer_poll = poll
                     indices_to_remove.add(i)
                     # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -872,7 +896,7 @@ class DecodeTransferQueue:
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                decode_req.last_transfer_poll = poll
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
