@@ -1,5 +1,4 @@
 # temp NSA debugging environ
-import os
 from itertools import accumulate
 
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -69,24 +68,6 @@ class ContextParallelMetadata:
     # Per-block page counts for CP KV transfer (zigzag order)
     block_page_counts: Optional[List[int]] = None
     is_gqa: Optional[bool] = True
-
-
-@dataclass(frozen=True)
-class LocalPaddedPCPLayout:
-    head_chunk_id: int
-    tail_chunk_id: int
-    head_alloc_len: int
-    tail_alloc_len: int
-    head_valid_len: int
-    tail_valid_len: int
-
-    @property
-    def rank_alloc_len(self) -> int:
-        return self.head_alloc_len + self.tail_alloc_len
-
-    @property
-    def rank_valid_len(self) -> int:
-        return self.head_valid_len + self.tail_valid_len
 
 
 
@@ -351,89 +332,6 @@ def cp_extract_local_tokens(forward_batch, input_: torch.Tensor):
     if not parts:
         return input_.new_empty((0, *input_.shape[1:]))
     return torch.cat(parts, dim=0).contiguous()
-
-
-def get_local_padded_pcp_layout(cp_metadata: ContextParallelMetadata) -> LocalPaddedPCPLayout:
-    assert cp_metadata is not None, "CP metadata is not available"
-    assert cp_metadata.cp_size is not None, "cp_metadata.cp_size is not initialized"
-    assert cp_metadata.cp_rank is not None, "cp_metadata.cp_rank is not initialized"
-    assert cp_metadata.split_list is not None, "cp_metadata.split_list is not initialized"
-    assert cp_metadata.actual_seq_q_prev >= 0, "cp_metadata.actual_seq_q_prev is not initialized"
-    assert cp_metadata.actual_seq_q_next >= 0, "cp_metadata.actual_seq_q_next is not initialized"
-
-    cp_segment_num = cp_metadata.cp_size * 2
-    assert len(cp_metadata.split_list) == cp_segment_num, (
-        "cp_metadata.split_list length mismatch: "
-        f"expected={cp_segment_num} got={len(cp_metadata.split_list)}"
-    )
-
-    head_chunk_id = cp_metadata.cp_rank
-    tail_chunk_id = cp_segment_num - 1 - cp_metadata.cp_rank
-    head_alloc_len = cp_metadata.split_list[head_chunk_id]
-    tail_alloc_len = cp_metadata.split_list[tail_chunk_id]
-
-    return LocalPaddedPCPLayout(
-        head_chunk_id=head_chunk_id,
-        tail_chunk_id=tail_chunk_id,
-        head_alloc_len=head_alloc_len,
-        tail_alloc_len=tail_alloc_len,
-        head_valid_len=cp_metadata.actual_seq_q_prev,
-        tail_valid_len=cp_metadata.actual_seq_q_next,
-    )
-
-
-def _pad_dim0(tensor: torch.Tensor, target_len: int) -> torch.Tensor:
-    current_len = tensor.shape[0]
-    if current_len == target_len:
-        return tensor.contiguous()
-    if current_len > target_len:
-        raise ValueError(
-            f"Cannot pad tensor to a smaller length: current={current_len}, target={target_len}"
-        )
-    pad_shape = (target_len - current_len, *tensor.shape[1:])
-    return torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=0).contiguous()
-
-
-def pack_local_pcp_tensor(
-    tensor: torch.Tensor, cp_metadata: ContextParallelMetadata
-) -> torch.Tensor:
-    layout = get_local_padded_pcp_layout(cp_metadata)
-    if tensor.shape[0] != layout.rank_valid_len:
-        raise ValueError(
-            "Local PCP tensor length mismatch: "
-            f"tensor_len={tensor.shape[0]} expected_valid_len={layout.rank_valid_len}"
-        )
-
-    head_tensor = tensor[: layout.head_valid_len]
-    tail_tensor = tensor[layout.head_valid_len :]
-    return torch.cat(
-        [
-            _pad_dim0(head_tensor, layout.head_alloc_len),
-            _pad_dim0(tail_tensor, layout.tail_alloc_len),
-        ],
-        dim=0,
-    )
-
-
-def unpack_local_pcp_tensor(
-    tensor: torch.Tensor, cp_metadata: ContextParallelMetadata
-) -> torch.Tensor:
-    layout = get_local_padded_pcp_layout(cp_metadata)
-    if tensor.shape[0] != layout.rank_alloc_len:
-        raise ValueError(
-            "Packed PCP tensor length mismatch: "
-            f"tensor_len={tensor.shape[0]} expected_alloc_len={layout.rank_alloc_len}"
-        )
-
-    head_tensor = tensor[: layout.head_alloc_len]
-    tail_tensor = tensor[layout.head_alloc_len :]
-    return torch.cat(
-        [
-            head_tensor[: layout.head_valid_len],
-            tail_tensor[: layout.tail_valid_len],
-        ],
-        dim=0,
-    ).contiguous()
 
 
 @triton.jit
@@ -815,7 +713,7 @@ def prepare_input_dp_with_cp_dsa(
     cp_metadata.attn_mask_seqlens = attn_mask_seqlens
     cp_metadata.is_gqa = is_gqa
 
-    logger.debug("attn cp_metadata=%s", cp_metadata)
+    print(f"attn cp_metadata={cp_metadata}")
     if is_enable_prefill_cp():
         return _compute_attention_metadata(
             cp_metadata,
