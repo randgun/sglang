@@ -1353,7 +1353,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=1,
+                antiquant_mode=1 if envs.SGLANG_NPU_PD_ENABLE_C8.get() else None,
                 antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_PD_ENABLE_C8.get() else None,
             )
             output = torch.empty(
