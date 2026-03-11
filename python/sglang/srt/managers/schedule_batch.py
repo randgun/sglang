@@ -1590,6 +1590,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     cp_rank=cp_rank,
                     page_size=page_size,
                 )
+                print(f"transfer cp_metadata={req.cp_metadata}")
                 # Precompute per-rank valid ranges in original sequence index space.
                 prefix_offsets = [0]
                 for block_len in req.cp_metadata.split_list:
