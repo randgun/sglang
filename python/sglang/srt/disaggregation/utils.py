@@ -92,6 +92,7 @@ def calculate_cp_transfer_metadata(
         zigzag_index=zigzag_index,
         cp_reverse_index=cp_reverse_index,
         cp_size=cp_size,
+        cp_rank=cp_rank,
         aligned_seq_len=aligned_seq_len,
         actual_seq_len=actual_seq_len,
     )

@@ -22,10 +22,11 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_rank
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
+    get_pcp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
@@ -60,11 +61,7 @@ class CommonKVManager(BaseKVManager):
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
         self.pcp_size = server_args.prefill_context_parallel_size
-        self.pcp_rank = (
-            get_tensor_model_parallel_rank() // self.attn_tp_size
-            if self.pcp_size > 1
-            else 0
-        )
+        self.pcp_rank = get_pcp_rank() if self.pcp_size > 1 else 0
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
