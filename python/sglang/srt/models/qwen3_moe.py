@@ -1013,8 +1013,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_rank,
                     self.pcp_size,
                     input_ids.device,
-                    forward_batch.cp_metadata,
-                    is_gqa=True,
+                    is_gqa=True
                 )
                 # if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
                 #     # print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\

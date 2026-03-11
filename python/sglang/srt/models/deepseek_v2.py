@@ -2907,7 +2907,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.cp_rank,
                     self.cp_size,
                     input_ids.device,
-                    forward_batch.cp_metadata,
                 )
         elif self.enable_prefill_cp:
             if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
@@ -2916,7 +2915,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.pcp_rank,
                     self.pcp_size,
                     input_ids.device,
-                    forward_batch.cp_metadata,
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
