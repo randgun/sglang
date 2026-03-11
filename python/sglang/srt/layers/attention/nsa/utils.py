@@ -572,8 +572,12 @@ def _compute_attention_metadata(
     tail_q_seqlens = [tail_chunk_len]
 
     # Compute nomask seqlens
-    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
-    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
+    head_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [head_start_global]], dtype=torch.int32
+    ).to(device=device)
+    tail_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [tail_start_global]], dtype=torch.int32
+    ).to(device=device)
 
     # Compute indices using torch.arange for efficiency
     kv_with_q_head_nomask_idx_tensor = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
@@ -599,7 +603,8 @@ def prepare_input_dp_with_cp_dsa(
     cp_rank,
     cp_size,
     device,
-    is_gqa,
+    cp_metadata: ContextParallelMetadata,
+    is_gqa=True,
 ):
     if is_nsa_prefill_cp_round_robin_split():
         return True
@@ -640,53 +645,19 @@ def prepare_input_dp_with_cp_dsa(
         * Last rank may focus on more tokens (more computation)
     - To mitigate uneven load, the input hissenstate needs to be sliced by cp_size*2 and rearranged.
     """
-    # just support batch = 1
-    kv_len = torch.tensor(kv_len)
-    bs_per_cp_group = 1
-    kv_len_origin = kv_len
-    # get zigzag index
+    actual_seq_len = cp_metadata.actual_seq_len
     cp_segment_num = cp_size * 2
-    seq_per_batch = kv_len // cp_segment_num  # seq_len for each batch and segment
-    split_list = seq_per_batch.repeat_interleave(cp_segment_num).int().tolist()
-    remainder = kv_len % (cp_segment_num)
-    if remainder > 0:
-        split_list[:remainder] = [x + 1 for x in split_list[:remainder]]
-
-    seq_max_rank_len = (kv_len + cp_size - 1) // cp_size
-    max_rank_len = seq_max_rank_len.repeat_interleave(cp_size).int().tolist()
-    zigzag_index = list(
-        range(cp_rank, cp_rank + bs_per_cp_group * cp_segment_num, cp_segment_num)
-    ) + list(
-        range(
-            cp_segment_num - cp_rank - 1,
-            bs_per_cp_group * cp_segment_num,
-            cp_segment_num,
-        )
-    )
-
-    per_rank_actual_token = list(
-        split_list[i] + split_list[cp_size * 2 - i - 1] for i in range(cp_size)
-    )
-    reverse_split_len = [
-        element
-        for i in range(cp_size)
-        for element in (split_list[i], split_list[cp_size * 2 - i - 1])
-    ]
-    # get zigzag reverse index
-    cp_reverse_index = []
-    for batch_id in range(bs_per_cp_group):
-        cp_reverse_index.extend(
-            list(range(batch_id, cp_segment_num * bs_per_cp_group, 2 * bs_per_cp_group))
-            + list(
-                range(
-                    (cp_segment_num - 1) * bs_per_cp_group + batch_id,
-                    0,
-                    -2 * bs_per_cp_group,
-                )
-            )
-        )
-
+    split_list = cp_metadata.split_list
     prefix_offsets = [0] + list(accumulate(split_list))
+    block_actual_lens = []
+    for block_idx in range(cp_segment_num):
+        block_start = prefix_offsets[block_idx]
+        block_end = prefix_offsets[block_idx + 1]
+        if block_start >= actual_seq_len:
+            block_actual_lens.append(0)
+        else:
+            block_actual_lens.append(min(block_end, actual_seq_len) - block_start)
+
     head_chunk_id = cp_rank
     tail_chunk_id = cp_segment_num - 1 - cp_rank
     head_start_global = prefix_offsets[head_chunk_id]
@@ -695,12 +666,8 @@ def prepare_input_dp_with_cp_dsa(
     tail_end_global = prefix_offsets[tail_chunk_id + 1]
     kv_len_prev = head_start_global
     kv_len_next = tail_start_global
-    actual_seq_q_prev = split_list[head_chunk_id]
-    actual_seq_q_next = split_list[tail_chunk_id]
-    kv_len_prev = head_start_global
-    kv_len_next = tail_start_global
-    actual_seq_q_prev = split_list[head_chunk_id]
-    actual_seq_q_next = split_list[tail_chunk_id]
+    actual_seq_q_prev = block_actual_lens[head_chunk_id]
+    actual_seq_q_next = block_actual_lens[tail_chunk_id]
     kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device=device, dtype=torch.int32)
     kv_len_next_tensor = torch.tensor(kv_len_next).to(device=device, dtype=torch.int32)
     actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(
@@ -710,36 +677,33 @@ def prepare_input_dp_with_cp_dsa(
         device=device, dtype=torch.int32
     )
 
-    attn_mask_seqlens = torch.tensor([[seq_per_batch], [seq_per_batch]], dtype=torch.int32)
-
-    cp_metadata = ContextParallelMetadata(
-        split_list=split_list,
-        max_rank_len=max_rank_len,
-        zigzag_index=zigzag_index,
-        per_rank_actual_token=per_rank_actual_token,
-        reverse_split_len=reverse_split_len,
-        cp_reverse_index=cp_reverse_index,
-        kv_len_prev=kv_len_prev,
-        kv_len_next=kv_len_next,
-        actual_seq_q_prev=actual_seq_q_prev,
-        actual_seq_q_next=actual_seq_q_next,
-        kv_len_prev_tensor=kv_len_prev_tensor,
-        kv_len_next_tensor=kv_len_next_tensor,
-        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
-        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
-        total_seq_lens=kv_len_origin,
-        attn_mask_seqlens=attn_mask_seqlens,
-        is_gqa=is_gqa,
+    attn_mask_seqlens = torch.tensor(
+        [[split_list[head_chunk_id]], [split_list[tail_chunk_id]]], dtype=torch.int32
     )
+
+    cp_metadata.cp_size = cp_size
+    cp_metadata.cp_rank = cp_rank
+    cp_metadata.kv_len_prev = kv_len_prev
+    cp_metadata.kv_len_next = kv_len_next
+    cp_metadata.actual_seq_q_prev = actual_seq_q_prev
+    cp_metadata.actual_seq_q_next = actual_seq_q_next
+    cp_metadata.kv_len_prev_tensor = kv_len_prev_tensor
+    cp_metadata.kv_len_next_tensor = kv_len_next_tensor
+    cp_metadata.actual_seq_q_prev_tensor = actual_seq_q_prev_tensor
+    cp_metadata.actual_seq_q_next_tensor = actual_seq_q_next_tensor
+    cp_metadata.total_seq_lens = actual_seq_len
+    cp_metadata.attn_mask_seqlens = attn_mask_seqlens
+    cp_metadata.is_gqa = is_gqa
+
     print(f"attn cp_metadata={cp_metadata}")
     if is_enable_prefill_cp():
         return _compute_attention_metadata(
             cp_metadata,
             device=device,
-            seq_per_batch=seq_per_batch,
+            seq_per_batch=split_list[head_chunk_id],
             head_start_global=head_start_global,
-            head_end_global=head_end_global,
+            head_end_global=min(head_end_global, actual_seq_len),
             tail_start_global=tail_start_global,
-            tail_end_global=tail_end_global,
+            tail_end_global=min(tail_end_global, actual_seq_len),
         )
     return cp_metadata

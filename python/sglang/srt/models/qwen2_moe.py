@@ -779,6 +779,7 @@ class Qwen2MoeForCausalLM(nn.Module):
                     self.pcp_rank,
                     self.pcp_size,
                     input_ids.device,
+                    forward_batch.cp_metadata,
                 )
 
         hidden_states = self.model(

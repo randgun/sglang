@@ -992,8 +992,9 @@ class AscendAttnBackend(AttentionBackend):
         seq_len = q.shape[0]
         if seq_len == 0:
             return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
-        split_len = (seq_len + 1) // 2
-        tail_len = seq_len - split_len
+        pcp_metadata = forward_batch.cp_metadata
+        split_len = pcp_metadata.actual_seq_q_prev
+        tail_len = pcp_metadata.actual_seq_q_next
 
         q_head, q_tail = torch.split(q, [split_len, tail_len], dim=0)
 
@@ -1003,16 +1004,16 @@ class AscendAttnBackend(AttentionBackend):
         # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
         #     print(f"+++ fia pcp q is {layer.layer_id=} {seq_len=} {split_len=} {tail_len=}")
 
-        pcp_metadata = forward_batch.cp_metadata
         atten_mask = self.fia_mask
 
         kv_with_q_head_nomask_idx = pcp_metadata.kv_with_q_head_nomask_idx
         kv_with_q_head_mask_idx = pcp_metadata.kv_with_q_head_mask_idx
         kv_with_q_tail_nomask_idx = pcp_metadata.kv_with_q_tail_nomask_idx
         kv_with_q_tail_mask_idx = pcp_metadata.kv_with_q_tail_mask_idx
-        attn_mask_seqlens = pcp_metadata.attn_mask_seqlens
-        head_attn_nomask_seqlens = pcp_metadata.head_attn_nomask_seqlens
-        tail_attn_nomask_seqlens = pcp_metadata.tail_attn_nomask_seqlens
+        head_mask_seqlens = [split_len, split_len]
+        tail_mask_seqlens = [tail_len, tail_len]
+        head_nomask_seqlens = [split_len, pcp_metadata.kv_len_prev]
+        tail_nomask_seqlens = [tail_len, pcp_metadata.kv_len_next]
         # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
         #     print(f"+++ fia pcp get metadata rank:{torch.distributed.get_rank()} {attn_mask_seqlens=} {head_attn_nomask_seqlens=} {tail_attn_nomask_seqlens=}\
         #         {head_q_seqlens=} {tail_q_seqlens=},{kv_with_q_head_mask_idx=} {kv_with_q_head_nomask_idx=} {kv_with_q_tail_mask_idx=} {kv_with_q_tail_nomask_idx=}")
@@ -1023,9 +1024,9 @@ class AscendAttnBackend(AttentionBackend):
             v=v,
             kv_mask_idx=kv_with_q_head_mask_idx,
             kv_nomask_idx=kv_with_q_head_nomask_idx,
-            kv_mask_seqlens=attn_mask_seqlens,
-            kv_nomask_seqlens=head_attn_nomask_seqlens,
-            q_seqlens=attn_mask_seqlens,
+            kv_mask_seqlens=head_mask_seqlens,
+            kv_nomask_seqlens=head_nomask_seqlens,
+            q_seqlens=head_mask_seqlens,
             layer=layer,
             atten_mask=atten_mask,
         )
@@ -1040,9 +1041,9 @@ class AscendAttnBackend(AttentionBackend):
                 v=v,
                 kv_mask_idx=kv_with_q_tail_mask_idx,
                 kv_nomask_idx=kv_with_q_tail_nomask_idx,
-                q_seqlens=attn_mask_seqlens,
-                kv_nomask_seqlens=tail_attn_nomask_seqlens,
-                kv_mask_seqlens=attn_mask_seqlens,
+                q_seqlens=tail_mask_seqlens,
+                kv_nomask_seqlens=tail_nomask_seqlens,
+                kv_mask_seqlens=tail_mask_seqlens,
                 layer=layer,
                 atten_mask=atten_mask,
             )
