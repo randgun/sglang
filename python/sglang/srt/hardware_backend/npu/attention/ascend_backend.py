@@ -1216,20 +1216,20 @@ class AscendAttnBackend(AttentionBackend):
                 #     print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=},{q[:2, :5,:5]=},{k[:2, :5,:5]=},{v[:2, :5,:5]=}")
 
                 if use_pcp(forward_batch):
-                    # attn_output = self.forward_ring_pcp(
-                    #     q=q,
-                    #     k=k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                    #     v=v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    #     layer=layer,
-                    #     forward_batch=forward_batch,
-                    # )
-                    attn_output = self.forward_fia_pcp(
+                    attn_output = self.forward_ring_pcp(
                         q=q,
                         k=k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
                         v=v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
                         layer=layer,
                         forward_batch=forward_batch,
                     )
+                    # attn_output = self.forward_fia_pcp(
+                    #     q=q,
+                    #     k=k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    #     v=v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    #     layer=layer,
+                    #     forward_batch=forward_batch,
+                    # )
                 else:
                     """FIA will support multi-bs in the later version of CANN"""
                     attn_output = torch.empty(
