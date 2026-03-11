@@ -20,8 +20,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
-    cp_extract_local_tokens,
+    get_local_padded_pcp_layout,
     is_nsa_enable_prefill_cp,
+    pack_local_pcp_tensor,
+    unpack_local_pcp_tensor,
     use_pcp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1064,29 +1066,26 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        cp_metadata = forward_batch.cp_metadata
-        assert cp_metadata is not None
-
-        head_padded_len = cp_metadata.head_padded_len
-        tail_padded_len = cp_metadata.tail_padded_len
-        seq_len = head_padded_len + tail_padded_len
-        if seq_len == 0:
-            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
-        if q.shape[0] != seq_len:
+        cp_layout = get_local_padded_pcp_layout(forward_batch.cp_metadata)
+        if q.shape[0] != cp_layout.rank_valid_len:
             raise ValueError(
-                f"Unexpected padded PCP q length: got={q.shape[0]} expected={seq_len}"
+                "Unexpected local PCP q length before padding: "
+                f"q_len={q.shape[0]} expected={cp_layout.rank_valid_len}"
             )
 
-        q_head_actual = max(cp_metadata.actual_seq_q_prev, 0)
-        q_tail_actual = max(cp_metadata.actual_seq_q_next, 0)
-        q_head_padded, q_tail_padded = torch.split(
-            q, [head_padded_len, tail_padded_len], dim=0
-        )
-        q_head = q_head_padded[:q_head_actual].contiguous()
-        q_tail = q_tail_padded[:q_tail_actual].contiguous()
+        q = pack_local_pcp_tensor(q.contiguous(), forward_batch.cp_metadata)
+        k = pack_local_pcp_tensor(k.contiguous(), forward_batch.cp_metadata)
+        v = pack_local_pcp_tensor(v.contiguous(), forward_batch.cp_metadata)
+        split_len = cp_layout.head_alloc_len
+        tail_len = cp_layout.tail_alloc_len
+        seq_len = split_len + tail_len
+        if seq_len == 0:
+            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
 
-        k = k.contiguous()
-        v = v.contiguous()
+        q_head = q[:split_len]
+        q_tail = q[split_len:]
+        q_head = q_head.contiguous()
+        q_tail = q_tail.contiguous()
 
         def _forward(
             q_chunk: torch.Tensor,
@@ -1139,17 +1138,10 @@ class AscendAttnBackend(AttentionBackend):
             if loop + 1 != pcp_size:
                 next_k, next_v = comm.send_recv_kv(k, v)
 
-            k_head_padded, k_tail_padded = torch.split(
-                k, [head_padded_len, tail_padded_len], dim=0
-            )
-            v_head_padded, v_tail_padded = torch.split(
-                v, [head_padded_len, tail_padded_len], dim=0
-            )
-            k_head = k_head_padded[:source_head_actual].contiguous()
-            v_head = v_head_padded[:source_head_actual].contiguous()
-            k_tail = k_tail_padded[:source_tail_actual].contiguous()
-            v_tail = v_tail_padded[:source_tail_actual].contiguous()
-
+            k_head = k[:split_len]
+            k_tail = k[split_len:]
+            v_head = v[:split_len]
+            v_tail = v[split_len:]
             if loop == 0:
                 out_part, lse_part = _forward(q_head, k_head, v_head, attn_mask=True)
                 if out_part is not None:
@@ -1176,17 +1168,8 @@ class AscendAttnBackend(AttentionBackend):
                 comm.wait()
                 k, v = next_k, next_v
 
-        output = q.new_zeros(
-            (seq_len, layer.tp_q_head_num * layer.v_head_dim),
-            dtype=out_dtype,
-        )
-        if head_out is not None and q_head_actual > 0:
-            output[:q_head_actual].copy_(head_out.reshape(q_head_actual, -1))
-        if tail_out is not None and q_tail_actual > 0:
-            output[
-                head_padded_len : head_padded_len + q_tail_actual
-            ].copy_(tail_out.reshape(q_tail_actual, -1))
-        return output.to(q.dtype)
+        out = out.to(out_dtype)
+        return unpack_local_pcp_tensor(out, forward_batch.cp_metadata)
 
     def forward_extend(
         self,
@@ -1236,7 +1219,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
-            if save_kv_cache and k is not None and v is not None:
+            if save_kv_cache and k is not None and v is not None and k.shape[0] != 0:
                 # support cross attention
                 cache_loc = (
                     forward_batch.out_cache_loc

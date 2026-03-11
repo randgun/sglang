@@ -38,7 +38,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size, pcp_ag_rearange_output
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -61,6 +61,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.attention.nsa.utils import (
+    prepare_input_dp_with_cp_dsa,
     is_enable_prefill_cp,
     cp_pad_local_tokens,
     use_pcp,
@@ -541,14 +542,18 @@ class Qwen3MoeAttention(nn.Module):
             and self.enable_prefill_cp
             and use_pcp(forward_batch)
         ):
-            # Avoid NPU rope on empty tensors; still participate in PCP comms.
-            empty_kv = torch.empty(
-                (0, self.kv_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+            # Avoid NPU rope on empty tensors while still entering the PCP ring path.
+            self._used_fused_qk_norm_rope_last_call = False
+            return (
+                None,
+                forward_batch,
+                (
+                    hidden_states.new_empty((0, self.q_size)),
+                    hidden_states.new_empty((0, self.kv_size)),
+                    hidden_states.new_empty((0, self.kv_size)),
+                    forward_batch,
+                ),
             )
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
-            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -580,14 +585,18 @@ class Qwen3MoeAttention(nn.Module):
             and self.enable_prefill_cp
             and use_pcp(forward_batch)
         ):
-            # Avoid rope on empty tensors; still participate in PCP comms.
-            empty_kv = torch.empty(
-                (0, self.kv_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+            # Avoid rope on empty tensors while still entering the PCP ring path.
+            self._used_fused_qk_norm_rope_last_call = False
+            return (
+                None,
+                forward_batch,
+                (
+                    hidden_states.new_empty((0, self.q_size)),
+                    hidden_states.new_empty((0, self.kv_size)),
+                    hidden_states.new_empty((0, self.kv_size)),
+                    forward_batch,
+                ),
             )
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
-            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
@@ -1004,22 +1013,26 @@ class Qwen3MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp and self.pcp_size > 1:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
-                    input_ids.device,
-                    forward_batch.cp_metadata,
-                    is_gqa=True,
-                )
-                # if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
-                #     # print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
-                #     {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
-                #     # print(f"[rank={torch.distributed.get_rank()}] "
-                #         f"pcp_rank={self.pcp_rank}, "
-                #         f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
+        if (
+            self.enable_prefill_cp
+            and self.pcp_size > 1
+            and forward_batch.cp_metadata is not None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
+                len(input_ids),
+                self.pcp_rank,
+                self.pcp_size,
+                input_ids.device,
+                forward_batch.cp_metadata,
+                is_gqa=True,
+            )
+            # if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
+            #     # print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
+            #     {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
+            #     # print(f"[rank={torch.distributed.get_rank()}] "
+            #         f"pcp_rank={self.pcp_rank}, "
+            #         f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
 
         hidden_states = self.model(
             input_ids,
