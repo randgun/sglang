@@ -148,7 +148,6 @@ def calculate_cp_metadata(
         actual_seq_q_next=tail_actual_len,
         total_seq_lens=actual_seq_len,
         cp_size=cp_size,
-        cp_rank=cp_rank,
         aligned_seq_len=aligned_seq_len,
         actual_seq_len=actual_seq_len,
         is_gqa=is_gqa,
