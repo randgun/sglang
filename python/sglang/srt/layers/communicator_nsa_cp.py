@@ -187,17 +187,72 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                     getattr(forward_batch.cp_metadata, "split_list", None),
                     getattr(forward_batch.cp_metadata, "rank_valid_ranges", None),
                 )
+                logger.warning(
+                    "PCP GQA entering all_reduce: rank=%s tp_rank=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                )
                 hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                logger.warning(
+                    "PCP GQA finished all_reduce: rank=%s tp_rank=%s shape=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                    tuple(hidden_states.shape),
+                )
+                logger.warning(
+                    "PCP GQA entering layernorm: rank=%s tp_rank=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                )
                 hidden_states, residual = layernorm(hidden_states, residual)
+                logger.warning(
+                    "PCP GQA finished layernorm: rank=%s tp_rank=%s hidden_shape=%s residual_shape=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                    tuple(hidden_states.shape),
+                    tuple(residual.shape) if residual is not None else None,
+                )
                 local_hidden_states = hidden_states
                 pcp_size = get_pcp_size()
+                logger.warning(
+                    "PCP GQA allocating gather buffer: rank=%s tp_rank=%s pcp_size=%s local_shape=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                    pcp_size,
+                    tuple(local_hidden_states.shape),
+                )
                 hidden_states = torch.empty(pcp_size, hidden_states.shape[0], hidden_states.shape[1],
                                             device=hidden_states.device,
                                             dtype=hidden_states.dtype)
+                logger.warning(
+                    "PCP GQA entering cp_all_gather_async: rank=%s tp_rank=%s gather_shape=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                    tuple(hidden_states.shape),
+                )
                 get_pcp_group().cp_all_gather_into_tensor_async(
                     hidden_states, local_hidden_states, torch.npu.current_stream()
                 )
-            return hidden_states.reshape(-1, hidden_states.shape[-1]), residual
+                logger.warning(
+                    "PCP GQA issued cp_all_gather_async: rank=%s tp_rank=%s gather_shape=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    get_attention_tp_rank(),
+                    tuple(hidden_states.shape),
+                )
+            logger.warning(
+                "PCP GQA entering reshape: rank=%s tp_rank=%s shape=%s",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                get_attention_tp_rank(),
+                tuple(hidden_states.shape),
+            )
+            reshaped_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+            logger.warning(
+                "PCP GQA finished reshape: rank=%s tp_rank=%s shape=%s",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                get_attention_tp_rank(),
+                tuple(reshaped_hidden_states.shape),
+            )
+            return reshaped_hidden_states, residual
         else:
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = layernorm(hidden_states, residual)
