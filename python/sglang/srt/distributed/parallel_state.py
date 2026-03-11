@@ -1687,16 +1687,28 @@ def initialize_model_parallel(
         group_name="pp",
     )
     global _PCP
-    # Build PCP groups aligned with TP groups to avoid cross-group communication
-    # mismatches when only a subset of TP ranks process a request.
+    # Build PCP groups across logical CP shards while keeping the same attention-TP
+    # coordinate in each group. For tp_size=4, pcp_size=2 this yields [0, 2] and
+    # [1, 3], so get_context_parallel_rank() matches the logical PCP shard rank
+    # used by dp_attention/get_pcp_rank().
     if prefill_context_parallel_size > 1:
+        assert (
+            tensor_model_parallel_size % prefill_context_parallel_size == 0
+        ), (
+            "tensor_model_parallel_size must be divisible by "
+            "prefill_context_parallel_size"
+        )
         tp_group_count = get_world_size() // tensor_model_parallel_size
+        attn_tp_size = tensor_model_parallel_size // prefill_context_parallel_size
         group_ranks = []
         for tp_group_idx in range(tp_group_count):
             tp_base = tp_group_idx * tensor_model_parallel_size
-            for offset in range(0, tensor_model_parallel_size, prefill_context_parallel_size):
+            for attn_tp_rank in range(attn_tp_size):
                 group_ranks.append(
-                    list(range(tp_base + offset, tp_base + offset + prefill_context_parallel_size))
+                    [
+                        tp_base + attn_tp_rank + pcp_rank * attn_tp_size
+                        for pcp_rank in range(prefill_context_parallel_size)
+                    ]
                 )
     else:
         group_ranks = [list(range(get_world_size()))]
