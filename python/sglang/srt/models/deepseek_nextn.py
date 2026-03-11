@@ -256,17 +256,17 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
-                    forward_batch.cp_metadata,
                 )
         elif self.enable_prefill_cp:
             if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
-                    forward_batch.cp_metadata,
                 )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
