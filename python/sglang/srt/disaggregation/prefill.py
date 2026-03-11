@@ -50,7 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_pcp_rank
+from sglang.srt.layers.dp_attention import get_pcp_rank
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -119,7 +119,7 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
-        kv_args.engine_rank = get_attention_tp_rank()
+        kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
@@ -199,7 +199,7 @@ class PrefillBootstrapQueue:
         else:
             kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
 
-        dest_tp_ranks = [get_attention_tp_rank()]
+        dest_tp_ranks = [self.tp_rank]
 
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
