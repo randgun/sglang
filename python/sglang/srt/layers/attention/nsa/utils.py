@@ -64,7 +64,7 @@ class ContextParallelMetadata:
     actual_seq_len: Optional[int] = None
     # Per-block page counts for CP KV transfer (zigzag order)
     block_page_counts: Optional[List[int]] = None
-    is_gqa: Optional[bool] = False
+    is_gqa: Optional[bool] = True
 
 
 
