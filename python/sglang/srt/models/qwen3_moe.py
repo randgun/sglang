@@ -601,12 +601,12 @@ class Qwen3MoeAttention(nn.Module):
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
 
-        # if self.enable_prefill_cp and use_pcp(forward_batch):
-        #     # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
-        #         # print(f"+++[Qwen3MoeAttention] before _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")
-        #     k,v = self._rebuild_pcp_kv(k, v, forward_batch)
-        #     # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
-        #         # print(f"+++[Qwen3MoeAttention] after _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")
+        if self.enable_prefill_cp and use_pcp(forward_batch):
+            # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
+                # print(f"+++[Qwen3MoeAttention] before _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")
+            k,v = self._rebuild_pcp_kv(k, v, forward_batch)
+            # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
+                # print(f"+++[Qwen3MoeAttention] after _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")
 
         inner_state = q, k, v, forward_batch
 
