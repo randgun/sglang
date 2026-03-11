@@ -746,6 +746,7 @@ def prepare_input_dp_with_cp_dsa(
         attn_mask_seqlens=attn_mask_seqlens,
         is_gqa=is_gqa,
     )
+    print(f"attn cp_metadata={cp_metadata}")
     if is_enable_prefill_cp():
         return _compute_attention_metadata(
             cp_metadata,
