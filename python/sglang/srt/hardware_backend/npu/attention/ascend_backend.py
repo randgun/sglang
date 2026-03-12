@@ -1248,6 +1248,9 @@ class AscendAttnBackend(AttentionBackend):
                 if use_pcp(forward_batch):
                     cache_k = cp_extract_local_tokens(forward_batch, k)
                     cache_v = cp_extract_local_tokens(forward_batch, v)
+                    # ForwardBatch may pad out_cache_loc later for attn-TP scatter.
+                    # PCP KV cache writes must still use only the real local token slots.
+                    cache_loc = cache_loc[: cache_k.shape[0]]
                 if cache_loc.shape[0] != cache_k.shape[0]:
                     raise ValueError(
                         "Unexpected PCP KV cache write length mismatch: "
