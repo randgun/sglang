@@ -78,6 +78,10 @@ class ContextParallelMetadata:
     max_rank_len: Optional[List[int]] = None
     zigzag_index: Optional[List[int]] = None
     per_rank_actual_token: Optional[List[int]] = None
+    per_rank_head_actual_token: Optional[List[int]] = None
+    per_rank_tail_actual_token: Optional[List[int]] = None
+    head_padded_len: int = 0
+    tail_padded_len: int = 0
     reverse_split_len: Optional[List[int]] = None
     cp_reverse_index: Optional[List[int]] = None
     # Per-rank valid ranges (in original sequence index space), computed
@@ -288,6 +292,69 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         dim=-1,
     )
     return positions
+
+def cp_pad_local_tokens(forward_batch, input_: torch.Tensor):
+    cp_metadata = getattr(forward_batch, "cp_metadata", None)
+    if cp_metadata is None:
+        return input_
+
+    head_actual = max(cp_metadata.actual_seq_q_prev, 0)
+    tail_actual = max(cp_metadata.actual_seq_q_next, 0)
+    actual_total = head_actual + tail_actual
+    padded_head = max(cp_metadata.head_padded_len, head_actual)
+    padded_tail = max(cp_metadata.tail_padded_len, tail_actual)
+    padded_total = padded_head + padded_tail
+
+    if padded_total == actual_total or input_.shape[0] == padded_total:
+        return input_
+
+    if input_.shape[0] != actual_total:
+        raise ValueError(
+            "Unexpected local CP token count before padding: "
+            f"got={input_.shape[0]} expected={actual_total}"
+        )
+
+    output = input_.new_zeros((padded_total, *input_.shape[1:]))
+    offset = 0
+    if head_actual > 0:
+        output[:head_actual].copy_(input_[:head_actual])
+        offset += head_actual
+    if tail_actual > 0:
+        output[padded_head : padded_head + tail_actual].copy_(
+            input_[offset : offset + tail_actual]
+        )
+    return output
+
+
+def cp_extract_local_tokens(forward_batch, input_: torch.Tensor):
+    cp_metadata = getattr(forward_batch, "cp_metadata", None)
+    if cp_metadata is None:
+        return input_
+
+    head_actual = max(cp_metadata.actual_seq_q_prev, 0)
+    tail_actual = max(cp_metadata.actual_seq_q_next, 0)
+    actual_total = head_actual + tail_actual
+    padded_head = max(cp_metadata.head_padded_len, head_actual)
+    padded_total = padded_head + max(cp_metadata.tail_padded_len, tail_actual)
+
+    if input_.shape[0] == actual_total:
+        return input_
+    if input_.shape[0] == 0 and actual_total == 0:
+        return input_
+    if input_.shape[0] != padded_total:
+        raise ValueError(
+            "Unexpected local CP token count before extraction: "
+            f"got={input_.shape[0]} expected={padded_total}"
+        )
+
+    parts = []
+    if head_actual > 0:
+        parts.append(input_[:head_actual])
+    if tail_actual > 0:
+        parts.append(input_[padded_head : padded_head + tail_actual])
+    if not parts:
+        return input_.new_empty((0, *input_.shape[1:]))
+    return torch.cat(parts, dim=0).contiguous()
 
 
 @triton.jit

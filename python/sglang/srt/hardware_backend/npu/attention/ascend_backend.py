@@ -20,9 +20,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
+    cp_extract_local_tokens,
     is_nsa_enable_prefill_cp,
     use_pcp,
-    cp_all_gather_rerange_output,
 )
 from sglang.srt.layers.dp_attention import (
     get_pcp_group,
@@ -1063,22 +1063,46 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        seq_len = q.shape[0]
+        cp_metadata = forward_batch.cp_metadata
+        assert cp_metadata is not None
+
+        head_padded_len = cp_metadata.head_padded_len
+        tail_padded_len = cp_metadata.tail_padded_len
+        seq_len = head_padded_len + tail_padded_len
         if seq_len == 0:
-            return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
-        split_len = (seq_len + 1) // 2
+            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+        if q.shape[0] != seq_len:
+            raise ValueError(
+                f"Unexpected padded PCP q length: got={q.shape[0]} expected={seq_len}"
+            )
+
+        q_head_actual = max(cp_metadata.actual_seq_q_prev, 0)
+        q_tail_actual = max(cp_metadata.actual_seq_q_next, 0)
+        q_head_padded, q_tail_padded = torch.split(
+            q, [head_padded_len, tail_padded_len], dim=0
+        )
+        q_head = q_head_padded[:q_head_actual].contiguous()
+        q_tail = q_tail_padded[:q_tail_actual].contiguous()
 
         k = k.contiguous()
         v = v.contiguous()
-        q_head, q_tail = torch.split(q, [split_len, seq_len - split_len], dim=0)
-        q_head = q_head.contiguous()
-        q_tail = q_tail.contiguous()
 
-        def _forward(q, k, v, layer, attn_mask):
-            attn_out, lse = torch.ops.npu.npu_fused_infer_attention_score(
-                q.unsqueeze(0),
-                k.unsqueeze(0),
-                v.unsqueeze(0),
+        def _forward(
+            q_chunk: torch.Tensor,
+            k_chunk: torch.Tensor,
+            v_chunk: torch.Tensor,
+            attn_mask: bool,
+        ):
+            if (
+                q_chunk.shape[0] == 0
+                or k_chunk.shape[0] == 0
+                or v_chunk.shape[0] == 0
+            ):
+                return None, None
+            return torch.ops.npu.npu_fused_infer_attention_score(
+                q_chunk.unsqueeze(0),
+                k_chunk.unsqueeze(0),
+                v_chunk.unsqueeze(0),
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="BSND",
@@ -1089,45 +1113,79 @@ class AscendAttnBackend(AttentionBackend):
                 inner_precise=0,
                 softmax_lse_flag=True,
             )
-            return attn_out, lse
+
+        def _accumulate(
+            cur_out: Optional[torch.Tensor],
+            cur_lse: Optional[torch.Tensor],
+            new_out: Optional[torch.Tensor],
+            new_lse: Optional[torch.Tensor],
+        ):
+            if new_out is None:
+                return cur_out, cur_lse
+            return update_out_and_lse(cur_out, cur_lse, new_out, new_lse)
 
         comm = RingComm(get_pcp_group().device_group)
-        out, lse, out_dtype = None, None, None
+        head_out, head_lse = None, None
+        tail_out, tail_lse = None, None
+        out_dtype = q.dtype
         next_k, next_v = None, None
         pcp_size = get_pcp_size()
         for loop in range(pcp_size):
+            source_rank = (comm.pcp_rank - loop) % pcp_size
+            source_head_actual = cp_metadata.per_rank_head_actual_token[source_rank]
+            source_tail_actual = cp_metadata.per_rank_tail_actual_token[source_rank]
+
             if loop + 1 != pcp_size:
                 next_k, next_v = comm.send_recv_kv(k, v)
 
-            k_head, k_tail = torch.split(k, [split_len, seq_len - split_len], dim=0)
-            v_head, v_tail = torch.split(v, [split_len, seq_len - split_len], dim=0)
+            k_head_padded, k_tail_padded = torch.split(
+                k, [head_padded_len, tail_padded_len], dim=0
+            )
+            v_head_padded, v_tail_padded = torch.split(
+                v, [head_padded_len, tail_padded_len], dim=0
+            )
+            k_head = k_head_padded[:source_head_actual].contiguous()
+            v_head = v_head_padded[:source_head_actual].contiguous()
+            k_tail = k_tail_padded[:source_tail_actual].contiguous()
+            v_tail = v_tail_padded[:source_tail_actual].contiguous()
+
             if loop == 0:
-                out_head, lse_head = _forward(q_head, k_head, v_head, layer, attn_mask=True)
-                out_dtype = out_head.dtype
-                out_tail1, lse_tail1 = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
-                out_tail2, lse_tail2 = _forward(q_tail, k_tail, v_tail, layer, attn_mask=True)
-                out_tail, lse_tail = update_out_and_lse(out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True)
-                block_out = torch.cat([out_head, out_tail], dim=1)
-                lse_head = lse_head.transpose(1, 2)
-                block_lse = torch.cat([lse_head, lse_tail], dim=1)
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_trans=False)
+                out_part, lse_part = _forward(q_head, k_head, v_head, attn_mask=True)
+                if out_part is not None:
+                    out_dtype = out_part.dtype
+                head_out, head_lse = _accumulate(head_out, head_lse, out_part, lse_part)
+
+                out_part, lse_part = _forward(q_tail, k_head, v_head, attn_mask=False)
+                tail_out, tail_lse = _accumulate(tail_out, tail_lse, out_part, lse_part)
+                out_part, lse_part = _forward(q_tail, k_tail, v_tail, attn_mask=True)
+                tail_out, tail_lse = _accumulate(tail_out, tail_lse, out_part, lse_part)
             elif loop <= comm.pcp_rank:
-                out_head, lse_head = _forward(q_head, k_head, v_head, layer, attn_mask=False)
-                out_tail, lse_tail = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
-                block_out = torch.cat([out_head, out_tail], dim=1)
-                block_lse = torch.cat([lse_head, lse_tail], dim=2)
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+                out_part, lse_part = _forward(q_head, k_head, v_head, attn_mask=False)
+                head_out, head_lse = _accumulate(head_out, head_lse, out_part, lse_part)
+
+                out_part, lse_part = _forward(q_tail, k_head, v_head, attn_mask=False)
+                tail_out, tail_lse = _accumulate(tail_out, tail_lse, out_part, lse_part)
             else:
-                out_tail1, lse_tail1 = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
-                out_tail2, lse_tail2 = _forward(q_tail, k_tail, v_tail, layer, attn_mask=False)
-                out_tail, lse_tail = update_out_and_lse(out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True)
-                out[:, split_len:], lse[:, split_len:] = update_out_and_lse(out[:, split_len:], lse[:, split_len:], out_tail, lse_tail, lse_trans=False)
+                out_part, lse_part = _forward(q_tail, k_head, v_head, attn_mask=False)
+                tail_out, tail_lse = _accumulate(tail_out, tail_lse, out_part, lse_part)
+                out_part, lse_part = _forward(q_tail, k_tail, v_tail, attn_mask=False)
+                tail_out, tail_lse = _accumulate(tail_out, tail_lse, out_part, lse_part)
 
             if loop + 1 != pcp_size:
                 comm.wait()
                 k, v = next_k, next_v
 
-        return out.to(out_dtype)
+        output = q.new_zeros(
+            (seq_len, layer.tp_q_head_num * layer.v_head_dim),
+            dtype=out_dtype,
+        )
+        if head_out is not None and q_head_actual > 0:
+            output[:q_head_actual].copy_(head_out.reshape(q_head_actual, -1))
+        if tail_out is not None and q_tail_actual > 0:
+            output[
+                head_padded_len : head_padded_len + q_tail_actual
+            ].copy_(tail_out.reshape(q_tail_actual, -1))
+        return output.to(q.dtype)
 
     def forward_extend(
         self,
@@ -1186,8 +1244,18 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 # if torch.distributed.get_rank() in (0,4) and layer.layer_id  == 0:
                 #     print(f"+++[ascend backend] save kv cache: {k.shape=},{v.shape=},{cache_loc.shape=}")
-
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                cache_k, cache_v = k, v
+                if use_pcp(forward_batch):
+                    cache_k = cp_extract_local_tokens(forward_batch, k)
+                    cache_v = cp_extract_local_tokens(forward_batch, v)
+                if cache_loc.shape[0] != cache_k.shape[0]:
+                    raise ValueError(
+                        "Unexpected PCP KV cache write length mismatch: "
+                        f"cache_loc={cache_loc.shape[0]} cache_k={cache_k.shape[0]}"
+                    )
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, cache_k, cache_v
+                )
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
