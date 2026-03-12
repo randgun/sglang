@@ -1628,46 +1628,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     page_size=page_size,
                     device=self.device,
                 )
-                # Precompute per-rank valid ranges in original sequence index space.
-                prefix_offsets = [0]
-                for block_len in req.cp_metadata.split_list:
-                    prefix_offsets.append(prefix_offsets[-1] + block_len)
-                rank_valid_ranges = []
-                for block_idx in req.cp_metadata.zigzag_index:
-                    block_start = prefix_offsets[block_idx]
-                    block_end = prefix_offsets[block_idx + 1]
-                    if block_start < actual_seq_len:
-                        valid_end = min(block_end, actual_seq_len)
-                        rank_valid_ranges.append((block_start, valid_end))
-                req.cp_metadata.rank_valid_ranges = rank_valid_ranges
-                # Build actual block lengths (intersected with real sequence length).
-                cp_block_num = cp_size * 2
-                block_actual_lens = []
-                for block_idx in range(cp_block_num):
-                    block_start = prefix_offsets[block_idx]
-                    block_end = prefix_offsets[block_idx + 1]
-                    if block_start >= actual_seq_len:
-                        block_actual_lens.append(0)
-                    else:
-                        block_actual_lens.append(min(block_end, actual_seq_len) - block_start)
-                # Per-rank actual token counts and max rank length.
-                per_rank_actual_token = []
-                for r in range(cp_size):
-                    head = r
-                    tail = cp_block_num - 1 - r
-                    per_rank_actual_token.append(
-                        block_actual_lens[head] + block_actual_lens[tail]
-                    )
-                max_rank_len = max(per_rank_actual_token) if per_rank_actual_token else 0
-                req.cp_metadata.per_rank_actual_token = per_rank_actual_token
-                req.cp_metadata.max_rank_len = [max_rank_len] * cp_size
-                # Reverse split lengths in zigzag order, clipped to actual length.
-                reverse_split_len = []
-                for r in range(cp_size):
-                    reverse_split_len.append(block_actual_lens[r])
-                    reverse_split_len.append(block_actual_lens[cp_block_num - 1 - r])
-                req.cp_metadata.reverse_split_len = reverse_split_len
-                req.cp_metadata.total_seq_lens = actual_seq_len
 
                 # Calculate extend tokens for current CP_Rank (allocation length)
                 prefix_len = len(req.prefix_indices)
