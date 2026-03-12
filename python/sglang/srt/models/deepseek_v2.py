@@ -57,13 +57,11 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
     is_enable_prefill_cp
 )
 from sglang.srt.layers.communicator import (
@@ -2902,23 +2900,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.enable_prefill_cp and self.use_nsa:
-            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    input_ids.device,
-                )
-        elif self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
-                    input_ids.device,
-                )
-
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors

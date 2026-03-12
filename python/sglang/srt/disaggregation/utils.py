@@ -3,10 +3,11 @@ from __future__ import annotations
 import dataclasses
 import os
 import random
+from itertools import accumulate
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -33,14 +34,16 @@ class DisaggregationMode(Enum):
 # CP Transfer Metadata
 #########################
 
-def calculate_cp_transfer_metadata(
+def calculate_cp_metadata(
     actual_seq_len: int,
     cp_size: int,
     cp_rank: int,
     page_size: int,
+    device: Optional[Union[str, torch.device]] = None,
+    is_gqa: bool = True,
 ):
     """
-    Calculate CP transfer metadata for a single request.
+    Build the canonical CP metadata shared by allocation, transfer, and compute
     """
     # Calculate alignment unit and aligned sequence length
     alignment_unit = page_size * cp_size * 2
@@ -70,31 +73,90 @@ def calculate_cp_transfer_metadata(
     # Calculate cp_reverse_index
     cp_reverse_index = []
     for batch_id in range(bs_per_cp_group):
-        cp_reverse_index.extend(
-            list(
-                range(
-                    batch_id,
-                    cp_block_num * bs_per_cp_group,
-                    2 * bs_per_cp_group,
-                )
-            )
-            + list(
-                range(
-                    (cp_block_num - 1) * bs_per_cp_group + batch_id,
-                    0,
-                    -2 * bs_per_cp_group,
-                )
-            )
-        )
+        cp_reverse_index.extend(list(range(batch_id,cp_block_num * bs_per_cp_group, 2 * bs_per_cp_group,))
+            + list(range((cp_block_num - 1) * bs_per_cp_group + batch_id, 0, -2 * bs_per_cp_group,)))
 
-    return ContextParallelMetadata(
+    prefix_offsets = [0] + list(accumulate(split_list))
+    block_actual_lens = []
+    for block_idx in range(cp_block_num):
+        block_start = prefix_offsets[block_idx]
+        block_end = prefix_offsets[block_idx + 1]
+        if block_start >= actual_seq_len:
+            block_actual_lens.append(0)
+        else:
+            block_actual_lens.append(min(block_end, actual_seq_len) - block_start)
+
+
+    rank_valid_ranges: List[Tuple[int, int]] = []
+    for block_idx in zigzag_index:
+        block_start = prefix_offsets[block_idx]
+        block_end = prefix_offsets[block_idx + 1]
+        if block_start < actual_seq_len:
+            rank_valid_ranges.append((block_start, min(block_end, actual_seq_len)))
+
+
+    per_rank_actual_token = []
+    reverse_split_len = []
+    for rank_idx in range(cp_size):
+        head_idx = rank_idx
+        tail_idx = cp_block_num - 1 - rank_idx
+        per_rank_actual_token.append(
+            block_actual_lens[head_idx] + block_actual_lens[tail_idx]
+        )
+        reverse_split_len.extend(
+            [block_actual_lens[head_idx], block_actual_lens[tail_idx]]
+        )
+    max_rank_len = max(per_rank_actual_token) if per_rank_actual_token else 0
+
+
+    head_chunk_id = cp_rank
+    tail_chunk_id = cp_block_num - 1 - cp_rank
+    head_start_global = prefix_offsets[head_chunk_id]
+    head_end_global = prefix_offsets[head_chunk_id + 1]
+    tail_start_global = prefix_offsets[tail_chunk_id]
+    tail_end_global = prefix_offsets[tail_chunk_id + 1]
+    head_actual_len = block_actual_lens[head_chunk_id]
+    tail_actual_len = block_actual_lens[tail_chunk_id]
+
+    cp_metadata = ContextParallelMetadata(
         split_list=split_list,
+        max_rank_len=[max_rank_len] * cp_size,
         zigzag_index=zigzag_index,
+        per_rank_actual_token=per_rank_actual_token,
+        reverse_split_len=reverse_split_len,
         cp_reverse_index=cp_reverse_index,
+        rank_valid_ranges=rank_valid_ranges,
+        kv_len_prev=head_start_global,
+        kv_len_next=tail_start_global,
+        actual_seq_q_prev=head_actual_len,
+        actual_seq_q_next=tail_actual_len,
+        total_seq_lens=actual_seq_len,
         cp_size=cp_size,
+        cp_rank=cp_rank,
         aligned_seq_len=aligned_seq_len,
         actual_seq_len=actual_seq_len,
+        is_gqa=is_gqa,
     )
+    print(f'device: {device}')
+    if device is not None:
+        cp_metadata.kv_len_prev_tensor = torch.tensor(cp_metadata.kv_len_prev, device=device, dtype=torch.int32)
+        cp_metadata.kv_len_next_tensor = torch.tensor(cp_metadata.kv_len_next, device=device, dtype=torch.int32)
+        cp_metadata.actual_seq_q_prev_tensor = torch.tensor(cp_metadata.actual_seq_q_prev, device=device, dtype=torch.int32)
+        cp_metadata.actual_seq_q_next_tensor = torch.tensor(cp_metadata.actual_seq_q_next, device=device, dtype=torch.int32)
+
+        cp_metadata.attn_mask_seqlens = torch.tensor([[seq_len_per_block], [seq_len_per_block]],device=device,dtype=torch.int32)
+
+        # Compute nomask seqlens
+        cp_metadata.head_attn_nomask_seqlens = torch.tensor([[seq_len_per_block], [head_start_global]],device=device,dtype=torch.int32,)
+        cp_metadata.tail_attn_nomask_seqlens = torch.tensor([[seq_len_per_block], [tail_start_global]],device=device,dtype=torch.int32,)
+        
+        # Compute indices using torch.arange for efficiency
+        cp_metadata.kv_with_q_head_nomask_idx = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
+        cp_metadata.kv_with_q_head_mask_idx = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
+        cp_metadata.kv_with_q_tail_nomask_idx = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
+        cp_metadata.kv_with_q_tail_mask_idx = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
+
+    return cp_metadata
 
 #########################
 # Synchronization

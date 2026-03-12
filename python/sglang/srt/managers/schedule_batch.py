@@ -58,7 +58,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    calculate_cp_transfer_metadata,
+    calculate_cp_metadata,
 )
 from sglang.srt.distributed.parallel_state import (
     get_context_parallel_world_size,
@@ -1566,13 +1566,51 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             cp_rank = get_pcp_rank()
             page_size = self.token_to_kv_pool_allocator.page_size
             """
-            CP Mode Memory Allocation Example:
+            【不填充】
+            - actual_seq_len = 12345, page_size = 32, cp_size = 4
+            - split_list = [1543, 1543, 1543, 1543, 1543, 1543, 1543, 1544] (8 blocks)
+            - For CP_Rank 0: zigzag_index = [0, 7], extend_tokens = 1543 (block 0) + 1544(block 7) = 3087 -> page_num == (3087 + 32 - 1) // 32 == 97
+            // - For CP_Rank 0: zigzag_index = [0, 7], extend_tokens = 1543 (block 0) + 1544(block 7) = 3087 -> page_num == (1543 + 32 -1) // 32 + (1544 + 32 - 1) // 32 == 48 + 48 == 98
+            - CP_Rank 0 【页布局】:
+                - page0 : [1, 2, 3, 4, 5, 6, 7, 8, ..., 31, 32]
+                - page1 : [33, 34, 35, 36, 37, 38, 39, 40, ..., 63, 64]
+                - ...
+                - page48: [1537, 1538, 1539, 1540, 1541, 1542, 1543, 【1544, ..., 1567, 1568】] --> token 1544->1568属于block2
+                // - page48: [1537, 1538, 1539, 1540, 1541, 1542, 1543, padding, padding,..., padding]
+                - page49: [1569, 1570, 1571, 1572, 1573, 1574, 1575, 1576, ..., 1599, 1600]
+                // - page49: [1544, 1545, 1546, 1547, 1548, 1549, 1550, 1551, ..., 1575, 1576]
+                - ...
+
+            【填充】
             - actual_seq_len = 12345, page_size = 32, cp_size = 4
             - aligned_seq_len = 12544 (aligned to page_size * cp_size * 2 = 256)
+            aligned_req = [1, 2, 3, 4, ..., 12345, padding, padding, ..., padding]
             - split_list = [1568, 1568, 1568, 1568, 1568, 1568, 1568, 1568] (8 blocks)
-            - For CP_Rank 0: zigzag_index = [0, 7], extend_tokens = 1568 + 1568 = 3136
-            - Memory allocated: 3136 tokens
-            - KV indices written: 2937 tokens (block 0: [0, 1568), block 7: [10976, 12345))
+            - For CP_Rank 0: zigzag_index = [0, 7], extend_tokens = 1568 + 1568 = 3136 -> page_num = (3136 + 32 - 1) // 32 == 98
+            - CP_Rank 0 【页布局】:
+
+                - page0 : [1, 2, 3, 4, 5, 6, 7, 8, ..., 31, 32]
+                - page1 : [33, 34, 35, 36, 37, 38, 39, 40, ..., 63, 64]
+                - ...
+                - page48: [1536, 1537, 1538, 1539, 1540, 1541, 1542, 1543, ..., 1567, 1568] --> block1尾部
+                - page49: [1569, 1570, 1571, 1572, 1573, 1574, 1575, 1576, ..., 1599, 1600]
+                - ...
+                - page97: [3105, 3106, 3107, 3108, 3109, 3110, 3111, 3112, ..., 3135, 3136]
+
+
+            实际输入 10 token, cp_size = 2
+            cp_rank 0:
+                block 0 -> token 1, token 2, token 3 --> page 0:[1, 2, 3, padding, ..., padding]
+                block 3 -> token 9, token 10 --> page 1:[9, 10, padding, ..., padding]
+            cp_rank 1:
+                block 1 -> token 4, token 5, token 6 --> page 0:[4, 5, 6, padding, ..., padding]
+                block 2 -> token 7, token 8 --> page 1:[7, 8, padding, ..., padding]
+
+            Decode 页排布:
+                - page 0: [1, 2, 3, padding, ..., padding]
+                - page 1: [4, 5, 6, padding, ..., padding]
+                - page 2: [7, 8, padding, ..., padding]
+                - page 3: [9, 10, padding, ..., padding]
             """
             
             # Calculate CP metadata for each request
@@ -1583,54 +1621,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for i, req in enumerate(reqs):
                 actual_seq_len = len(req.fill_ids)
                 seq_lens_actual[i] = actual_seq_len
-                # Calculate CP metadata
-                req.cp_metadata = calculate_cp_transfer_metadata(
+                req.cp_metadata = calculate_cp_metadata(
                     actual_seq_len=actual_seq_len,
                     cp_size=cp_size,
                     cp_rank=cp_rank,
                     page_size=page_size,
+                    device=self.device,
                 )
-                print(f"transfer cp_metadata={req.cp_metadata}")
-                # Precompute per-rank valid ranges in original sequence index space.
-                prefix_offsets = [0]
-                for block_len in req.cp_metadata.split_list:
-                    prefix_offsets.append(prefix_offsets[-1] + block_len)
-                rank_valid_ranges = []
-                for block_idx in req.cp_metadata.zigzag_index:
-                    block_start = prefix_offsets[block_idx]
-                    block_end = prefix_offsets[block_idx + 1]
-                    if block_start < actual_seq_len:
-                        valid_end = min(block_end, actual_seq_len)
-                        rank_valid_ranges.append((block_start, valid_end))
-                req.cp_metadata.rank_valid_ranges = rank_valid_ranges
-                # Build actual block lengths (intersected with real sequence length).
-                cp_block_num = cp_size * 2
-                block_actual_lens = []
-                for block_idx in range(cp_block_num):
-                    block_start = prefix_offsets[block_idx]
-                    block_end = prefix_offsets[block_idx + 1]
-                    if block_start >= actual_seq_len:
-                        block_actual_lens.append(0)
-                    else:
-                        block_actual_lens.append(min(block_end, actual_seq_len) - block_start)
-                # Per-rank actual token counts and max rank length.
-                per_rank_actual_token = []
-                for r in range(cp_size):
-                    head = r
-                    tail = cp_block_num - 1 - r
-                    per_rank_actual_token.append(
-                        block_actual_lens[head] + block_actual_lens[tail]
-                    )
-                max_rank_len = max(per_rank_actual_token) if per_rank_actual_token else 0
-                req.cp_metadata.per_rank_actual_token = per_rank_actual_token
-                req.cp_metadata.max_rank_len = [max_rank_len] * cp_size
-                # Reverse split lengths in zigzag order, clipped to actual length.
-                reverse_split_len = []
-                for r in range(cp_size):
-                    reverse_split_len.append(block_actual_lens[r])
-                    reverse_split_len.append(block_actual_lens[cp_block_num - 1 - r])
-                req.cp_metadata.reverse_split_len = reverse_split_len
-                req.cp_metadata.total_seq_lens = actual_seq_len
 
                 # Calculate extend tokens for current CP_Rank (allocation length)
                 prefix_len = len(req.prefix_indices)

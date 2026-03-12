@@ -26,12 +26,10 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
     is_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -249,25 +247,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-        if self.enable_prefill_cp and self.use_nsa:
-            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    input_ids.device,
-                )
-        elif self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    input_ids.device,
-                )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

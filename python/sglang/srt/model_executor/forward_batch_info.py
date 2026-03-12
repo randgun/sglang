@@ -420,6 +420,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            cp_metadata=batch.prefill_cp_metadata,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
         )
         device = model_runner.device

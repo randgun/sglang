@@ -61,8 +61,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    prepare_input_dp_with_cp_dsa,
     is_enable_prefill_cp,
     cp_all_gather_rerange_output,
     use_pcp,
@@ -1018,23 +1016,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp and self.pcp_size > 1:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
-                    input_ids.device,
-                    is_gqa=True
-                )
-                # if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
-                #     # print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
-                #     {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
-                #     # print(f"[rank={torch.distributed.get_rank()}] "
-                #         f"pcp_rank={self.pcp_rank}, "
-                #         f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
-
         hidden_states = self.model(
             input_ids,
             positions,
