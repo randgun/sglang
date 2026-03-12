@@ -38,7 +38,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size, pcp_ag_rearange_output
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -530,6 +530,15 @@ class Qwen3MoeAttention(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def _build_empty_inner_state(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        self._used_fused_qk_norm_rope_last_call = False
+        empty_q = hidden_states.new_empty((0, self.q_size))
+        empty_k = hidden_states.new_empty((0, self.kv_size))
+        empty_v = hidden_states.new_empty((0, self.kv_size))
+        return None, forward_batch, (empty_q, empty_k, empty_v, forward_batch)
+
     def forward_prepare_npu(
         self,
         positions: torch.Tensor,
@@ -541,14 +550,9 @@ class Qwen3MoeAttention(nn.Module):
             and self.enable_prefill_cp
             and use_pcp(forward_batch)
         ):
-            # Avoid NPU rope on empty tensors; still participate in PCP comms.
-            empty_kv = torch.empty(
-                (0, self.kv_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
-            return hidden_states, forward_batch, None
+            # Avoid NPU rope on empty tensors, but keep the rank on the
+            # normal attention path so PCP collectives happen in one order.
+            return self._build_empty_inner_state(hidden_states, forward_batch)
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -580,14 +584,9 @@ class Qwen3MoeAttention(nn.Module):
             and self.enable_prefill_cp
             and use_pcp(forward_batch)
         ):
-            # Avoid rope on empty tensors; still participate in PCP comms.
-            empty_kv = torch.empty(
-                (0, self.kv_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
-            return hidden_states, forward_batch, None
+            # Avoid local projection/rope kernels on empty tensors, but keep the
+            # rank on the normal attention path so PCP collectives stay aligned.
+            return self._build_empty_inner_state(hidden_states, forward_batch)
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
@@ -670,7 +669,7 @@ class Qwen3MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             # Outside PCP, the empty rank can exit early. In PCP we still route
             # through forward_prepare_* so the rank stays on the shared path and
-            # pad to the fixed local PCP layout before attention.
+            # only skips local empty-tensor kernels.
             if not (self.enable_prefill_cp and use_pcp(forward_batch)):
                 return hidden_states, forward_batch, None
         if not _is_npu or forward_batch.forward_mode.is_extend():
@@ -697,6 +696,9 @@ class Qwen3MoeAttention(nn.Module):
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
+
+        if q.shape[0] == 0:
+            return q.new_empty((0, self.hidden_size))
 
         attn_output = self.attn(
             q,
