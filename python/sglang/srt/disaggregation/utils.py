@@ -95,18 +95,30 @@ def calculate_cp_metadata(
             rank_valid_ranges.append((block_start, min(block_end, actual_seq_len)))
 
 
+    per_rank_head_actual_token = [
+        block_actual_lens[rank_idx] for rank_idx in range(cp_size)
+    ]
+    per_rank_tail_actual_token = [
+        block_actual_lens[cp_block_num - 1 - rank_idx] for rank_idx in range(cp_size)
+    ]
+    head_padded_len = (
+        max(per_rank_head_actual_token) if per_rank_head_actual_token else 0
+    )
+    tail_padded_len = (
+        max(per_rank_tail_actual_token) if per_rank_tail_actual_token else 0
+    )
+
     per_rank_actual_token = []
     reverse_split_len = []
     for rank_idx in range(cp_size):
-        head_idx = rank_idx
-        tail_idx = cp_block_num - 1 - rank_idx
         per_rank_actual_token.append(
-            block_actual_lens[head_idx] + block_actual_lens[tail_idx]
+            per_rank_head_actual_token[rank_idx]
+            + per_rank_tail_actual_token[rank_idx]
         )
         reverse_split_len.extend(
-            [block_actual_lens[head_idx], block_actual_lens[tail_idx]]
+            [per_rank_head_actual_token[rank_idx], per_rank_tail_actual_token[rank_idx]]
         )
-    max_rank_len = max(per_rank_actual_token) if per_rank_actual_token else 0
+    max_rank_len = head_padded_len + tail_padded_len
 
 
     head_chunk_id = cp_rank
@@ -123,6 +135,10 @@ def calculate_cp_metadata(
         max_rank_len=[max_rank_len] * cp_size,
         zigzag_index=zigzag_index,
         per_rank_actual_token=per_rank_actual_token,
+        per_rank_head_actual_token=per_rank_head_actual_token,
+        per_rank_tail_actual_token=per_rank_tail_actual_token,
+        head_padded_len=head_padded_len,
+        tail_padded_len=tail_padded_len,
         reverse_split_len=reverse_split_len,
         cp_reverse_index=cp_reverse_index,
         rank_valid_ranges=rank_valid_ranges,

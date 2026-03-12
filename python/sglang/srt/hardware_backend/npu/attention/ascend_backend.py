@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
+    cp_extract_local_tokens,
     is_nsa_enable_prefill_cp,
     use_pcp,
 )
@@ -1062,16 +1063,29 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        seq_len = q.shape[0]
+        cp_metadata = forward_batch.cp_metadata
+        assert cp_metadata is not None
+
+        head_padded_len = cp_metadata.head_padded_len
+        tail_padded_len = cp_metadata.tail_padded_len
+        seq_len = head_padded_len + tail_padded_len
         if seq_len == 0:
-            return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
-        split_len = (seq_len + 1) // 2
+            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+        if q.shape[0] != seq_len:
+            raise ValueError(
+                f"Unexpected padded PCP q length: got={q.shape[0]} expected={seq_len}"
+            )
+
+        q_head_actual = max(cp_metadata.actual_seq_q_prev, 0)
+        q_tail_actual = max(cp_metadata.actual_seq_q_next, 0)
+        q_head_padded, q_tail_padded = torch.split(
+            q, [head_padded_len, tail_padded_len], dim=0
+        )
+        q_head = q_head_padded[:q_head_actual].contiguous()
+        q_tail = q_tail_padded[:q_tail_actual].contiguous()
 
         k = k.contiguous()
         v = v.contiguous()
-        q_head, q_tail = torch.split(q, [split_len, seq_len - split_len], dim=0)
-        q_head = q_head.contiguous()
-        q_tail = q_tail.contiguous()
 
         def _forward(
             q_chunk: torch.Tensor,
@@ -1124,8 +1138,17 @@ class AscendAttnBackend(AttentionBackend):
             if loop + 1 != pcp_size:
                 next_k, next_v = comm.send_recv_kv(k, v)
 
-            k_head, k_tail = torch.split(k, [split_len, seq_len - split_len], dim=0)
-            v_head, v_tail = torch.split(v, [split_len, seq_len - split_len], dim=0)
+            k_head_padded, k_tail_padded = torch.split(
+                k, [head_padded_len, tail_padded_len], dim=0
+            )
+            v_head_padded, v_tail_padded = torch.split(
+                v, [head_padded_len, tail_padded_len], dim=0
+            )
+            k_head = k_head_padded[:source_head_actual].contiguous()
+            v_head = v_head_padded[:source_head_actual].contiguous()
+            k_tail = k_tail_padded[:source_tail_actual].contiguous()
+            v_tail = v_tail_padded[:source_tail_actual].contiguous()
+
             if loop == 0:
                 out_part, lse_part = _forward(q_head, k_head, v_head, attn_mask=True)
                 if out_part is not None:
@@ -1152,7 +1175,17 @@ class AscendAttnBackend(AttentionBackend):
                 comm.wait()
                 k, v = next_k, next_v
 
-        return out.to(out_dtype)
+        output = q.new_zeros(
+            (seq_len, layer.tp_q_head_num * layer.v_head_dim),
+            dtype=out_dtype,
+        )
+        if head_out is not None and q_head_actual > 0:
+            output[:q_head_actual].copy_(head_out.reshape(q_head_actual, -1))
+        if tail_out is not None and q_tail_actual > 0:
+            output[
+                head_padded_len : head_padded_len + q_tail_actual
+            ].copy_(tail_out.reshape(q_tail_actual, -1))
+        return output.to(q.dtype)
 
     def forward_extend(
         self,
@@ -1215,9 +1248,6 @@ class AscendAttnBackend(AttentionBackend):
                 if use_pcp(forward_batch):
                     cache_k = cp_extract_local_tokens(forward_batch, k)
                     cache_v = cp_extract_local_tokens(forward_batch, v)
-                    # ForwardBatch may pad out_cache_loc later for attn-TP scatter.
-                    # PCP KV cache writes must still use only the real local token slots.
-                    cache_loc = cache_loc[: cache_k.shape[0]]
                 if cache_loc.shape[0] != cache_k.shape[0]:
                     raise ValueError(
                         "Unexpected PCP KV cache write length mismatch: "

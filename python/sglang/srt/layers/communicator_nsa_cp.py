@@ -372,6 +372,8 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                         hidden_states = hidden_states.tensor_split(pcp_size)[
                             pcp_rank
                         ]
+                    if residual is not None and cp_metadata is not None:
+                        residual = cp_extract_local_tokens(forward_batch, residual)
                 # get_pcp_group().reduce_scatter_tensor(hidden_states, input_hidden_states)
             #     if layer_norm is not None:
             #         try:
