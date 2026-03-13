@@ -22,14 +22,13 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group,get_context_parallel_rank
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -40,10 +39,6 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Constant for prefill context parallel TP size
-PREFILL_CP_ATTN_TP_SIZE = 16
-
 
 class CommonKVManager(BaseKVManager):
     def __init__(
@@ -63,9 +58,13 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
-        self.pcp_size = server_args.prefill_context_parallel_size
-        self.pcp_rank = get_context_parallel_rank()
         self.attn_tp_size = get_attention_tp_size()
+        self.pcp_size = server_args.prefill_context_parallel_size
+        self.pcp_rank = (
+            get_tensor_model_parallel_rank() // self.attn_tp_size
+            if self.pcp_size > 1
+            else 0
+        )
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
@@ -102,6 +101,7 @@ class CommonKVManager(BaseKVManager):
             self.prefill_dp_size_table: Dict[str, int] = {}
             self.prefill_pp_size_table: Dict[str, int] = {}
             self.prefill_page_size_table: Dict[str, Optional[int]] = {}
+            self.prefill_pcp_size_table: Dict[str, int] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -129,11 +129,6 @@ class CommonKVManager(BaseKVManager):
         attn_dp_rank = self.attn_dp_rank
         attn_tp_size = self.attn_tp_size
         attn_dp_size = self.attn_dp_size
-        if is_enable_prefill_cp():
-            attn_dp_rank = 0
-            attn_tp_size = PREFILL_CP_ATTN_TP_SIZE
-            attn_dp_size = 1
-            attn_tp_rank = self.pcp_rank * attn_tp_size + self.attn_tp_rank
         payload = {
             "role": "Prefill",
             "attn_tp_size": attn_tp_size,
@@ -142,6 +137,8 @@ class CommonKVManager(BaseKVManager):
             "attn_dp_rank": attn_dp_rank,
             "pp_size": self.pp_size,
             "pp_rank": self.pp_rank,
+            "pcp_size": self.pcp_size,
+            "pcp_rank": self.pcp_rank,
             "system_dp_size": self.system_dp_size,
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
@@ -242,6 +239,8 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        cp_rank: Optional[int] = None,
+        cp_metadata: Optional["ContextParallelMetadata"] = None,
     ):
         pass
 
@@ -268,6 +267,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
+        # Ensure the attribute exists even if initialization exits early.
+        self.bootstrap_infos = None
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
@@ -276,6 +277,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.prefill_dp_size,
                 self.prefill_pp_size,
                 self.prefill_page_size,
+                self.prefill_pcp_size,
             ) = self._get_prefill_parallel_info_from_server()
             if (
                 self.prefill_attn_tp_size is None
@@ -301,8 +303,9 @@ class CommonKVReceiver(BaseKVReceiver):
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
 
+            self.prefill_pcp_size = int(self.prefill_pcp_size or 1)
             logger.debug(
-                f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size}"
+                f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size} PCP size:{self.prefill_pcp_size}"
             )
             self.kv_mgr.prefill_attn_tp_size_table[self.bootstrap_addr] = (
                 self.prefill_attn_tp_size
@@ -316,6 +319,9 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.prefill_page_size_table[self.bootstrap_addr] = (
                 self.prefill_page_size
             )
+            self.kv_mgr.prefill_pcp_size_table[self.bootstrap_addr] = (
+                self.prefill_pcp_size
+            )
         else:
             self.prefill_attn_tp_size = self.kv_mgr.prefill_attn_tp_size_table[
                 self.bootstrap_addr
@@ -327,6 +333,9 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.bootstrap_addr
             ]
             self.prefill_page_size = self.kv_mgr.prefill_page_size_table.get(
+                self.bootstrap_addr
+            )
+            self.prefill_pcp_size = self.kv_mgr.prefill_pcp_size_table.get(
                 self.bootstrap_addr
             )
 
@@ -404,12 +413,15 @@ class CommonKVReceiver(BaseKVReceiver):
         else:
             self.target_pp_ranks = [rank for rank in range(self.prefill_pp_size)]
 
+        self.target_pcp_ranks = list(range(self.prefill_pcp_size))
+        self.required_prefill_response_num *= self.prefill_pcp_size
+
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
         )
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
-            f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
+            f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}_pcp{self.prefill_pcp_size}"
         )
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
@@ -417,30 +429,35 @@ class CommonKVReceiver(BaseKVReceiver):
             for target_tp_rank in self.target_tp_ranks:
                 # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
                 for target_pp_rank in reversed(self.target_pp_ranks):
-                    bootstrap_info = self._get_bootstrap_info_from_server(
-                        target_tp_rank, self.target_dp_group, target_pp_rank
-                    )
-                    if bootstrap_info is not None:
-                        if self.kv_mgr.is_mla_backend:
-                            # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
-                            bootstrap_info["is_dummy"] = not bool(
-                                target_tp_rank == self.target_tp_rank
-                                or self.target_tp_rank is None
+                    for target_pcp_rank in self.target_pcp_ranks:
+                        bootstrap_info = self._get_bootstrap_info_from_server(
+                            target_tp_rank,
+                            self.target_dp_group,
+                            target_pp_rank,
+                            target_pcp_rank,
+                        )
+                        if bootstrap_info is not None:
+                            if self.kv_mgr.is_mla_backend:
+                                # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
+                                bootstrap_info["is_dummy"] = not bool(
+                                    target_tp_rank == self.target_tp_rank
+                                    or self.target_tp_rank is None
+                                )
+                            else:
+                                # For non-MLA: all target_tp_ranks are selected real ranks
+                                bootstrap_info["is_dummy"] = False
+                            bootstrap_info["pcp_rank"] = target_pcp_rank
+                            logger.debug(
+                                f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank} PP {target_pp_rank} PCP {target_pcp_rank}"
                             )
+                            bootstrap_infos.append(bootstrap_info)
                         else:
-                            # For non-MLA: all target_tp_ranks are selected real ranks
-                            bootstrap_info["is_dummy"] = False
-                        logger.debug(
-                            f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank} PP {target_pp_rank}"
-                        )
-                        bootstrap_infos.append(bootstrap_info)
-                    else:
-                        self.kv_mgr.record_failure(
-                            self.bootstrap_room,
-                            f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group} and target_pp_rank {target_pp_rank}",
-                        )
-                        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                        return
+                            self.kv_mgr.record_failure(
+                                self.bootstrap_room,
+                                f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group} and target_pp_rank {target_pp_rank} and target_pcp_rank {target_pcp_rank}",
+                            )
+                            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                            return
 
             self.bootstrap_infos = bootstrap_infos
             self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
@@ -453,11 +470,11 @@ class CommonKVReceiver(BaseKVReceiver):
         assert len(self.bootstrap_infos) > 0
 
     def _get_bootstrap_info_from_server(
-        self, engine_rank, target_dp_group, target_pp_rank
+        self, engine_rank, target_dp_group, target_pp_rank, target_pcp_rank
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}&target_pcp_rank={target_pcp_rank}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -473,7 +490,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def _get_prefill_parallel_info_from_server(
         self,
-    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
@@ -485,15 +502,16 @@ class CommonKVReceiver(BaseKVReceiver):
                     int(prefill_parallel_info["prefill_dp_size"]),
                     int(prefill_parallel_info["prefill_pp_size"]),
                     int(prefill_parallel_info["prefill_page_size"]),
+                    int(prefill_parallel_info["prefill_pcp_size"]),
                 )
             else:
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
                 )
-                return None, None, None, None
+                return None, None, None, None, None
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
-            return None, None, None, None
+            return None, None, None, None, None
 
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
@@ -536,8 +554,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.attn_tp_size = None
         self.dp_size = None
         self.page_size = None
+        self.pcp_size = None
         self.prefill_port_table: Dict[
-            int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
+            int, Dict[int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]]
         ] = {}
 
         # Start bootstrap server
@@ -574,6 +593,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         attn_dp_rank = data["attn_dp_rank"]
         pp_size = data["pp_size"]
         pp_rank = data["pp_rank"]
+        pcp_size = int(data["pcp_size"])
+        pcp_rank = int(data["pcp_rank"])
         system_dp_size = data["system_dp_size"]
         system_dp_rank = data["system_dp_rank"]
         rank_ip = data["rank_ip"]
@@ -591,6 +612,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.page_size is None and page_size is not None:
             self.page_size = page_size
+        if self.pcp_size is None and pcp_size is not None:
+            self.pcp_size = pcp_size
 
         if role == "Prefill":
             if system_dp_size == 1:
@@ -604,13 +627,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     self.prefill_port_table[dp_group] = {}
                 if attn_tp_rank not in self.prefill_port_table[dp_group]:
                     self.prefill_port_table[dp_group][attn_tp_rank] = {}
+                if pp_rank not in self.prefill_port_table[dp_group][attn_tp_rank]:
+                    self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {}
 
-            self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {
+            self.prefill_port_table[dp_group][attn_tp_rank][pp_rank][pcp_rank] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} PCP{pcp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)
@@ -619,6 +644,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         engine_rank = request.query.get("engine_rank")
         target_dp_group = request.query.get("target_dp_group")
         target_pp_rank = request.query.get("target_pp_rank")
+        target_pcp_rank = request.query.get("target_pcp_rank")
         if not engine_rank or not target_dp_group or not target_pp_rank:
             return web.Response(text="Missing inputs for bootstrap server.", status=400)
 
@@ -633,14 +659,22 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "prefill_dp_size": self.dp_size,
                 "prefill_pp_size": self.pp_size,
                 "prefill_page_size": self.page_size,
+                "prefill_pcp_size": self.pcp_size,
             }
             return web.json_response(prefill_parallel_info, status=200)
 
+        # Backward compatibility: default PCP rank to 0 when not provided.
+        if target_pcp_rank is None:
+            target_pcp_rank = "0"
+
         # Find corresponding prefill info
         async with self.lock:
-            bootstrap_info = self.prefill_port_table[int(target_dp_group)][
-                int(engine_rank)
-            ][int(target_pp_rank)]
+            dp_group_table = self.prefill_port_table.get(int(target_dp_group))
+            tp_table = None if dp_group_table is None else dp_group_table.get(int(engine_rank))
+            pp_table = None if tp_table is None else tp_table.get(int(target_pp_rank))
+            bootstrap_info = (
+                None if pp_table is None else pp_table.get(int(target_pcp_rank))
+            )
 
         if bootstrap_info is not None:
             return web.json_response(bootstrap_info, status=200)

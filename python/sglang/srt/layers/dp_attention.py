@@ -30,6 +30,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -298,10 +302,19 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
-    if pcp_size>1:
-        _ATTN_DP_SIZE = 1
-        _LOCAL_ATTN_DP_SIZE = 1
+    # Always initialize PCP metadata so get_pcp_size() is safe even when PCP is disabled.
+    _ATTN_PCP_RANK = 0
+    _ATTN_PCP_SIZE = 1
+
+    if pcp_size > 1:
+        # PCP reuses attention-TP partitioning but should not expose logical DP to
+        # downstream paths that index `global_num_tokens` by DP rank.
+        _ATTN_PCP_RANK = _ATTN_DP_RANK
         _ATTN_PCP_SIZE = pcp_size
+        _ATTN_DP_RANK = 0
+        _ATTN_DP_SIZE = 1
+        _LOCAL_ATTN_DP_RANK = 0
+        _LOCAL_ATTN_DP_SIZE = 1
 
     tp_group = get_tp_group()
     # Trick to solve circular references
@@ -310,7 +323,7 @@ def initialize_dp_attention(
     use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
     group_ranks = [
         list(range(head,head + _ATTN_TP_SIZE))
-        for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE) 
+        for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
     ]
     _ATTN_TP_GROUP = GroupCoordinator(
         group_ranks,
@@ -333,11 +346,11 @@ def initialize_dp_attention(
     )
 
 def get_pcp_rank() -> int:
-    assert _ATTN_PCP_RANK is not None, "dp attention not initialized!"
+    assert _ATTN_PCP_RANK is not None, "pcp attention not initialized!"
     return _ATTN_PCP_RANK
 
 def get_pcp_size() -> int:
-    assert _ATTN_PCP_SIZE is not None, "dp attention not initialized!"
+    assert _ATTN_PCP_SIZE is not None, "pcp attention not initialized!"
     return _ATTN_PCP_SIZE
 
 
@@ -599,38 +612,108 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
-def pcp_ag_rearange_output(input_tensor,pcp_size,forward_batch):
-    max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
+def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
+    # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
+    # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
+    # but communicate on PCP group (not attention-TP group).
+    pcp_group = get_pcp_group()
+    tp_group = get_tp_group()
+    can_use_tp_group = (
+        getattr(pcp_group, "world_size", None) == getattr(tp_group, "world_size", None)
+        and getattr(pcp_group, "ranks", None) == getattr(tp_group, "ranks", None)
+    )
+    # Default strategy: prefer tp_group when it has the same rank set as pcp_group.
+    comm_group = tp_group if can_use_tp_group else pcp_group
+    cp_rank_count = pcp_group.world_size
+    cp_metadata = forward_batch.cp_metadata
+    if cp_metadata is None:
+        raise ValueError(
+            f"pcp_ag_rearange_output requires cp metadata, got None "
+            f"(forward_mode={getattr(forward_batch, 'forward_mode', None)})"
+        )
+    max_len = cp_metadata.max_rank_len[0]
 
+    if (
+        cp_metadata.max_rank_len is None
+        or len(cp_metadata.max_rank_len) != cp_rank_count
+    ):
+        if cp_metadata.per_rank_actual_token is not None:
+            max_len = max(cp_metadata.per_rank_actual_token)
+        else:
+            total_len = cp_metadata.total_seq_lens
+            max_len = (total_len + cp_rank_count - 1) // cp_rank_count
+        cp_metadata.max_rank_len = [max_len] * cp_rank_count
+
+    if (
+        cp_metadata.per_rank_actual_token is None
+        or len(cp_metadata.per_rank_actual_token) != cp_rank_count
+    ):
+        raise ValueError(
+            "pcp metadata invalid per_rank_actual_token: "
+            f"len={None if cp_metadata.per_rank_actual_token is None else len(cp_metadata.per_rank_actual_token)} "
+            f"cp_rank_count={cp_rank_count}"
+        )
+    if (
+        cp_metadata.reverse_split_len is None
+        or len(cp_metadata.reverse_split_len) == 0
+    ):
+        raise ValueError(
+            f"pcp metadata invalid reverse_split_len={cp_metadata.reverse_split_len}"
+        )
+    if (
+        cp_metadata.cp_reverse_index is None
+        or len(cp_metadata.cp_reverse_index) != len(cp_metadata.reverse_split_len)
+    ):
+        raise ValueError(
+            "pcp metadata invalid cp_reverse_index: "
+            f"len(cp_reverse_index)={None if cp_metadata.cp_reverse_index is None else len(cp_metadata.cp_reverse_index)} "
+            f"len(reverse_split_len)={len(cp_metadata.reverse_split_len)}"
+        )
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
-        input_tensor = F.pad(input_tensor, (0, 0, 0, pad_size),mode="constant",value=0)
+        input_tensor = F.pad(
+            input_tensor,
+            (0, 0, 0, pad_size),
+            mode="constant",
+            value=0,
+        )
     all_shuffled_sensor = torch.empty(
-        max_len * pcp_size,
+        max_len * cp_rank_count,
         input_tensor.shape[-1],
         dtype=input_tensor.dtype,
         device=input_tensor.device,
     )
 
-    get_pcp_group().all_gather_into_tensor(all_shuffled_sensor, input_tensor)
+    assert (
+        pcp_group.world_size == cp_rank_count
+    ), f"pcp metadata/group mismatch: cp_rank_count={cp_rank_count}, pcp_group.world_size={pcp_group.world_size}"
+    assert (
+        getattr(comm_group, "world_size", None) == cp_rank_count
+    ), f"comm group size mismatch: cp_rank_count={cp_rank_count}, comm_group.world_size={getattr(comm_group, 'world_size', None)}"
+    comm_group.all_gather_into_tensor(all_shuffled_sensor, input_tensor)
 
-    splitted_tensor = list(torch.split(all_shuffled_sensor, forward_batch.nsa_cp_metadata.max_rank_len, dim=0))
+    splitted_tensor = list(
+        torch.split(
+            all_shuffled_sensor,
+            cp_metadata.max_rank_len,
+            dim=0,
+        )
+    )
     output_tensor = torch.cat(
         [
             splitted_tensor[index][:per_rank_len]
             for index, per_rank_len in enumerate(
-                forward_batch.nsa_cp_metadata.per_rank_actual_token
+                cp_metadata.per_rank_actual_token
             )
         ],
         dim=0,
     )
     outputs_list = list(
         torch.split(
-            output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
+            output_tensor, cp_metadata.reverse_split_len, dim=0
         )
     )
     outputs = torch.cat(
-        [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
+        [outputs_list[i] for i in cp_metadata.cp_reverse_index], dim=0
     )
     return outputs
-    
