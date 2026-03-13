@@ -750,9 +750,6 @@ class SchedulerDisaggregationPrefillMixin:
 
             prefill_page_indices_array = np.array(prefill_page_indices, dtype=np.int32)
             if len(prefill_page_indices_array) == 0:
-                logger.info(
-                    f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty (CP mode)"
-                )
                 # For FakeKVSender (health check), still mark as sent to avoid hanging.
                 if isinstance(req.disagg_kv_sender, FakeKVSender):
                     req.disagg_kv_sender.send(prefill_page_indices_array, state_indices)

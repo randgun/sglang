@@ -1,13 +1,11 @@
-# temp NSA debugging environ
-
-from typing import TYPE_CHECKING, List, Tuple, Union, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from dataclasses import dataclass
 
+import logging
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-import logging
 
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -24,53 +22,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
-
-
-def _is_pcp_precision_debug_enabled() -> bool:
-    return os.getenv("SGLANG_PCP_DEBUG_PRECISION", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _pcp_tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
-    if tensor is None:
-        return f"{name}=None"
-    if tensor.numel() == 0:
-        return (
-            f"{name}(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-            "numel=0, empty=True)"
-        )
-
-    t = tensor.detach()
-    if t.dtype.is_floating_point or t.is_complex():
-        tf = t.float()
-        finite = torch.isfinite(tf)
-        finite_count = int(finite.sum().item())
-        total = tf.numel()
-        finite_tf = tf[finite]
-        if finite_count > 0:
-            min_v = float(finite_tf.min().item())
-            max_v = float(finite_tf.max().item())
-            mean_v = float(finite_tf.mean().item())
-            std_v = float(finite_tf.std(unbiased=False).item())
-        else:
-            min_v = max_v = mean_v = std_v = float("nan")
-        abs_max = float(tf.abs().max().item())
-        return (
-            f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={total}, "
-            f"finite={finite_count}/{total}, min={min_v:.6e}, max={max_v:.6e}, "
-            f"mean={mean_v:.6e}, std={std_v:.6e}, abs_max={abs_max:.6e})"
-        )
-
-    ti = t.to(torch.int64)
-    return (
-        f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={ti.numel()}, "
-        f"min={int(ti.min().item())}, max={int(ti.max().item())})"
-    )
-
 
 @dataclass
 class ContextParallelMetadata:
@@ -137,8 +88,10 @@ def is_nsa_prefill_cp_round_robin_split():
         and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
     )
 
+
 def is_enable_prefill_cp():
     return get_global_server_args().prefill_context_parallel_size > 1
+
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
@@ -466,8 +419,6 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dtype=input_.dtype,
     )
     # step2
-    # print(f'=====input_tensor_all:{input_tensor_all.shape}')
-    # print(f'=====input_:{input_.shape}')
     get_pcp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
@@ -548,11 +499,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
-    if _is_pcp_precision_debug_enabled():
-        logger.info(
-            "[pcp-debug] cp_all_gather_rerange_output_done: %s",
-            _pcp_tensor_debug_summary("output", output_tensor),
-        )
     return output_tensor
 
 

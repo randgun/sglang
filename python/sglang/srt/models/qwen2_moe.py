@@ -632,10 +632,6 @@ class Qwen2MoeModel(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
-            # if self.enable_prefill_cp and use_pcp(forward_batch):
-            #     hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            #     if torch.distributed.get_rank() in range(5):
-            #         print(f"+++ cp split and rebuild hidden states,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]}") 
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -644,10 +640,6 @@ class Qwen2MoeModel(nn.Module):
         if self.enable_prefill_cp and use_pcp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            # if torch.distributed.get_rank() in (0,4):
-            #     print(f"+++[Qwen2MoeModel] after cp split and rebuild position,{torch.distributed.get_rank()=},{positions.sum()=},{positions=},{forward_batch.cp_metadata.split_list=},\
-            #         {forward_batch.extend_seq_lens=},{forward_batch.extend_seq_lens.sum()=}") 
-            #     print(f"+++[Qwen2MoeModel] after cp split and rebuild hidden states,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]}")
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -680,9 +672,6 @@ class Qwen2MoeModel(nn.Module):
                             else None
                         ),
                     )
-                    # if layer.layer_id == 0 and torch.distributed.get_rank() in (0,1):
-                    #     print(f"+++ hidden_states and positions,{torch.distributed.get_rank()=},{hidden_states.sum()=},{positions[:]}") 
-                    
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -702,9 +691,7 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states.contiguous(),
                 self.pcp_size,
                 forward_batch,
-                )
-            # if torch.distributed.get_rank() in (0,4):
-            #     print(f"+++[Qwen2MoeModel] model output hidden states after pcp ag rearange output,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]=},{hidden_states.shape=}")
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
