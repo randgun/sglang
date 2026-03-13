@@ -1130,6 +1130,22 @@ class AscendAttnBackend(AttentionBackend):
         out_dtype = q.dtype
         next_k, next_v = None, None
         pcp_size = get_pcp_size()
+        if layer.layer_id == 0:
+            logger.info(
+                "PD+PCP ring enter: rank=%s pcp_rank=%s pcp_size=%s pcp_group=%s "
+                "seq_len=%s q_shape=%s head_actual=%s tail_actual=%s "
+                "per_rank_head=%s per_rank_tail=%s",
+                torch.distributed.get_rank(),
+                comm.pcp_rank,
+                pcp_size,
+                torch.distributed.get_process_group_ranks(get_pcp_group().device_group),
+                seq_len,
+                tuple(q.shape),
+                q_head_actual,
+                q_tail_actual,
+                cp_metadata.per_rank_head_actual_token,
+                cp_metadata.per_rank_tail_actual_token,
+            )
         for loop in range(pcp_size):
             source_rank = (comm.pcp_rank - loop) % pcp_size
             source_head_actual = cp_metadata.per_rank_head_actual_token[source_rank]

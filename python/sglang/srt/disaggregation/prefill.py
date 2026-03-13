@@ -211,6 +211,19 @@ class PrefillBootstrapQueue:
         self._process_req(req)
         req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
+        if getattr(self.kv_manager, "pcp_size", 1) > 1:
+            logger.info(
+                "PD+PCP bootstrap add: tp_rank=%s pp_rank=%s attn_tp_rank=%s "
+                "pcp_rank=%s req=%s room=%s queue_len=%s dest_tp_ranks=%s",
+                self.tp_rank,
+                self.pp_rank,
+                getattr(self.kv_manager, "attn_tp_rank", None),
+                getattr(self.kv_manager, "pcp_rank", None),
+                req.rid,
+                req.bootstrap_room,
+                len(self.queue),
+                dest_tp_ranks,
+            )
         trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -298,6 +311,19 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            if getattr(self.kv_manager, "pcp_size", 1) > 1:
+                logger.info(
+                    "PD+PCP bootstrap ready: tp_rank=%s pp_rank=%s attn_tp_rank=%s "
+                    "pcp_rank=%s req=%s room=%s num_pages=%s metadata_idx=%s",
+                    self.tp_rank,
+                    self.pp_rank,
+                    getattr(self.kv_manager, "attn_tp_rank", None),
+                    getattr(self.kv_manager, "pcp_rank", None),
+                    req.rid,
+                    req.bootstrap_room,
+                    num_pages,
+                    req.metadata_buffer_index,
+                )
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -336,6 +362,18 @@ class SchedulerDisaggregationPrefillMixin:
         batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
 
         if batch:
+            if self.server_args.prefill_context_parallel_size > 1:
+                logger.info(
+                    "PD+PCP prefill batch ready: tp_rank=%s pp_rank=%s attn_tp_rank=%s "
+                    "reqs=%s batch_size=%s waiting=%s inflight=%s",
+                    self.tp_rank,
+                    self.pp_rank,
+                    self.attn_tp_rank,
+                    [req.rid for req in batch.reqs],
+                    batch.batch_size(),
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_inflight_queue),
+                )
             trace_event_batch("schedule", batch.reqs)
 
         return batch
