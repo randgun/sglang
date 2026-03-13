@@ -335,7 +335,6 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
-        self.log_pd_pcp_topology()
 
         # Init PD-multiplexing context
         if self.enable_pdmux:
@@ -823,34 +822,6 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
-
-    def log_pd_pcp_topology(self):
-        if (
-            self.server_args.disaggregation_mode != DisaggregationMode.PREFILL
-            or self.server_args.prefill_context_parallel_size <= 1
-        ):
-            return
-
-        from sglang.srt.distributed.parallel_state import get_pcp_group
-        from sglang.srt.layers.dp_attention import get_pcp_rank, get_pcp_size
-
-        attn_tp_group = get_attention_tp_group()
-        pcp_group = get_pcp_group()
-        logger.info(
-            "PD+PCP topology: tp_rank=%s pp_rank=%s dp_rank=%s attn_tp_rank=%s "
-            "attn_tp_size=%s attn_tp_group=%s pcp_rank=%s pcp_size=%s pcp_group=%s "
-            "enable_dp_attention=%s",
-            self.tp_rank,
-            self.pp_rank,
-            self.dp_rank,
-            self.attn_tp_rank,
-            self.attn_tp_size,
-            getattr(attn_tp_group, "ranks", None),
-            get_pcp_rank(),
-            get_pcp_size(),
-            getattr(pcp_group, "ranks", None),
-            self.server_args.enable_dp_attention,
-        )
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
