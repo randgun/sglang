@@ -325,11 +325,6 @@ class MoriKVManager(CommonKVManager):
             infos[transfer_info.engine_key] = transfer_info
 
             if len(infos) >= transfer_info.required_dst_info_num:
-                # logger.debug(
-                #     "Bootstrap room %s got enough transfer info (%s)",
-                #     transfer_info.room,
-                #     len(infos),
-                # )
                 self.update_status(transfer_info.room, KVPoll.WaitingForInput)
         except Exception:
             logger.exception("Failed to parse transfer info message")
@@ -471,12 +466,6 @@ class MoriKVManager(CommonKVManager):
             return
         self.engine.register_remote_engine(register_info.engine_desc)
         self.decode_kv_args_table[engine_key] = register_info
-        # logger.debug(
-        #     "Registered decode peer %s (%s:%s)",
-        #     engine_key,
-        #     register_info.endpoint,
-        #     register_info.dst_port,
-        # )
 
     def _get_mha_mem_desc_slices(
         self, dst_mem_descs: List[MemoryDesc]
@@ -817,10 +806,6 @@ class MoriKVManager(CommonKVManager):
         AuxDataCodec.deserialize_data_to_buffer(
             self.kv_args, buffer_index, aux_index, data
         )
-
-        # logger.debug(
-        #     f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
-        # )
 
     def add_transfer_request(
         self,

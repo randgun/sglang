@@ -1,6 +1,4 @@
-# temp NSA debugging environ
-
-from typing import TYPE_CHECKING, List, Tuple, Union, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from dataclasses import dataclass
 
 import logging
@@ -8,7 +6,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-import logging
 
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -94,6 +91,7 @@ def is_nsa_prefill_cp_round_robin_split():
 
 def is_enable_prefill_cp():
     return get_global_server_args().prefill_context_parallel_size > 1
+
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():

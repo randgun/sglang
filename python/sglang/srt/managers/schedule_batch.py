@@ -1628,7 +1628,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     page_size=page_size,
                     device=self.device,
                 )
-                print(f"prepare_for_extend cp_metadata={req.cp_metadata}")
 
                 # Calculate extend tokens for current CP_Rank (allocation length)
                 prefix_len = len(req.prefix_indices)

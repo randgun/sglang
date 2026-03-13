@@ -11,9 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-
-import logging
 from functools import partial
 from typing import Callable, Optional
 
@@ -37,16 +34,13 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
-    get_attention_tp_rank,
+    get_attention_tp_group,
     get_local_dp_buffer,
     get_pcp_rank,
     get_pcp_size,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.distributed.parallel_state import get_pcp_group
-
-
-logger = logging.getLogger(__name__)
 
 
 
@@ -183,55 +177,14 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 else hidden_states.shape[0]
             )
             if hidden_states.shape[0] != 0:
-                logger.warning(
-                    "PCP GQA pre-all_reduce: rank=%s tp_rank=%s shape=%s numel=%s contiguous=%s split_list=%s rank_valid_ranges=%s",
-                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                    get_attention_tp_rank(),
-                    tuple(hidden_states.shape),
-                    hidden_states.numel(),
-                    hidden_states.is_contiguous(),
-                    getattr(forward_batch.cp_metadata, "split_list", None),
-                    getattr(forward_batch.cp_metadata, "rank_valid_ranges", None),
-                )
-                logger.warning(
-                    "PCP GQA entering all_reduce: rank=%s tp_rank=%s",
-                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                    get_attention_tp_rank(),
-                )
                 hidden_states = get_attention_tp_group().all_reduce(hidden_states)
-                logger.warning(
-                    "PCP GQA finished all_reduce: rank=%s tp_rank=%s shape=%s",
-                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                    get_attention_tp_rank(),
-                    tuple(hidden_states.shape),
-                )
-                logger.warning(
-                    "PCP GQA entering layernorm: rank=%s tp_rank=%s",
-                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                    get_attention_tp_rank(),
-                )
                 hidden_states, residual = layernorm(hidden_states, residual)
-                logger.warning(
-                    "PCP GQA finished layernorm: rank=%s tp_rank=%s hidden_shape=%s residual_shape=%s",
-                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                    get_attention_tp_rank(),
-                    tuple(hidden_states.shape),
-                    tuple(residual.shape) if residual is not None else None,
-                )
             local_len = hidden_states.shape[0]
             local_hidden_states = hidden_states.new_zeros(
                 (max_len, hidden_states.shape[1]), dtype=hidden_states.dtype
             )
             if local_len > 0:
                 local_hidden_states[:local_len].copy_(hidden_states)
-            logger.warning(
-                "PCP GQA allocating gather buffer: rank=%s tp_rank=%s pcp_size=%s local_shape=%s padded_shape=%s",
-                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                get_attention_tp_rank(),
-                pcp_size,
-                tuple(hidden_states.shape),
-                tuple(local_hidden_states.shape),
-            )
             gathered_hidden_states = torch.empty(
                 pcp_size,
                 max_len,
@@ -239,28 +192,10 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
-            logger.warning(
-                "PCP GQA entering cp_all_gather_async: rank=%s tp_rank=%s gather_shape=%s",
-                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                get_attention_tp_rank(),
-                tuple(gathered_hidden_states.shape),
-            )
             get_pcp_group().cp_all_gather_into_tensor_async(
                 gathered_hidden_states,
                 local_hidden_states,
                 torch.npu.current_stream(),
-            )
-            logger.warning(
-                "PCP GQA issued cp_all_gather_async: rank=%s tp_rank=%s gather_shape=%s",
-                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                get_attention_tp_rank(),
-                tuple(gathered_hidden_states.shape),
-            )
-            logger.warning(
-                "PCP GQA entering reshape: rank=%s tp_rank=%s shape=%s",
-                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                get_attention_tp_rank(),
-                tuple(gathered_hidden_states.shape),
             )
             reshaped_hidden_states = gathered_hidden_states.reshape(
                 -1, gathered_hidden_states.shape[-1]
@@ -281,12 +216,6 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                     reshaped_hidden_states = torch.cat(gathered_parts, dim=0)
                 else:
                     reshaped_hidden_states = reshaped_hidden_states[:0]
-            logger.warning(
-                "PCP GQA finished reshape: rank=%s tp_rank=%s shape=%s",
-                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                get_attention_tp_rank(),
-                tuple(reshaped_hidden_states.shape),
-            )
             return reshaped_hidden_states, residual
         else:
             if hidden_states.shape[0] != 0:
@@ -344,16 +273,6 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         elif use_pcp(forward_batch):
             if hidden_states.shape[0] != 0:
                 if not forward_batch.cp_metadata.is_gqa:
-                    logger.warning(
-                        "PCP non-GQA pre-all_reduce: rank=%s tp_rank=%s shape=%s numel=%s contiguous=%s split_list=%s rank_valid_ranges=%s",
-                        torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
-                        get_attention_tp_rank(),
-                        tuple(hidden_states.shape),
-                        hidden_states.numel(),
-                        hidden_states.is_contiguous(),
-                        getattr(forward_batch.cp_metadata, "split_list", None),
-                        getattr(forward_batch.cp_metadata, "rank_valid_ranges", None),
-                    )
                     hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                     hidden_states, residual = layer_norm(hidden_states, residual)
                 else:
@@ -374,12 +293,6 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                         ]
                     if residual is not None and cp_metadata is not None:
                         residual = cp_extract_local_tokens(forward_batch, residual)
-                # get_pcp_group().reduce_scatter_tensor(hidden_states, input_hidden_states)
-            #     if layer_norm is not None:
-            #         try:
-            #             hidden_states, residual = layer_norm(hidden_states, residual)
-            #         except TypeError:
-            #             hidden_states = layer_norm(hidden_states)
             return hidden_states, residual
         else:
             return hidden_states, residual
