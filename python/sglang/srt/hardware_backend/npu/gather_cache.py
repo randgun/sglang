@@ -40,29 +40,26 @@ def gather_paged_kv_kernel(
     tl.store(out_ptrs, data, mask=valid_seq_mask)
 
 
-def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor, block_table: torch.Tensor, page_size: int, max_seq_len: int):
-    b, _ = block_table.shape
-    # max_seq_len = n * page_size
+def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor, block_table: torch.Tensor, page_size: int):
+    b, n = block_table.shape
+    max_seq_len = n * page_size
     
     output = torch.empty((b, max_seq_len), device=cache.device, dtype=cache.dtype)
     BLOCK_SIZE = 128 
         
-    grid = lambda meta: (
-        triton.cdiv(max_seq_len, meta['BLOCK_SIZE']), # 这里的 cdiv 会动态改变 grid 的大小
-        b                                             
-    )
-    
-    gather_paged_kv_kernel[grid](
-        cache_ptr=cache,
-        actual_seq_len_ptr=actual_seq_len_kv,
-        block_table_ptr=block_table,
-        out_ptr=output,
-        stride_bt_b=block_table.stride(0),
-        stride_out_b=output.stride(0),
-        page_size=page_size,
-        max_seq_len=max_seq_len, # 正常传入变量
-        BLOCK_SIZE=BLOCK_SIZE,   # 传入固定的 constexpr
-    )
+    if b > 0 and n > 0:
+        grid = (n, b)
+        gather_paged_kv_kernel[grid](
+            cache_ptr=cache,
+            actual_seq_len_ptr=actual_seq_len_kv,
+            block_table_ptr=block_table,
+            out_ptr=output,
+            stride_bt_b=block_table.stride(0),
+            stride_out_b=output.stride(0),
+            page_size=page_size,
+            max_seq_len=max_seq_len,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
     
     return output
 

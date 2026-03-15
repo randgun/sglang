@@ -298,7 +298,7 @@ class DecodePreallocQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
-        if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+        if envs.SGLANG_NPU_PD_ENABLE_C8.get() and self.disaggregation_mode == DisaggregationMode.DECODE:
             kv_args.dequant_unit_num = self.token_to_kv_pool.get_dequant_unit_num()
             (
                 kv_args.dequant_scale_data_ptrs,
@@ -315,6 +315,13 @@ class DecodePreallocQueue:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                draft_dequant_scale_data_ptrs, draft_dequant_scale_data_lens, draft_dequant_scale_item_lens = (
+                    self.draft_token_to_kv_pool.get_contiguous_scale_buf_infos()
+                )
+                kv_args.dequant_scale_data_ptrs += draft_dequant_scale_data_ptrs
+                kv_args.dequant_scale_data_lens += draft_dequant_scale_data_lens
+                kv_args.dequant_scale_item_lens += draft_dequant_scale_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

@@ -71,8 +71,10 @@ class AscendKVManager(MooncakeKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.npu_c8 = envs.SGLANG_NPU_PD_ENABLE_C8.get()
+        # LKL TODO remove hard code
         self.page_size = 128
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
     def init_engine(self):
         # TransferEngine initialized on ascend.
@@ -82,7 +84,6 @@ class AscendKVManager(MooncakeKVManager):
             npu_id=self.kv_args.gpu_id,
             disaggregation_mode=self.disaggregation_mode,
         )
-        self.npu_c8 = envs.SGLANG_NPU_PD_ENABLE_C8.get()
 
     def register_buffer_to_engine(self):
         self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
@@ -230,6 +231,7 @@ class AscendKVManager(MooncakeKVManager):
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
+                                    target_rank_registration_info.dst_kv_item_len,
                                     target_rank_registration_info.dequant_scale_data_ptrs,
                                     target_rank_registration_info.dequant_scale_item_len,
                                     target_rank_registration_info.dequant_unit_num,
@@ -323,6 +325,7 @@ class AscendKVManager(MooncakeKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
+        dst_kv_item_len: npt.NDArray[np.int32],
         dequant_scale_ptrs: list[int],
         dequant_scale_item_len: int,
         dequant_unit_num: int,
@@ -331,7 +334,7 @@ class AscendKVManager(MooncakeKVManager):
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
-        print(f"+++ {prefill_kv_blocks=}, {dst_kv_blocks=}, {prefill_kv_indices=}, {dst_kv_indices=}", flush=True)
+        print(f"+++ {prefill_kv_blocks=}, {dst_kv_blocks=}, {prefill_kv_indices=}, {dst_kv_indices=}, {dst_kv_item_len=}", flush=True)
 
         num_layers = len(self.kv_args.kv_data_ptrs)
         layers_params = [
@@ -339,6 +342,7 @@ class AscendKVManager(MooncakeKVManager):
                 self.kv_args.kv_data_ptrs[layer_id],
                 dst_kv_ptrs[layer_id],
                 self.kv_args.kv_item_lens[layer_id],
+                dst_kv_item_len[layer_id],
                 dequant_scale_ptrs[layer_id],
                 dequant_scale_item_len,
             )
@@ -351,13 +355,14 @@ class AscendKVManager(MooncakeKVManager):
             src_ptr,
             dst_ptr,
             item_len,
+            dst_item_len,
             dequant_scale_ptr,
             dequant_scale_item_len,
         ) in layers_params:
             tmp_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * dst_item_len
                 length = item_len * len(prefill_index)
                 dequant_scale_addr = (
                     dequant_scale_ptr + int(decode_index[0]) * dequant_scale_item_len * self.page_size
@@ -431,27 +436,28 @@ class AscendKVReceiver(MooncakeKVReceiver):
             dst_kv_item_len = str(kv_item_len).encode("ascii")
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            base_args = [
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            dst_tp_rank,
+                            dst_attn_tp_size,
+                            dst_kv_item_len,
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                        ]
+            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                base_args.extend([
+                            dequant_scale_data_ptrs,
+                            dequant_scale_item_len,
+                            dequant_unit_num,
+                        ])
             with lock:
-                sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        dst_tp_rank,
-                        dst_attn_tp_size,
-                        dst_kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                        dequant_scale_data_ptrs,
-                        dequant_scale_item_len,
-                        dequant_unit_num,
-                    ]
-                )
-
+                sock.send_multipart(base_args)
 
 class AscendKVBootstrapServer(MooncakeKVBootstrapServer):
     pass

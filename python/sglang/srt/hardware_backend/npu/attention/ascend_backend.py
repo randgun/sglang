@@ -1102,9 +1102,21 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
-                )
+                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                    k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k.view(-1, layer.tp_k_head_num * layer.qk_head_dim))
+                    v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v.view(-1, layer.tp_v_head_num * layer.v_head_dim))
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        forward_batch.out_cache_loc,
+                        k_quant.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v_quant.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        k_dynamic_scale,
+                        v_dynamic_scale,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, v
+                    )
 
         if not self.use_mla:
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
@@ -1134,21 +1146,60 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens,
                 )
 
-            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                query,
-                k_cache,
-                v_cache,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                atten_mask=self.mtp_mask,
-                scale=layer.scaling,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                sparse_mode=3,
-            )
+            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, 0)
+
+                bs = self.forward_metadata.block_tables.shape[0]
+                max_kv_len = max(actual_seq_lengths_kv)
+                query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
+
+                rank = torch.distributed.get_rank()
+
+                if not forward_batch.forward_mode.is_idle():
+                    print(f"+++ {rank=}, {layer.layer_id=}, {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {self.forward_metadata.block_tables.shape=}"
+                        f", {self.page_size=}, {layer.tp_k_head_num=}, {actual_seq_lengths_kv=}, {kv_dequant_scale.shape=} {self.forward_metadata.seq_lens=}", flush=True)
+
+                hidden_dim = layer.tp_k_head_num * layer.v_head_dim
+                np_page_k = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
+                np_page_v = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
+
+                for i in range(bs):
+                    np_page_k[i] = k_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
+                    np_page_v[i] = v_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
+
+                # 算子在Q_S>1时不支持page attention
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query,
+                    np_page_k,
+                    np_page_v,
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSH",
+                    softmax_scale=layer.scaling,
+                    actual_seq_kvlen=actual_seq_lengths_kv,
+                    key_quant_mode=1,
+                    value_quant_mode=1,
+                    dequant_scale_key=kv_dequant_scale[0][:, :max_kv_len],
+                    dequant_scale_value=kv_dequant_scale[1][:, :max_kv_len],
+                    sparse_mode=3,
+                    atten_mask=self.mtp_mask,
+                )
+            else:
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    atten_mask=self.mtp_mask,
+                    scale=layer.scaling,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    sparse_mode=3,
+                )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
@@ -1342,42 +1393,73 @@ class AscendAttnBackend(AttentionBackend):
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
             num_tokens = query.shape[0]
             print(f"++++ {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {kv_dequant_scale.shape=}")
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                query,
-                k_cache,
-                v_cache,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSH",
-                scale=layer.scaling,
-                actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=1 if envs.SGLANG_NPU_PD_ENABLE_C8.get() else None,
-                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_PD_ENABLE_C8.get() else None,
-            )
+
+            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSH",
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                    antiquant_mode=1,
+                    antiquant_scale=kv_dequant_scale,
+                )
+            else:
+                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSH",
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
                 dtype=q.dtype,
                 device=q.device,
             )
             softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-            torch_npu.npu_fused_infer_attention_score.out(
-                query,
-                k_cache,
-                v_cache,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSH",
-                scale=layer.scaling,
-                actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=1,
-                antiquant_scale=kv_dequant_scale if envs.SGLANG_NPU_PD_ENABLE_C8.get() else None,
-                workspace=workspace,
-                out=[output, softmax_lse],
-            )
+            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSH",
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                    antiquant_mode=1,
+                    antiquant_scale=kv_dequant_scale,
+                    workspace=workspace,
+                    out=[output, softmax_lse],
+                )
+            else:
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSH",
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                    workspace=workspace,
+                    out=[output, softmax_lse],
+                )
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1540,28 +1622,66 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    q.view(
-                        forward_batch.batch_size,
-                        -1,
-                        layer.tp_q_head_num,
-                        layer.qk_head_dim,
-                    ),
-                    k_cache.view(
-                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-                    ),
-                    v_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num * layer.qk_head_dim
-                    ),
-                    num_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="BSND",
-                    atten_mask=None,
-                    block_size=self.page_size,
-                    block_table=self.forward_metadata.block_tables,
-                    actual_seq_lengths_kv=actual_seq_len_kv,
-                    scale=layer.scaling,
-                )
+                
+                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                    actual_bs = self.forward_metadata.block_tables.shape[0]
+                    query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
+                    padded_bs = query.shape[0]
+                    k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                    v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                    max_seq_len = torch.max(self.forward_metadata.seq_lens_cpu_int).item()
+                    kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, 1)
+
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        query[:actual_bs],
+                        k_cache,
+                        v_cache,
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSH",
+                        softmax_scale=layer.scaling,
+                        actual_seq_kvlen=actual_seq_len_kv,
+                        key_quant_mode=1,
+                        value_quant_mode=1,
+                        dequant_scale_key=kv_dequant_scale[0],
+                        dequant_scale_value=kv_dequant_scale[1],
+                    )
+                    if padded_bs != actual_bs:
+                        attn_output = torch.cat(
+                            [
+                                attn_output,
+                                attn_output.new_zeros(
+                                    padded_bs - actual_bs,
+                                    *attn_output.shape[1:],
+                                ),
+                            ],
+                            dim=0,
+                        )
+                else:
+                    attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                        q.view(
+                            forward_batch.batch_size,
+                            -1,
+                            layer.tp_q_head_num,
+                            layer.qk_head_dim,
+                        ),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num * layer.qk_head_dim
+                        ),
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        atten_mask=None,
+                        block_size=self.page_size,
+                        block_table=self.forward_metadata.block_tables,
+                        actual_seq_lengths_kv=actual_seq_len_kv,
+                        scale=layer.scaling,
+                    )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
             elif forward_batch.encoder_lens is None:
@@ -1574,25 +1694,17 @@ class AscendAttnBackend(AttentionBackend):
                         device=query.device,
                     )
 
-                    if envs.SGLANG_NPU_PD_ENABLE_C8.get():
-                        rank = torch.distributed.get_rank()
-                        max_seq_len = torch.max(self.forward_metadata.seq_lens_cpu_int).item()
-                        print(f"+++ {rank=}, {layer.layer_id=} {self.forward_metadata.seq_lens.shape=}", flush=True)
-                        kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, max_seq_len)
-                        print(f"+++ {rank=}, {layer.layer_id=} {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}, {kv_dequant_scale=}", flush=True)
-                        attn_output = torch.ones((num_tokens, layer.tp_q_head_num * layer.v_head_dim), device='npu', dtype=torch.bfloat16)
-
-                    # torch_npu._npu_paged_attention(
-                    #     query=query,
-                    #     key_cache=k_cache,
-                    #     value_cache=v_cache,
-                    #     num_heads=layer.tp_q_head_num,
-                    #     num_kv_heads=layer.tp_k_head_num,
-                    #     scale_value=layer.scaling,
-                    #     block_table=self.forward_metadata.block_tables,
-                    #     context_lens=self.forward_metadata.seq_lens_cpu_int,
-                    #     out=attn_output,
-                    # )
+                    torch_npu._npu_paged_attention(
+                        query=query,
+                        key_cache=k_cache,
+                        value_cache=v_cache,
+                        num_heads=layer.tp_q_head_num,
+                        num_kv_heads=layer.tp_k_head_num,
+                        scale_value=layer.scaling,
+                        block_table=self.forward_metadata.block_tables,
+                        context_lens=self.forward_metadata.seq_lens_cpu_int,
+                        out=attn_output,
+                    )
                 else:
                     attn_output = self.attn_alibi(
                         q=query,
