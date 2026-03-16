@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
@@ -58,6 +59,8 @@ class TransferKVChunk:
     is_last: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
+    cp_rank: Optional[int] = None
+    cp_metadata: Optional[ContextParallelMetadata] = None
 
 
 # decode
@@ -380,6 +383,38 @@ class MooncakeKVManager(CommonKVManager):
 
         return 0
 
+    def _map_cp_page_indices(
+        self,
+        prefill_page_indices: npt.NDArray[np.int32],
+        cp_metadata: ContextParallelMetadata,
+        page_size: int,
+    ) -> npt.NDArray[np.int32]:
+        zigzag_len = len(cp_metadata.zigzag_index)
+        prefill_len = int(prefill_page_indices.shape[0])
+        if (
+            cp_metadata.block_page_counts is None
+            or len(cp_metadata.block_page_counts) != zigzag_len
+            or sum(cp_metadata.block_page_counts) != prefill_len
+        ):
+            raise ValueError(
+                "Invalid PCP block_page_counts for decode-side page mapping: "
+                f"zigzag_len={zigzag_len} prefill_len={prefill_len} "
+                f"block_page_counts={cp_metadata.block_page_counts}"
+            )
+
+        decode_page_indices = []
+        for zigzag_pos, original_block_idx in enumerate(cp_metadata.zigzag_index):
+            count = cp_metadata.block_page_counts[zigzag_pos]
+            if count <= 0:
+                continue
+            block_token_start = sum(
+                cp_metadata.split_list[j] for j in range(original_block_idx)
+            )
+            for local_page_idx in range(count):
+                page_token_start = block_token_start + local_page_idx * page_size
+                decode_page_indices.append(page_token_start // page_size)
+        return np.array(decode_page_indices, dtype=np.int32)
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -401,9 +436,9 @@ class MooncakeKVManager(CommonKVManager):
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
+        prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
+        dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
@@ -836,7 +871,14 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
-                local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                if getattr(self, "pcp_size", 1) > 1:
+                    local_rank = (
+                        (self.pcp_rank * self.attn_tp_size + self.attn_tp_rank)
+                        * self.pp_size
+                        + self.pp_rank
+                    )
+                else:
+                    local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -870,6 +912,18 @@ class MooncakeKVManager(CommonKVManager):
                                 : len(chunked_dst_kv_indice)
                             ]
 
+                        if kv_chunk.cp_metadata is not None:
+                            mapped_logical_pages = self._map_cp_page_indices(
+                                kv_chunk.prefill_kv_indices,
+                                kv_chunk.cp_metadata,
+                                self.kv_args.page_size,
+                            )
+                            mapped_dst_kv_indices = req.dst_kv_indices[
+                                mapped_logical_pages
+                            ]
+                        else:
+                            mapped_dst_kv_indices = chunked_dst_kv_indice
+
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
@@ -881,7 +935,7 @@ class MooncakeKVManager(CommonKVManager):
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
+                                mapped_dst_kv_indices,
                                 executor,
                             )
                         else:
@@ -889,7 +943,7 @@ class MooncakeKVManager(CommonKVManager):
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
+                                mapped_dst_kv_indices,
                                 target_rank_registration_info.dst_tp_rank,
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
@@ -1016,6 +1070,26 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_rank = int(prefill_rank.decode("ascii"))
 
                 if status == KVPoll.Success:
+                    bootstrap_addr = None
+                    with self.connection_lock:
+                        for addr, rooms in self.addr_to_rooms_tracker.items():
+                            if bootstrap_room in rooms:
+                                bootstrap_addr = addr
+                                break
+                    if bootstrap_addr:
+                        prefill_attn_tp_size = self.prefill_attn_tp_size_table.get(
+                            bootstrap_addr
+                        )
+                        prefill_pp_size = self.prefill_pp_size_table.get(bootstrap_addr)
+                        prefill_pcp_size = self.prefill_pcp_size_table.get(
+                            bootstrap_addr
+                        )
+                        if prefill_attn_tp_size and prefill_pp_size:
+                            pp_rank = prefill_rank % prefill_pp_size
+                            tmp = prefill_rank // prefill_pp_size
+                            attn_tp_rank = tmp % prefill_attn_tp_size
+                            pcp_rank = tmp // prefill_attn_tp_size
+                if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = (
@@ -1098,6 +1172,8 @@ class MooncakeKVManager(CommonKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        cp_rank: Optional[int] = None,
+        cp_metadata: Optional[ContextParallelMetadata] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -1132,6 +1208,8 @@ class MooncakeKVManager(CommonKVManager):
                 is_last=is_last,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
             )
         )
 
@@ -1170,6 +1248,8 @@ class MooncakeKVManager(CommonKVManager):
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_pp_size_table:
                 del self.prefill_pp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_pcp_size_table:
+                del self.prefill_pcp_size_table[failed_bootstrap_addr]
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
@@ -1213,6 +1293,8 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        cp_rank: Optional[int] = None,
+        cp_metadata: Optional["ContextParallelMetadata"] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -1224,6 +1306,8 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1233,6 +1317,8 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
             )
 
     def poll(self) -> KVPoll:

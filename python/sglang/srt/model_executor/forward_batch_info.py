@@ -372,10 +372,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dimensions: Optional[list[int]] = None
 
     # Record the split metadata of the sequence number of NSA context parallels.
-    nsa_cp_metadata: Optional[ContextParallelMetadata] = None
-
-    # For GQA context parallels (e.g., Qwen3 PCP)
-    gqa_cp_metadata: Optional[ContextParallelMetadata] = None
+    cp_metadata: Optional[ContextParallelMetadata] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
@@ -423,6 +420,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            cp_metadata=batch.prefill_cp_metadata,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
         )
         device = model_runner.device

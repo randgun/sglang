@@ -11,18 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-
 from functools import partial
 from typing import Callable, Optional
 
 import torch
 
 from sglang.srt.layers.attention.nsa.utils import (
+    cp_extract_local_tokens,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
+    use_pcp,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -35,10 +34,13 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
+    get_attention_tp_group,
     get_local_dp_buffer,
+    get_pcp_rank,
+    get_pcp_size,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.distributed.parallel_state import get_pcp_group
 
 
 def nsa_enable_prefill_cp():
@@ -149,11 +151,11 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         *,
         residual_input_mode,
     ):
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if nsa_use_prefill_cp(forward_batch):
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
                 get_local_dp_buffer(),
@@ -164,7 +166,62 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 local_hidden_states,
             )
             return hidden_states, residual
-        
+        elif use_pcp(forward_batch) and forward_batch.cp_metadata.is_gqa:
+            cp_metadata = forward_batch.cp_metadata
+            assert cp_metadata is not None
+            pcp_size = get_pcp_size()
+            max_len = (
+                cp_metadata.max_rank_len[0]
+                if cp_metadata.max_rank_len is not None
+                else hidden_states.shape[0]
+            )
+            if hidden_states.shape[0] != 0:
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                hidden_states, residual = layernorm(hidden_states, residual)
+            local_len = hidden_states.shape[0]
+            local_hidden_states = hidden_states.new_zeros(
+                (max_len, hidden_states.shape[1]), dtype=hidden_states.dtype
+            )
+            if local_len > 0:
+                local_hidden_states[:local_len].copy_(hidden_states)
+            gathered_hidden_states = torch.empty(
+                pcp_size,
+                max_len,
+                hidden_states.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            get_pcp_group().cp_all_gather_into_tensor_async(
+                gathered_hidden_states,
+                local_hidden_states,
+                torch.npu.current_stream(),
+            )
+            reshaped_hidden_states = gathered_hidden_states.reshape(
+                -1, gathered_hidden_states.shape[-1]
+            )
+            if (
+                cp_metadata.per_rank_actual_token is not None
+                and len(cp_metadata.per_rank_actual_token) == pcp_size
+            ):
+                gathered_parts = []
+                for rank_idx, per_rank_len in enumerate(cp_metadata.per_rank_actual_token):
+                    if per_rank_len <= 0:
+                        continue
+                    start = rank_idx * max_len
+                    gathered_parts.append(
+                        reshaped_hidden_states[start : start + per_rank_len]
+                    )
+                if gathered_parts:
+                    reshaped_hidden_states = torch.cat(gathered_parts, dim=0)
+                else:
+                    reshaped_hidden_states = reshaped_hidden_states[:0]
+            return reshaped_hidden_states, residual
+        else:
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
+            return hidden_states, residual
+
+        return hidden_states, residual
 
 
 class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
@@ -199,7 +256,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-        layer_norm: torch.nn.Module,
+        layer_norm: Optional[torch.nn.Module] = None,
         allow_reduce_scatter: bool = False,
     ):
         # for prefill: full -> attn tp scattered
@@ -212,8 +269,30 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             ]
             attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
             return hidden_states, residual
-        elif is_enable_prefill_cp():
+        elif use_pcp(forward_batch):
             if hidden_states.shape[0] != 0:
-                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
-                hidden_states, residual = layer_norm(hidden_states, residual)
+                if not forward_batch.cp_metadata.is_gqa:
+                    hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                    hidden_states, residual = layer_norm(hidden_states, residual)
+                else:
+                    pcp_size = get_pcp_size()
+                    pcp_rank = get_pcp_rank()
+                    cp_metadata = forward_batch.cp_metadata
+                    if (
+                        cp_metadata is not None
+                        and cp_metadata.per_rank_actual_token is not None
+                        and len(cp_metadata.per_rank_actual_token) == pcp_size
+                    ):
+                        start = sum(cp_metadata.per_rank_actual_token[:pcp_rank])
+                        end = start + cp_metadata.per_rank_actual_token[pcp_rank]
+                        hidden_states = hidden_states[start:end].contiguous()
+                    else:
+                        hidden_states = hidden_states.tensor_split(pcp_size)[
+                            pcp_rank
+                        ]
+                    if residual is not None and cp_metadata is not None:
+                        residual = cp_extract_local_tokens(forward_batch, residual)
             return hidden_states, residual
+        else:
+            return hidden_states, residual
+

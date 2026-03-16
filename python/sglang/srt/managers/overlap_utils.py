@@ -144,7 +144,14 @@ class FutureMap:
     ):
         if self.spec_algo.is_none():
             intv = future_indices.interval
-            self.token_ids_buf[intv] = batch_result.next_token_ids
+            if self.is_empty_slice(intv):
+                return
+            next_token_ids = batch_result.next_token_ids
+            assert next_token_ids is not None
+            if next_token_ids.numel() == 0:
+                # CP ranks can have zero valid tokens; skip storing.
+                return
+            self.token_ids_buf[intv] = next_token_ids
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)

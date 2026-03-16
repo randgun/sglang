@@ -45,6 +45,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    pcp_ag_rearange_output,
+    get_pcp_size,
+    get_pcp_rank,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -64,6 +67,15 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.attention.nsa.utils import (
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_enable_prefill_cp,
+    nsa_use_prefill_cp,
+    is_nsa_enable_prefill_cp,
+    use_pcp,
+)
+
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -565,6 +577,8 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.enable_prefill_cp = is_enable_prefill_cp()
+        self.pcp_size = get_pcp_size() if self.enable_prefill_cp else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -623,6 +637,10 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        if use_pcp(forward_batch):
+            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -667,7 +685,13 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-
+                
+        if use_pcp(forward_batch):
+            hidden_states = pcp_ag_rearange_output(
+                hidden_states.contiguous(),
+                self.pcp_size,
+                forward_batch,
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -704,6 +728,24 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+        # PCP (Prefill Context Parallelism) configuration
+        self.enable_prefill_cp = is_enable_prefill_cp()
+        if self.enable_prefill_cp:
+            self.pcp_rank = get_pcp_rank()
+            self.pcp_size = get_pcp_size()
+        else:
+            self.pcp_rank = self.pcp_size = None
+
+
+        # PCP (Prefill Context Parallelism) configuration
+        self.enable_prefill_cp = is_enable_prefill_cp()
+        if self.enable_prefill_cp:
+            self.pcp_rank = get_pcp_rank()
+            self.pcp_size = get_pcp_size()
+        else:
+            self.pcp_rank = self.pcp_size = None
+
 
     @torch.no_grad()
     def forward(

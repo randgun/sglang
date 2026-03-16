@@ -1547,6 +1547,7 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     prefill_context_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
 ) -> None:
@@ -1686,16 +1687,38 @@ def initialize_model_parallel(
         group_name="pp",
     )
     global _PCP
-    pcp_tp_size = tensor_model_parallel_size // prefill_context_parallel_size
-    group_ranks = [list(range(i,get_world_size(),pcp_tp_size)) for i in range(pcp_tp_size)]
+    # Build PCP groups across logical CP shards while keeping the same attention-TP
+    # coordinate in each group. For tp_size=4, pcp_size=2 this yields [0, 2] and
+    # [1, 3], so get_context_parallel_rank() matches the logical PCP shard rank
+    # used by dp_attention/get_pcp_rank().
+    if prefill_context_parallel_size > 1:
+        assert (
+            tensor_model_parallel_size % prefill_context_parallel_size == 0
+        ), (
+            "tensor_model_parallel_size must be divisible by "
+            "prefill_context_parallel_size"
+        )
+        tp_group_count = get_world_size() // tensor_model_parallel_size
+        attn_tp_size = tensor_model_parallel_size // prefill_context_parallel_size
+        group_ranks = []
+        for tp_group_idx in range(tp_group_count):
+            tp_base = tp_group_idx * tensor_model_parallel_size
+            for attn_tp_rank in range(attn_tp_size):
+                group_ranks.append(
+                    [
+                        tp_base + attn_tp_rank + pcp_rank * attn_tp_size
+                        for pcp_rank in range(prefill_context_parallel_size)
+                    ]
+                )
+    else:
+        group_ranks = [list(range(get_world_size()))]
     _PCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_custom_allreduce= False,
+        use_custom_allreduce=False,
         group_name="pcp_tp",
     )
-
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
 ) -> Optional[torch.distributed.ProcessGroup]:

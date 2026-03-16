@@ -72,7 +72,6 @@ if TYPE_CHECKING:
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
 
-
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that

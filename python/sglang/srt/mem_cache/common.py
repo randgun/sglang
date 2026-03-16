@@ -10,9 +10,13 @@ import triton.language as tl
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.distributed.parallel_state import (
+    get_context_parallel_world_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -75,6 +79,87 @@ def write_req_to_token_pool_triton(
         )
 
 
+def _write_cp_cache_indices(
+    out_cache_loc: torch.Tensor,
+    req_idx: int,
+    prefix_len: int,
+    pt: int,
+    req: "Req",
+    req_to_token_pool: ReqToTokenPool,
+):
+    cp_metadata = req.cp_metadata
+    actual_seq_len = cp_metadata.actual_seq_len
+    out_offset = pt
+    written_pages = []
+    padding_pages = []
+    page_size = get_global_server_args().page_size
+    aligned_actual_len = ceil_align(actual_seq_len, page_size)
+
+    # CP writes only the current rank's zigzag blocks into req_to_token.
+    # Clear the active range first so a reused request slot does not keep
+    # stale indices in the holes owned by peer CP ranks.
+    if actual_seq_len > prefix_len:
+        req_to_token_pool.req_to_token[req_idx, prefix_len:actual_seq_len] = 0
+
+    for block_idx in cp_metadata.zigzag_index:
+        block_size = cp_metadata.split_list[block_idx]
+        block_token_start = 0
+        for j in range(block_idx):
+            block_token_start += cp_metadata.split_list[j]
+        block_token_end = block_token_start + block_size
+
+        if block_token_start < actual_seq_len:
+            extend_block_end = min(block_token_end, actual_seq_len)
+            write_size = extend_block_end - block_token_start
+            if write_size > 0:
+                written_chunk = out_cache_loc[out_offset : out_offset + write_size]
+                req_to_token_pool.write(
+                    (req_idx, slice(block_token_start, extend_block_end)),
+                    written_chunk,
+                )
+                written_pages.append(torch.unique(written_chunk // page_size))
+
+            if write_size < block_size:
+                free_start = max(write_size, aligned_actual_len - block_token_start)
+                if free_start < block_size:
+                    padding_chunk = out_cache_loc[
+                        out_offset + free_start : out_offset + block_size
+                    ]
+                    padding_pages.append(torch.unique(padding_chunk // page_size))
+        else:
+            free_start = max(0, aligned_actual_len - block_token_start)
+            if free_start < block_size:
+                padding_chunk = out_cache_loc[
+                    out_offset + free_start : out_offset + block_size
+                ]
+                padding_pages.append(torch.unique(padding_chunk // page_size))
+
+        out_offset += block_size
+
+    if written_pages:
+        new_written_pages = torch.unique(torch.cat(written_pages))
+        if req.cp_written_pages is None:
+            req.cp_written_pages = new_written_pages
+        else:
+            req.cp_written_pages = torch.unique(
+                torch.cat([req.cp_written_pages, new_written_pages])
+            )
+
+    if padding_pages:
+        new_padding_pages = torch.unique(torch.cat(padding_pages))
+        if req.cp_written_pages is not None:
+            new_padding_pages = new_padding_pages[
+                ~torch.isin(new_padding_pages, req.cp_written_pages)
+            ]
+        if new_padding_pages.numel() > 0:
+            if req.cp_padding_pages is None:
+                req.cp_padding_pages = new_padding_pages
+            else:
+                req.cp_padding_pages = torch.unique(
+                    torch.cat([req.cp_padding_pages, new_padding_pages])
+                )
+
+
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -87,8 +172,13 @@ def write_cache_indices(
     extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
+    reqs: list["Req"] | None = None,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    # Check if CP is enabled
+    enable_cp = is_enable_prefill_cp()
+    server_args = get_global_server_args()
+
+    if support_triton(get_global_server_args().attention_backend) and not enable_cp:
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -117,10 +207,19 @@ def write_cache_indices(
                 (req_idx, slice(0, prefix_len)),
                 prefix_tensors[i],
             )
-            req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
-            )
+
+            if enable_cp and server_args.disaggregation_mode != "null":
+                if reqs is None:
+                    raise ValueError("reqs must be provided when CP mode is enabled")
+                _write_cp_cache_indices(
+                    out_cache_loc, req_idx, prefix_len, pt, reqs[i], req_to_token_pool
+                )
+            else:
+                req_to_token_pool.write(
+                    (req_idx, slice(prefix_len, seq_len)),
+                    out_cache_loc[pt : pt + extend_len],
+                )
+
             pt += extend_len
 
 
@@ -363,16 +462,20 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
+        
+        seq_lens_for_alloc = batch.seq_lens
+        seq_lens_cpu_for_alloc = batch.seq_lens_cpu
+        
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens=seq_lens_for_alloc,
+            seq_lens_cpu=seq_lens_cpu_for_alloc,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
-
+    
     # Write to req_to_token_pool
     write_cache_indices(
         out_cache_loc,
@@ -386,6 +489,7 @@ def alloc_for_extend(
         extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
+        batch.reqs,
     )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
@@ -477,6 +581,73 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    if (
+        getattr(req, "cp_padding_pages", None) is not None
+        or getattr(req, "cp_written_pages", None) is not None
+    ):
+        from sglang.srt.distributed.parallel_state import (
+            get_context_parallel_world_size,
+        )
+
+        page_size = get_global_server_args().page_size
+        padding_pages = (
+            req.cp_padding_pages[req.cp_padding_pages > 0]
+            if req.cp_padding_pages is not None
+            else torch.empty(0, device=tree_cache.req_to_token_pool.req_to_token.device, dtype=torch.int64)
+        )
+        if req.cp_written_pages is not None and padding_pages.numel() > 0:
+            padding_pages = padding_pages[
+                ~torch.isin(padding_pages, req.cp_written_pages)
+            ]
+
+        if get_context_parallel_world_size() > 1:
+            allocator = tree_cache.token_to_kv_pool_allocator
+            free_pages = allocator.free_pages
+            release_pages = allocator.release_pages
+            pending_free_pages = torch.empty(
+                (0,), device=allocator.device, dtype=torch.int64
+            )
+            if not getattr(allocator, "is_not_in_free_group", True):
+                free_group = getattr(allocator, "free_group", [])
+                if free_group:
+                    pending_indices = torch.cat(free_group)
+                    if pending_indices.numel() > 0:
+                        pending_free_pages = torch.unique(
+                            pending_indices // page_size
+                        )
+            if release_pages.numel() > 0 or pending_free_pages.numel() > 0:
+                already_free_pages = torch.unique(
+                    torch.cat((free_pages, release_pages, pending_free_pages))
+                )
+            else:
+                already_free_pages = free_pages
+
+            if padding_pages.numel() > 0:
+                padding_pages = padding_pages[
+                    ~torch.isin(padding_pages, already_free_pages)
+                ]
+
+            if padding_pages.numel() > 0:
+                to_free_indices = (
+                    padding_pages[:, None] * page_size
+                    + torch.arange(
+                        page_size, device=allocator.device, dtype=torch.int64
+                    )
+                ).reshape(-1)
+                allocator.free(to_free_indices)
+        else:
+            if padding_pages.numel() > 0:
+                to_free_indices = (
+                    padding_pages[:, None] * page_size
+                    + torch.arange(
+                        page_size, device=padding_pages.device, dtype=torch.int64
+                    )
+                ).reshape(-1)
+                tree_cache.token_to_kv_pool_allocator.free(to_free_indices)
+
+        req.cp_written_pages = None
+        req.cp_padding_pages = None
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 
