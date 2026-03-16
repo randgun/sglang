@@ -23,7 +23,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
     use_pcp,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -239,15 +238,12 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             return hidden_states, residual
         elif use_pcp(forward_batch):
             if hidden_states.shape[0] != 0:
-                # hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                # input_hidden_states = hidden_states
                 if not forward_batch.cp_metadata.is_gqa:
                     hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                     hidden_states, residual = layer_norm(hidden_states, residual)
                 else:
                     pcp_size = get_pcp_size()
                     pcp_rank = get_pcp_rank()
-                    # hidden_states = get_pcp_group().all_reduce(hidden_states)
                     hidden_states = hidden_states.tensor_split(pcp_size)[
                         pcp_rank
                     ]

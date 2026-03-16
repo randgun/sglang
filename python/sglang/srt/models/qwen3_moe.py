@@ -457,7 +457,7 @@ class Qwen3MoeAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.pcp_size = get_pcp_size() if self.enable_prefill_cp else None
+        self.pcp_size = get_pcp_size() if self.enable_prefill_cp else 1
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings

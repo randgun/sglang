@@ -271,6 +271,8 @@ def initialize_dp_attention(
 ):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE, _ATTN_PCP_SIZE, _ATTN_PCP_RANK
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+
+    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
@@ -289,14 +291,7 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    if pcp_size > 1:
-        assert not enable_dp_attention, "Prefill context parallelism is not supported with dp attention"
-        dp_size = pcp_size
-        enable_dp_attention = True
-
-    _ENABLE_DP_ATTENTION_FLAG = False if pcp_size > 1 else enable_dp_attention
-
-    _, _, _ATTN_DP_RANK = compute_dp_attention_world_info(
+    _, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
