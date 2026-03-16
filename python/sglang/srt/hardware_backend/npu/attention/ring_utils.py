@@ -6,8 +6,8 @@ import torch.nn.functional as F
 import inspect
 from functools import cache
 from sglang.srt.layers.dp_attention import (
-    get_pcp_size,
-    get_pcp_rank,
+    get_attention_cp_rank,
+    get_attention_cp_size,
 )
 
 
@@ -58,8 +58,8 @@ class RingComm:
     def __init__(self, process_group: dist.ProcessGroup):
         self._process_group = process_group
         self._ops = []
-        self.pcp_rank = get_pcp_rank()
-        self.pcp_size = get_pcp_size()
+        self.pcp_rank = get_attention_cp_rank()
+        self.pcp_size = get_attention_cp_size()
         self._reqs = None
 
         pcp_ranks = dist.get_process_group_ranks(self._process_group)

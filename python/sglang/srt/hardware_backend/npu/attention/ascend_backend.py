@@ -11,7 +11,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
 )
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state import get_pcp_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
@@ -27,8 +26,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
 )
 from sglang.srt.layers.dp_attention import (
-    get_pcp_group,
-    get_pcp_size,
+    get_attention_cp_group,
+    get_attention_cp_size,
 )
 from sglang.srt.hardware_backend.npu.attention.ring_utils import (
     RingComm, 
@@ -262,8 +261,8 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
-        self.is_prefill_cp_enable = model_runner.pcp_size > 1
-        self.pcp_size = model_runner.pcp_size
+        self.is_prefill_cp_enable = model_runner.attn_cp_size > 1
+        self.pcp_size = model_runner.attn_cp_size
 
         # dllm model config
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -1102,10 +1101,10 @@ class AscendAttnBackend(AttentionBackend):
             )
             return attn_out, lse
 
-        comm = RingComm(get_pcp_group().device_group)
+        comm = RingComm(get_attention_cp_group().device_group)
         out, lse, out_dtype = None, None, None
         next_k, next_v = None, None
-        pcp_size = get_pcp_size()
+        pcp_size = get_attention_cp_size()
         for loop in range(pcp_size):
             if loop + 1 != pcp_size:
                 next_k, next_v = comm.send_recv_kv(k, v)

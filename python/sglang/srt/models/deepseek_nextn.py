@@ -17,7 +17,6 @@
 import logging
 from typing import Iterable, Optional, Tuple
 
-from python.sglang.srt.distributed.parallel_state import get_context_parallel_rank
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -41,7 +40,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     is_dp_attention_enabled,
     pcp_ag_rearange_output,
-    get_pcp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -130,10 +128,8 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.enable_prefill_cp = is_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
-        elif self.is_enable_prefill_cp():
-            self.pcp_size = get_pcp_size()
+        if self.nsa_enable_prefill_cp or self.enable_prefill_cp:
+            self.cp_size = self.pcp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -234,12 +230,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.use_nsa = is_deepseek_nsa(config)
         self.enable_prefill_cp = is_nsa_enable_prefill_cp()  if self.use_nsa else is_enable_prefill_cp()
         if self.enable_prefill_cp:
-            if self.use_nsa:
-                self.cp_rank = get_attention_cp_rank()
-                self.cp_size = get_attention_cp_size()
-            else:
-                self.cp_size = self.pcp_size = get_pcp_size()
-                self.cp_rank = self.pcp_rank = get_context_parallel_rank()
+            self.cp_rank = self.pcp_rank = get_attention_cp_rank()
+            self.cp_size = self.pcp_size = get_attention_cp_size()
         else:
             self.cp_rank = None
             self.cp_size = None

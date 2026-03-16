@@ -3227,7 +3227,7 @@ def require_mlp_sync(server_args: ServerArgs):
     # `global_num_tokens`, even when dp-attention is disabled.
     return (
         server_args.enable_dp_attention
-        or server_args.prefill_context_parallel_size > 1
+        or server_args.attn_cp_size > 1
         or require_gathered_buffer(server_args)
     )
 
