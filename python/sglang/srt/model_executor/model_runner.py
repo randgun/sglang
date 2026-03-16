@@ -293,6 +293,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         tp_rank: int,
         tp_size: int,
         moe_ep_rank: int,
+        pcp_size: int,
         moe_ep_size: int,
         pp_rank: int,
         pp_size: int,
@@ -316,6 +317,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        self.pcp_size = pcp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.attn_cp_rank = attn_cp_rank
@@ -815,6 +817,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 attention_data_parallel_size=self.dp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                prefill_context_parallel_size=self.pcp_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
