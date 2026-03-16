@@ -662,8 +662,6 @@ class ServerArgs:
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
 
-    prefill_context_parallel_size: int = 1
-
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
@@ -3766,9 +3764,11 @@ class ServerArgs:
         parser.add_argument(
             "--attention-context-parallel-size",
             "--attn-cp-size",
+            "--prefill-context-parallel-size",
+            "--pcp-size",
             type=int,
             default=ServerArgs.attn_cp_size,
-            help="The attention context parallelism size.",
+            help="The attention context parallelism size (also used for prefill context parallelism).",
         )
         parser.add_argument(
             "--moe-data-parallel-size",
@@ -5355,14 +5355,6 @@ class ServerArgs:
             help="The output folder for dumping tensors.",
         )
         parser.add_argument(
-            "--prefill-context-parallel-size",
-            "--pcp-size",
-            type=int,
-            default=ServerArgs.prefill_context_parallel_size,
-            help="The context parallel size used in the long sequence prefill phase of DeepSeek v3.2.",
-        )
-
-        parser.add_argument(
             "--debug-tensor-dump-layers",
             type=int,
             nargs="+",
@@ -5612,8 +5604,6 @@ class ServerArgs:
         args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-        if hasattr(args, "pcp_size"):
-            args.prefill_context_parallel_size = args.pcp_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -5704,7 +5694,7 @@ class ServerArgs:
                 self.tp_size * self.pp_size
             ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
         else:
-            if self.prefill_context_parallel_size > 1:
+            if self.attn_cp_size > 1 and not self.enable_nsa_prefill_context_parallel:
                 assert (
                     self.disaggregation_mode!="decode"
                 ), "Prefill context parallelism is not supported in decode mode"
@@ -5715,8 +5705,8 @@ class ServerArgs:
                     self.disable_radix_cache
                 ), "Prefill context parallelism has not supported radix cache"
             assert (
-                self.tp_size * self.pp_size * self.prefill_context_parallel_size
-            ) % self.nnodes == 0, "(tp_size * pp_size * pcp_size) must be divisible by number of nodes"
+                self.tp_size * self.pp_size * self.attn_cp_size
+            ) % self.nnodes == 0, "(tp_size * pp_size * attn_cp_size) must be divisible by number of nodes"
 
         if self.pp_size > 1:
             assert (

@@ -20,7 +20,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_pcp_group,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -79,7 +78,8 @@ def is_nsa_prefill_cp_round_robin_split():
     )
 
 def is_enable_prefill_cp():
-    return get_global_server_args().prefill_context_parallel_size > 1
+    server_args = get_global_server_args()
+    return server_args.attn_cp_size > 1 and not server_args.enable_nsa_prefill_context_parallel
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():

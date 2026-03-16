@@ -45,7 +45,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
-    get_context_parallel_rank,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -74,12 +73,12 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
+    get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
-    get_pcp_size,
-    pcp_ag_rearange_output
+    pcp_ag_rearange_output,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1788,10 +1787,8 @@ class DeepseekV2Model(nn.Module):
         self.pp_group = get_pp_group()
         self.use_nsa = is_deepseek_nsa(config)
         self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
-        if self.enable_prefill_cp and self.use_nsa:
+        if self.enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
-        elif self.enable_prefill_cp:
-            self.cp_size = get_pcp_size()
         else:
             self.cp_size = None
 
@@ -2116,18 +2113,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.use_nsa = is_deepseek_nsa(config)
         self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
-        if self.enable_prefill_cp and self.use_nsa:
-            #3.2
-            self.cp_rank = get_attention_cp_rank()
-            self.cp_size = get_attention_cp_size()
-        elif self.enable_prefill_cp:
-            #3
-            self.cp_rank = self.pcp_rank = get_context_parallel_rank()
-            self.cp_size = self.pcp_size = get_pcp_size()
+        if self.enable_prefill_cp:
+            self.cp_rank = self.pcp_rank = get_attention_cp_rank()
+            self.cp_size = self.pcp_size = get_attention_cp_size()
         else:
             self.cp_rank = self.cp_size = None
             self.pcp_rank = self.pcp_size = None
-
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
@@ -2192,20 +2183,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.enable_prefill_cp and self.use_nsa:
+        if self.enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
-                    input_ids.device,
-                )
-        elif self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
                     input_ids.device,
                 )
 

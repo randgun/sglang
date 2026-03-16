@@ -23,7 +23,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
-    get_pcp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -41,8 +40,6 @@ if TYPE_CHECKING:
 
 _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
-_ATTN_PCP_SIZE: Optional[int] = None
-_ATTN_PCP_RANK: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
@@ -269,21 +266,15 @@ def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
-    global _ATTN_DP_RANK, _ATTN_DP_SIZE, _ATTN_PCP_SIZE, _ATTN_PCP_RANK
+    global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
 
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
-    pcp_size = server_args.prefill_context_parallel_size
 
-    if pcp_size > 1:
-        assert not enable_dp_attention, "Prefill context parallelism is not supported with dp attention"
-        dp_size = pcp_size
-        enable_dp_attention = True
-
-    _ENABLE_DP_ATTENTION_FLAG = False if pcp_size > 1 else enable_dp_attention
+    _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
@@ -305,29 +296,11 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
-    if pcp_size > 1:
-        # PCP reuses attention-TP partitioning but should not expose logical DP to
-        # downstream paths that index `global_num_tokens` by DP rank.
-        _ATTN_PCP_RANK = _ATTN_DP_RANK
-        _ATTN_PCP_SIZE = pcp_size
-        _ATTN_DP_RANK = 0
-        _ATTN_DP_SIZE = 1
-        _LOCAL_ATTN_DP_RANK = 0
-        _LOCAL_ATTN_DP_SIZE = 1
-
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
         device=torch.device(server_args.device),
     )
-
-def get_pcp_rank() -> int:
-    assert _ATTN_PCP_RANK is not None, "pcp attention not initialized!"
-    return _ATTN_PCP_RANK
-
-def get_pcp_size() -> int:
-    assert _ATTN_PCP_SIZE is not None, "pcp attention not initialized!"
-    return _ATTN_PCP_SIZE
 
 
 def is_dp_attention_enabled() -> bool:
@@ -627,13 +600,13 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
         device=input_tensor.device,
     )
 
-    pcp_group = get_pcp_group()
+    cp_group = get_attention_cp_group()
 
     assert (
-        pcp_group.world_size == pcp_size
-    ), f"pcp metadata/group mismatch: pcp_size={pcp_size}, pcp_group.world_size={pcp_group.world_size}"
+        cp_group.world_size == pcp_size
+    ), f"pcp metadata/group mismatch: pcp_size={pcp_size}, cp_group.world_size={cp_group.world_size}"
 
-    pcp_group.all_gather_into_tensor(
+    cp_group.all_gather_into_tensor(
         all_shuffled_sensor, input_tensor
         )
     
