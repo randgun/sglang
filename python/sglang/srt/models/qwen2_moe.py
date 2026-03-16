@@ -637,7 +637,7 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+        if use_pcp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
@@ -686,7 +686,7 @@ class Qwen2MoeModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
                 
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+        if use_pcp(forward_batch):
             hidden_states = pcp_ag_rearange_output(
                 hidden_states.contiguous(),
                 self.pcp_size,

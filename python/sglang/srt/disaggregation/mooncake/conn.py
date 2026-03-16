@@ -389,77 +389,30 @@ class MooncakeKVManager(CommonKVManager):
         cp_metadata: ContextParallelMetadata,
         page_size: int,
     ) -> npt.NDArray[np.int32]:
-        """
-        Map Prefill page indices to Decode page indices in CP mode.
-        
-        Example:
-        - actual_seq_len = 12345, page_size = 32, cp_size = 4
-        - split_list = [1568, 1568, 1568, 1568, 1568, 1568, 1568, 1568]
-        - pages_per_block = 49 (1568 // 32), CP_Rank 0: zigzag_index = [0, 7]
-        - Prefill stores blocks in zigzag order: [block 0 (pages 0-48), block 7 (pages 49-97)]
-        - Prefill page 0 -> zigzag block 0 -> original block 0 -> Decode page 0
-        - Prefill page 49 -> zigzag block 1 -> original block 7 -> Decode page 343
-        - For prefill_page_idx = 49:
-          * block_idx_zigzag = 49 // 49 = 1
-          * original_block_idx = zigzag_index[1] = 7
-          * page_offset_in_block = 49 % 49 = 0
-          * block_token_start = sum(split_list[0..6]) = 1568 * 7 = 10976
-          * page_token_start = 10976 + 0 * 32 = 10976
-          * decode_page_idx = 10976 // 32 = 343
-        """
-        pages_per_block = cp_metadata.split_list[0] // page_size
         zigzag_len = len(cp_metadata.zigzag_index)
         prefill_len = int(prefill_page_indices.shape[0])
-        if prefill_len > 0:
-            max_prefill_page = int(prefill_page_indices.max())
-            max_block_idx_zigzag = max_prefill_page // pages_per_block
-        else:
-            max_prefill_page = -1
-            max_block_idx_zigzag = -1
-        
-        # Prefer block_page_counts if provided (zigzag order)
-        use_block_counts = (
-            cp_metadata.block_page_counts is not None
-            and len(cp_metadata.block_page_counts) == zigzag_len
-            and sum(cp_metadata.block_page_counts) == prefill_len
-        )
-        if use_block_counts:
-            decode_page_indices = []
-            for zigzag_pos, original_block_idx in enumerate(cp_metadata.zigzag_index):
-                count = cp_metadata.block_page_counts[zigzag_pos]
-                if count <= 0:
-                    continue
-                block_token_start = sum(
-                    cp_metadata.split_list[j] for j in range(original_block_idx)
-                )
-                for local_page_idx in range(count):
-                    page_token_start = block_token_start + local_page_idx * page_size
-                    decode_page_indices.append(page_token_start // page_size)
-            return np.array(decode_page_indices, dtype=np.int32)
+        if (
+            cp_metadata.block_page_counts is None
+            or len(cp_metadata.block_page_counts) != zigzag_len
+            or sum(cp_metadata.block_page_counts) != prefill_len
+        ):
+            raise ValueError(
+                "Invalid PCP block_page_counts for decode-side page mapping: "
+                f"zigzag_len={zigzag_len} prefill_len={prefill_len} "
+                f"block_page_counts={cp_metadata.block_page_counts}"
+            )
 
-        # Fallback to legacy mapping using global page indices
         decode_page_indices = []
-        for prefill_page_idx in prefill_page_indices:
-            # Convert global page index to global block index
-            original_block_idx = prefill_page_idx // pages_per_block
-            # Map global block index to zigzag position for this CP rank
-            block_idx_zigzag = cp_metadata.zigzag_index.index(original_block_idx)
-
-            # Calculate page offset within the block
-            page_offset_in_block = prefill_page_idx % pages_per_block
-
-            # Calculate block start token position in original request
+        for zigzag_pos, original_block_idx in enumerate(cp_metadata.zigzag_index):
+            count = cp_metadata.block_page_counts[zigzag_pos]
+            if count <= 0:
+                continue
             block_token_start = sum(
                 cp_metadata.split_list[j] for j in range(original_block_idx)
             )
-
-            # Calculate page start token position in original request
-            page_token_start = block_token_start + page_offset_in_block * page_size
-
-            # Calculate Decode page index
-            decode_page_idx = page_token_start // page_size
-            decode_page_indices.append(decode_page_idx)
-
+            for local_page_idx in range(count):
+                page_token_start = block_token_start + local_page_idx * page_size
+                decode_page_indices.append(page_token_start // page_size)
         return np.array(decode_page_indices, dtype=np.int32)
 
     def send_kvcache(

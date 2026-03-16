@@ -147,7 +147,8 @@ class FutureMap:
             if self.is_empty_slice(intv):
                 return
             next_token_ids = batch_result.next_token_ids
-            if next_token_ids is None or next_token_ids.numel() == 0:
+            assert next_token_ids is not None
+            if next_token_ids.numel() == 0:
                 # CP ranks can have zero valid tokens; skip storing.
                 return
             self.token_ids_buf[intv] = next_token_ids

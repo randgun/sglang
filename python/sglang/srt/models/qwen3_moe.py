@@ -536,7 +536,7 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+        if use_pcp(forward_batch):
             hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
             positions = cp_pad_local_tokens(forward_batch, positions)
         qkv, _ = self.qkv_proj(hidden_states)
@@ -565,7 +565,7 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+        if use_pcp(forward_batch):
             hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
             positions = cp_pad_local_tokens(forward_batch, positions)
         qkv, _ = self.qkv_proj(hidden_states)
@@ -643,7 +643,7 @@ class Qwen3MoeAttention(nn.Module):
             # Outside PCP, the empty rank can exit early. In PCP we still route
             # through forward_prepare_* so the rank stays on the shared path and
             # pad to the fixed local PCP layout before attention.
-            if not (self.enable_prefill_cp and use_pcp(forward_batch)):
+            if not use_pcp(forward_batch):
                 return hidden_states, forward_batch, None
         if not _is_npu or forward_batch.forward_mode.is_extend():
             return self.forward_prepare_native(
@@ -811,15 +811,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
-        if hidden_states.shape[0] != 0 or (
-            self.enable_prefill_cp and use_pcp(forward_batch)
-        ):
+        if hidden_states.shape[0] != 0 or use_pcp(forward_batch):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+        if use_pcp(forward_batch):
             hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
             if residual is not None:
                 residual = cp_pad_local_tokens(forward_batch, residual)

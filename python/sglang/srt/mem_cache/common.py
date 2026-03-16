@@ -79,6 +79,87 @@ def write_req_to_token_pool_triton(
         )
 
 
+def _write_cp_cache_indices(
+    out_cache_loc: torch.Tensor,
+    req_idx: int,
+    prefix_len: int,
+    pt: int,
+    req: "Req",
+    req_to_token_pool: ReqToTokenPool,
+):
+    cp_metadata = req.cp_metadata
+    actual_seq_len = cp_metadata.actual_seq_len
+    out_offset = pt
+    written_pages = []
+    padding_pages = []
+    page_size = get_global_server_args().page_size
+    aligned_actual_len = ceil_align(actual_seq_len, page_size)
+
+    # CP writes only the current rank's zigzag blocks into req_to_token.
+    # Clear the active range first so a reused request slot does not keep
+    # stale indices in the holes owned by peer CP ranks.
+    if actual_seq_len > prefix_len:
+        req_to_token_pool.req_to_token[req_idx, prefix_len:actual_seq_len] = 0
+
+    for block_idx in cp_metadata.zigzag_index:
+        block_size = cp_metadata.split_list[block_idx]
+        block_token_start = 0
+        for j in range(block_idx):
+            block_token_start += cp_metadata.split_list[j]
+        block_token_end = block_token_start + block_size
+
+        if block_token_start < actual_seq_len:
+            extend_block_end = min(block_token_end, actual_seq_len)
+            write_size = extend_block_end - block_token_start
+            if write_size > 0:
+                written_chunk = out_cache_loc[out_offset : out_offset + write_size]
+                req_to_token_pool.write(
+                    (req_idx, slice(block_token_start, extend_block_end)),
+                    written_chunk,
+                )
+                written_pages.append(torch.unique(written_chunk // page_size))
+
+            if write_size < block_size:
+                free_start = max(write_size, aligned_actual_len - block_token_start)
+                if free_start < block_size:
+                    padding_chunk = out_cache_loc[
+                        out_offset + free_start : out_offset + block_size
+                    ]
+                    padding_pages.append(torch.unique(padding_chunk // page_size))
+        else:
+            free_start = max(0, aligned_actual_len - block_token_start)
+            if free_start < block_size:
+                padding_chunk = out_cache_loc[
+                    out_offset + free_start : out_offset + block_size
+                ]
+                padding_pages.append(torch.unique(padding_chunk // page_size))
+
+        out_offset += block_size
+
+    if written_pages:
+        new_written_pages = torch.unique(torch.cat(written_pages))
+        if req.cp_written_pages is None:
+            req.cp_written_pages = new_written_pages
+        else:
+            req.cp_written_pages = torch.unique(
+                torch.cat([req.cp_written_pages, new_written_pages])
+            )
+
+    if padding_pages:
+        new_padding_pages = torch.unique(torch.cat(padding_pages))
+        if req.cp_written_pages is not None:
+            new_padding_pages = new_padding_pages[
+                ~torch.isin(new_padding_pages, req.cp_written_pages)
+            ]
+        if new_padding_pages.numel() > 0:
+            if req.cp_padding_pages is None:
+                req.cp_padding_pages = new_padding_pages
+            else:
+                req.cp_padding_pages = torch.unique(
+                    torch.cat([req.cp_padding_pages, new_padding_pages])
+                )
+
+
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -96,9 +177,6 @@ def write_cache_indices(
     # Check if CP is enabled
     enable_cp = is_enable_prefill_cp()
     server_args = get_global_server_args()
-    force_full_alloc_non_pd_cp = (
-        enable_cp and server_args.disaggregation_mode == "null"
-    )
 
     if support_triton(get_global_server_args().attention_backend) and not enable_cp:
         prefix_pointers = torch.tensor(
@@ -130,77 +208,12 @@ def write_cache_indices(
                 prefix_tensors[i],
             )
 
-            if enable_cp and not force_full_alloc_non_pd_cp:
+            if enable_cp and server_args.disaggregation_mode != "null":
                 if reqs is None:
                     raise ValueError("reqs must be provided when CP mode is enabled")
-                cp_metadata = reqs[i].cp_metadata
-                actual_seq_len = cp_metadata.actual_seq_len
-                out_offset = pt
-                overallocated_chunks = []
-
-                page_size = get_global_server_args().page_size
-                aligned_actual_len = ceil_align(actual_seq_len, page_size)
-
-                # CP writes only the current rank's zigzag blocks into req_to_token.
-                # Clear the active range first so a reused request slot does not keep
-                # stale indices in the holes owned by peer CP ranks.
-                if actual_seq_len > prefix_len:
-                    req_to_token_pool.req_to_token[req_idx, prefix_len:actual_seq_len] = 0
-
-                for block_idx in cp_metadata.zigzag_index:
-                    block_size = cp_metadata.split_list[block_idx]
-
-                    # Calculate token range of block_idx
-                    block_token_start = 0
-                    for j in range(block_idx):
-                        block_token_start += cp_metadata.split_list[j]
-                    block_token_end = block_token_start + block_size
-
-                    # Calculate write range within actual sequence
-                    if block_token_start < actual_seq_len:
-                        extend_block_start = block_token_start
-                        extend_block_end = min(block_token_end, actual_seq_len)
-                        write_size = extend_block_end - extend_block_start
-
-                        if write_size > 0:
-                            # Write to req_to_token_pool
-                            req_to_token_pool.write(
-                                (req_idx, slice(extend_block_start, extend_block_end)),
-                                out_cache_loc[out_offset : out_offset + write_size],
-                            )
-
-                        # Collect padding indices in this block (if any),
-                        # but only those fully beyond aligned_actual_len to avoid double-free.
-                        if write_size < block_size:
-                            free_start = max(write_size, aligned_actual_len - block_token_start)
-                            if free_start < block_size:
-                                overallocated_chunks.append(
-                                    out_cache_loc[out_offset + free_start : out_offset + block_size]
-                                )
-                    else:
-                        # Entire block is beyond actual sequence length: all are padding
-                        free_start = max(0, aligned_actual_len - block_token_start)
-                        if free_start < block_size:
-                            overallocated_chunks.append(
-                                out_cache_loc[out_offset + free_start : out_offset + block_size]
-                            )
-
-                    # Always advance by full block size to stay aligned with allocation
-                    out_offset += block_size
-
-                # Stash overallocated indices on request for later free
-                if overallocated_chunks:
-                    new_overalloc = torch.cat(overallocated_chunks)
-                    if reqs[i].cp_overallocated_kv_indices is None:
-                        reqs[i].cp_overallocated_kv_indices = new_overalloc
-                    else:
-                        reqs[i].cp_overallocated_kv_indices = torch.cat(
-                            [reqs[i].cp_overallocated_kv_indices, new_overalloc]
-                        )
-                else:
-                    if reqs[i].cp_overallocated_kv_indices is None:
-                        reqs[i].cp_overallocated_kv_indices = None
-                
+                _write_cp_cache_indices(
+                    out_cache_loc, req_idx, prefix_len, pt, reqs[i], req_to_token_pool
+                )
             else:
                 req_to_token_pool.write(
                     (req_idx, slice(prefix_len, seq_len)),
@@ -569,48 +582,32 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
-    if getattr(req, "cp_overallocated_kv_indices", None) is not None:
+    if (
+        getattr(req, "cp_padding_pages", None) is not None
+        or getattr(req, "cp_written_pages", None) is not None
+    ):
         from sglang.srt.distributed.parallel_state import (
             get_context_parallel_world_size,
         )
 
-        if get_context_parallel_world_size() > 1:
-            page_size = get_global_server_args().page_size
-            allocator = tree_cache.token_to_kv_pool_allocator
-            goto_free_cp_overalloc = True
-
-            # (a) 璁＄畻 overalloc 椤甸泦鍚?
-            overalloc_indices = req.cp_overallocated_kv_indices
-            # Defensive: never free dummy page 0 if it appears in CP overalloc.
-            num_page0_overalloc = (overalloc_indices < page_size).sum().item()
-            if num_page0_overalloc > 0:
-                overalloc_indices = overalloc_indices[overalloc_indices >= page_size]
-            overalloc_pages = torch.unique(overalloc_indices // page_size)
-
-            # (b) 璁＄畻鏈?rank 鏈夋晥鍖洪棿椤甸泦鍚堬紙metadata锛?
-            # NOTE: overalloc_pages are physical page ids from allocator outputs.
-            # Do not filter them by logical token ranges from cp_metadata.
-
-            # (c) 璁＄畻宸插啓椤甸泦鍚堬紙req_to_token_pool锛?
-            committed_indices = tree_cache.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_committed_len
+        page_size = get_global_server_args().page_size
+        padding_pages = (
+            req.cp_padding_pages[req.cp_padding_pages > 0]
+            if req.cp_padding_pages is not None
+            else torch.empty(0, device=tree_cache.req_to_token_pool.req_to_token.device, dtype=torch.int64)
+        )
+        if req.cp_written_pages is not None and padding_pages.numel() > 0:
+            padding_pages = padding_pages[
+                ~torch.isin(padding_pages, req.cp_written_pages)
             ]
-            committed_indices = committed_indices[committed_indices > 0]
-            written_pages = (
-                torch.unique(committed_indices // page_size)
-                if committed_indices.numel() > 0
-                else torch.empty(0, device=allocator.device, dtype=torch.int64)
-            )
 
-            # (d) 璁＄畻 allocator 宸?free 鐨勯〉
+        if get_context_parallel_world_size() > 1:
+            allocator = tree_cache.token_to_kv_pool_allocator
             free_pages = allocator.free_pages
             release_pages = allocator.release_pages
             pending_free_pages = torch.empty(
                 (0,), device=allocator.device, dtype=torch.int64
             )
-            # If we are inside a free-group, pages freed earlier in this group
-            # are not yet reflected in free_pages/release_pages. Include them
-            # to avoid double-free.
             if not getattr(allocator, "is_not_in_free_group", True):
                 free_group = getattr(allocator, "free_group", [])
                 if free_group:
@@ -626,24 +623,31 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             else:
                 already_free_pages = free_pages
 
-            mask_written = ~torch.isin(overalloc_pages, written_pages)
-            overalloc_pages = overalloc_pages[mask_written]
+            if padding_pages.numel() > 0:
+                padding_pages = padding_pages[
+                    ~torch.isin(padding_pages, already_free_pages)
+                ]
 
-            mask_free = ~torch.isin(overalloc_pages, already_free_pages)
-            overalloc_pages = overalloc_pages[mask_free]
-
-            if goto_free_cp_overalloc and overalloc_pages.numel() > 0:
+            if padding_pages.numel() > 0:
                 to_free_indices = (
-                    overalloc_pages[:, None] * page_size
+                    padding_pages[:, None] * page_size
                     + torch.arange(
                         page_size, device=allocator.device, dtype=torch.int64
                     )
                 ).reshape(-1)
                 allocator.free(to_free_indices)
         else:
-            tree_cache.token_to_kv_pool_allocator.free(req.cp_overallocated_kv_indices)
+            if padding_pages.numel() > 0:
+                to_free_indices = (
+                    padding_pages[:, None] * page_size
+                    + torch.arange(
+                        page_size, device=padding_pages.device, dtype=torch.int64
+                    )
+                ).reshape(-1)
+                tree_cache.token_to_kv_pool_allocator.free(to_free_indices)
 
-        req.cp_overallocated_kv_indices = None
+        req.cp_written_pages = None
+        req.cp_padding_pages = None
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 

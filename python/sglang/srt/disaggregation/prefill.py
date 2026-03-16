@@ -749,57 +749,17 @@ class SchedulerDisaggregationPrefillMixin:
                 block_page_counts.append(len(block_prefill_pages))
 
             prefill_page_indices_array = np.array(prefill_page_indices, dtype=np.int32)
-            if len(prefill_page_indices_array) == 0:
-                # For FakeKVSender (health check), still mark as sent to avoid hanging.
-                if isinstance(req.disagg_kv_sender, FakeKVSender):
-                    req.disagg_kv_sender.send(prefill_page_indices_array, state_indices)
-                    return
-                # For CP ranks with no pages, proactively notify decode of success
-                if not isinstance(req.disagg_kv_sender, FakeKVSender):
-                    kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
-                    if (
-                        kv_mgr is not None
-                        and hasattr(kv_mgr, "transfer_infos")
-                        and hasattr(kv_mgr, "sync_status_to_decode_endpoint")
-                    ):
-                        if getattr(kv_mgr, "pcp_size", 1) > 1:
-                            local_rank = (
-                                (kv_mgr.pcp_rank * kv_mgr.attn_tp_size + kv_mgr.attn_tp_rank)
-                                * kv_mgr.pp_size
-                                + kv_mgr.pp_rank
-                            )
-                        else:
-                            local_rank = (
-                                kv_mgr.attn_tp_rank * kv_mgr.pp_size + kv_mgr.pp_rank
-                            )
-                        if req.bootstrap_room in kv_mgr.transfer_infos:
-                            for info in kv_mgr.transfer_infos[req.bootstrap_room].values():
-                                kv_mgr.sync_status_to_decode_endpoint(
-                                    info.endpoint,
-                                    info.dst_port,
-                                    info.room,
-                                    KVPoll.Success,
-                                    local_rank,
-                                )
-                            kv_mgr.update_status(req.bootstrap_room, KVPoll.Success)
-                return
-
-            # Store per-block page counts (zigzag order) for decode-side mapping
             cp_metadata.block_page_counts = block_page_counts
+            local_pages = len(prefill_page_indices_array)
 
             if isinstance(req.disagg_kv_sender, FakeKVSender):
                 req.disagg_kv_sender.send(prefill_page_indices_array, state_indices)
                 return
 
-            # CP sender should track rank-local page count; otherwise `is_last`
-            # can never be reached when global pages != local pages.
-            sender_expected_pages = getattr(req.disagg_kv_sender, "num_kv_indices", None)
-            local_pages = len(prefill_page_indices_array)
             if (
                 hasattr(req.disagg_kv_sender, "curr_idx")
                 and req.disagg_kv_sender.curr_idx == 0
-                and sender_expected_pages is not None
-                and sender_expected_pages != local_pages
+                and hasattr(req.disagg_kv_sender, "num_kv_indices")
             ):
                 req.disagg_kv_sender.num_kv_indices = local_pages
 

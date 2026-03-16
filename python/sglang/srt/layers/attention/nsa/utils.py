@@ -35,8 +35,6 @@ class ContextParallelMetadata:
     tail_padded_len: int = 0
     reverse_split_len: Optional[List[int]] = None
     cp_reverse_index: Optional[List[int]] = None
-    # Per-rank valid ranges (in original sequence index space), computed
-    # by intersecting each zigzag block with [0, actual_seq_len).
     rank_valid_ranges: Optional[List[Tuple[int, int]]] = None
     kv_len_prev: int = -1
     kv_len_next: int = -1
@@ -56,15 +54,12 @@ class ContextParallelMetadata:
     attn_mask_seqlens: Optional[torch.Tensor] = None
     head_q_seqlens: Optional[List[int]] = None
     tail_q_seqlens: Optional[List[int]] = None
-    # For KV transfer
     cp_size: Optional[int] = None
     cp_rank: Optional[int] = None
     aligned_seq_len: Optional[int] = None
     actual_seq_len: Optional[int] = None
-    # Per-block page counts for CP KV transfer (zigzag order)
     block_page_counts: Optional[List[int]] = None
     is_gqa: Optional[bool] = True
-
 
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
@@ -389,12 +384,10 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         return False
 
 def use_pcp(forward_batch):
-    if (forward_batch.cp_metadata is not None
+    return (
+        is_enable_prefill_cp()
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_enable_prefill_cp()):
-            return True
-    else:
-        return False
+    )
 
 
 def cp_attn_tp_all_gather_reorganazied_into_tensor(

@@ -289,9 +289,10 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
+        assert hidden_states is not None
         # CP ranks can legitimately have zero valid tokens after splitting.
         # In this case, return empty tensors to keep downstream slicing safe.
-        if hidden_states is None or hidden_states.numel() == 0:
+        if hidden_states.numel() == 0:
             vocab_size = getattr(self.config, "vocab_size", None)
             if vocab_size is None:
                 if hasattr(lm_head, "weight"):
@@ -303,18 +304,7 @@ class LogitsProcessor(nn.Module):
                             vocab_size *= get_tensor_model_parallel_world_size()
                 else:
                     vocab_size = 0
-            if hidden_states is None:
-                if hasattr(lm_head, "weight"):
-                    device = lm_head.weight.device
-                    dtype = lm_head.weight.dtype
-                    hidden_size = lm_head.weight.shape[1]
-                else:
-                    device = get_dp_device()
-                    dtype = get_dp_dtype()
-                    hidden_size = get_dp_hidden_size()
-                empty_hidden = torch.empty((0, hidden_size), device=device, dtype=dtype)
-            else:
-                empty_hidden = hidden_states
+            empty_hidden = hidden_states
             empty_logits = empty_hidden.new_empty((0, vocab_size))
             return LogitsProcessorOutput(
                 next_token_logits=empty_logits,

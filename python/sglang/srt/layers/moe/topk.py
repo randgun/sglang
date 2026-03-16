@@ -347,23 +347,8 @@ class TopK(MultiPlatformOp):
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
-        if hidden_states.numel() == 0 or hidden_states.shape[0] == 0:
-            topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                topk_weights = torch.empty(
-                    (0, topk), dtype=torch.float32, device=hidden_states.device
-                )
-                topk_ids = torch.full(
-                    (0, topk), -1, dtype=torch.int32, device=hidden_states.device
-                )
-            empty_router_logits = (
-                router_logits
-                if router_logits is not None
-                else torch.empty((0, topk), dtype=torch.float32, device=hidden_states.device)
-            )
-            return StandardTopKOutput(topk_weights, topk_ids, empty_router_logits)
+        if hidden_states.numel() == 0:
+            return self.empty_topk_output(hidden_states.device, router_logits)
 
         return fused_topk_npu(
             hidden_states=hidden_states,
@@ -374,15 +359,20 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
         )
 
-    def empty_topk_output(self, device: torch.device) -> TopKOutput:
+    def empty_topk_output(
+        self,
+        device: torch.device,
+        router_logits: Optional[torch.Tensor] = None,
+    ) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
-        # FIXME: router_logits should be of size (0, num_experts)
-        router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
+        if router_logits is None:
+            # FIXME: router_logits should be of size (0, num_experts)
+            router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 

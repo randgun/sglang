@@ -632,43 +632,6 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
             f"(forward_mode={getattr(forward_batch, 'forward_mode', None)})"
         )
     max_len = cp_metadata.max_rank_len[0]
-
-    if (
-        cp_metadata.max_rank_len is None
-        or len(cp_metadata.max_rank_len) != cp_rank_count
-    ):
-        if cp_metadata.per_rank_actual_token is not None:
-            max_len = max(cp_metadata.per_rank_actual_token)
-        else:
-            total_len = cp_metadata.total_seq_lens
-            max_len = (total_len + cp_rank_count - 1) // cp_rank_count
-        cp_metadata.max_rank_len = [max_len] * cp_rank_count
-
-    if (
-        cp_metadata.per_rank_actual_token is None
-        or len(cp_metadata.per_rank_actual_token) != cp_rank_count
-    ):
-        raise ValueError(
-            "pcp metadata invalid per_rank_actual_token: "
-            f"len={None if cp_metadata.per_rank_actual_token is None else len(cp_metadata.per_rank_actual_token)} "
-            f"cp_rank_count={cp_rank_count}"
-        )
-    if (
-        cp_metadata.reverse_split_len is None
-        or len(cp_metadata.reverse_split_len) == 0
-    ):
-        raise ValueError(
-            f"pcp metadata invalid reverse_split_len={cp_metadata.reverse_split_len}"
-        )
-    if (
-        cp_metadata.cp_reverse_index is None
-        or len(cp_metadata.cp_reverse_index) != len(cp_metadata.reverse_split_len)
-    ):
-        raise ValueError(
-            "pcp metadata invalid cp_reverse_index: "
-            f"len(cp_reverse_index)={None if cp_metadata.cp_reverse_index is None else len(cp_metadata.cp_reverse_index)} "
-            f"len(reverse_split_len)={len(cp_metadata.reverse_split_len)}"
-        )
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
         input_tensor = F.pad(
@@ -684,9 +647,6 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
         device=input_tensor.device,
     )
 
-    assert (
-        pcp_group.world_size == cp_rank_count
-    ), f"pcp metadata/group mismatch: cp_rank_count={cp_rank_count}, pcp_group.world_size={pcp_group.world_size}"
     assert (
         getattr(comm_group, "world_size", None) == cp_rank_count
     ), f"comm group size mismatch: cp_rank_count={cp_rank_count}, comm_group.world_size={getattr(comm_group, 'world_size', None)}"
