@@ -141,6 +141,12 @@ def write_cache_indices(
                 page_size = get_global_server_args().page_size
                 aligned_actual_len = ceil_align(actual_seq_len, page_size)
 
+                # CP writes only the current rank's zigzag blocks into req_to_token.
+                # Clear the active range first so a reused request slot does not keep
+                # stale indices in the holes owned by peer CP ranks.
+                if actual_seq_len > prefix_len:
+                    req_to_token_pool.req_to_token[req_idx, prefix_len:actual_seq_len] = 0
+
                 for block_idx in cp_metadata.zigzag_index:
                     block_size = cp_metadata.split_list[block_idx]
 
