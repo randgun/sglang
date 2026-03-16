@@ -1859,6 +1859,8 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
+    if prefill_context_parallel_size > 1 and attn_dp_size == 1:
+        attn_dp_size = prefill_context_parallel_size
     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
 
     global _ATTN_CP

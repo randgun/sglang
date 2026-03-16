@@ -269,10 +269,9 @@ def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
-    global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE, _ATTN_PCP_SIZE, _ATTN_PCP_RANK
+    global _ATTN_DP_RANK, _ATTN_DP_SIZE, _ATTN_PCP_SIZE, _ATTN_PCP_RANK
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
 
-    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
@@ -285,13 +284,11 @@ def initialize_dp_attention(
         enable_dp_attention = True
 
     _ENABLE_DP_ATTENTION_FLAG = False if pcp_size > 1 else enable_dp_attention
-    pp_size = server_args.pp_size
-    pcp_size = server_args.prefill_context_parallel_size
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
@@ -317,29 +314,6 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_RANK = 0
         _LOCAL_ATTN_DP_SIZE = 1
-
-    tp_group = get_tp_group()
-    # Trick to solve circular references
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-
-    use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
-    group_ranks = [
-        list(range(head,head + _ATTN_TP_SIZE))
-        for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
-    ]
-    _ATTN_TP_GROUP = GroupCoordinator(
-        group_ranks,
-        tp_group.local_rank,
-        torch.distributed.get_backend(tp_group.device_group),
-        use_pynccl=use_pynccl,
-        use_pymscclpp=False,
-        use_custom_allreduce=False,
-        use_torch_symm_mem_all_reduce=False,
-        use_hpu_communicator=False,
-        use_xpu_communicator=False,
-        use_npu_communicator=False,
-        group_name="attention_tp",
-    )
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
