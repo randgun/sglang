@@ -25,6 +25,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -252,6 +253,11 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+        kv_heads = model_runner.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        )
+        self.k_hidden_size = kv_heads * model_runner.model_config.head_dim
+        self.v_hidden_size = kv_heads * model_runner.model_config.v_head_dim
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -340,6 +346,19 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+
+        if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+            max_seq_len = max_num_tokens // max_bs
+            self.graph_metadata["np_page_k"] = torch.empty(
+                (max_bs, max_seq_len, self.k_hidden_size),
+                dtype=torch.int8,
+                device=self.device,
+            )
+            self.graph_metadata["np_page_v"] = torch.empty(
+                (max_bs, max_seq_len, self.v_hidden_size),
+                dtype=torch.int8,
+                device=self.device,
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1147,6 +1166,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                # 图模式分支：使用预分配 buffer 和向量化操作
+                if self.graph_mode and not self.enable_torch_compile:
+                    # 图模式下使用专门的图模式实现
+                    return self.forward_mtp_graph_c8(
+                        query, k_cache, v_cache, layer, forward_batch,
+                        actual_seq_lengths_kv, kv_dequant_scale
+                    )
+                
+                # 非图模式：保持原有实现
                 kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, 0)
 
                 bs = self.forward_metadata.block_tables.shape[0]
@@ -1160,13 +1188,14 @@ class AscendAttnBackend(AttentionBackend):
                         f", {self.page_size=}, {layer.tp_k_head_num=}, {actual_seq_lengths_kv=}, {kv_dequant_scale.shape=} {self.forward_metadata.seq_lens=}", flush=True)
 
                 hidden_dim = layer.tp_k_head_num * layer.v_head_dim
-                np_page_k = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
-                np_page_v = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
+                # np_page_k = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
+                # np_page_v = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
 
-                for i in range(bs):
-                    np_page_k[i] = k_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
-                    np_page_v[i] = v_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
-
+                # for i in range(bs):
+                #     np_page_k[i] = k_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
+                #     np_page_v[i] = v_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
+                np_page_k = k_cache[self.forward_metadata.block_tables].view(bs, -1, hidden_dim)
+                np_page_v = v_cache[self.forward_metadata.block_tables].view(bs, -1, hidden_dim)
                 # 算子在Q_S>1时不支持page attention
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
@@ -1314,6 +1343,67 @@ class AscendAttnBackend(AttentionBackend):
                     dim=0,
                 )
             return attn_output
+
+    def forward_mtp_graph_c8(
+        self,
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        actual_seq_lengths_kv: List[int],
+        kv_dequant_scale: torch.Tensor,
+    ):
+        bs = self.graph_metadata["np_page_k"].shape[0]
+        
+        hidden_dim_k = layer.tp_k_head_num * layer.qk_head_dim
+        hidden_dim_v = layer.tp_v_head_num * layer.v_head_dim
+        
+        # 1. 获取预分配的 Buffer
+        np_page_k_buffer = self.graph_metadata["np_page_k"]
+        np_page_v_buffer = self.graph_metadata["np_page_v"]
+        
+        block_tables_static = self.forward_metadata.block_tables
+        
+        page_size = k_cache.shape[1]
+        block_tables_flat = block_tables_static.flatten()
+
+        torch.index_select(
+            k_cache, 
+            dim=0, 
+            index=block_tables_flat, 
+            out=np_page_k_buffer.view(-1, page_size, hidden_dim_k)
+        )
+
+        torch.index_select(
+            v_cache, 
+            dim=0, 
+            index=block_tables_flat, 
+            out=np_page_v_buffer.view(-1, page_size, hidden_dim_v)
+        )
+        query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
+        
+        # 3. 修正 scale 参数的传入
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query,
+            np_page_k_buffer,
+            np_page_v_buffer,
+            num_query_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="BSH",
+            softmax_scale=layer.scaling,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            key_quant_mode=1,
+            value_quant_mode=1,
+            dequant_scale_key=kv_dequant_scale[0],
+            dequant_scale_value=kv_dequant_scale[1],
+            sparse_mode=3,
+            atten_mask=self.mtp_mask,
+        )
+        
+        attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        
+        return attn_output
 
     def forward_decode_graph(
         self,
