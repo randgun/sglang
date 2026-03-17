@@ -109,8 +109,12 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        # PD attention_cp needs every prefill CP shard to participate in transfer.
+        # Otherwise non-zero CP ranks stay in WaitingForInput and block the
+        # cross-CP status reduction on the prefill side.
         self.enable_all_cp_ranks_for_transfer = (
-            envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            self.attn_cp_size > 1
+            or envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
 
         # bind zmq socket
