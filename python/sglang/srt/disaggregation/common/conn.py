@@ -26,7 +26,6 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -262,22 +261,13 @@ class CommonKVManager(BaseKVManager):
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         bootstrap_server_url = bootstrap_na.to_host_port_str()
         url = f"{bootstrap_na.to_url()}/route"
-        attn_tp_rank = self.attn_tp_rank
-        attn_dp_rank = self.attn_dp_rank
-        attn_tp_size = self.attn_tp_size
-        attn_dp_size = self.attn_dp_size
-        if is_enable_prefill_cp():
-            attn_dp_rank = 0
-            attn_tp_size = self.pcp_size * self.attn_tp_size
-            attn_dp_size = 1
-            attn_tp_rank = self.pcp_rank * self.attn_tp_size + self.attn_tp_rank
         payload = {
-            "attn_tp_size": attn_tp_size,
-            "attn_tp_rank": attn_tp_rank,
+            "attn_tp_size": self.attn_tp_size,
+            "attn_tp_rank": self.attn_tp_rank,
             "attn_cp_size": self.attn_cp_size,
             "attn_cp_rank": self.attn_cp_rank,
-            "attn_dp_size": attn_dp_size,
-            "attn_dp_rank": attn_dp_rank,
+            "attn_dp_size": self.attn_dp_size,
+            "attn_dp_rank": self.attn_dp_rank,
             "pp_size": self.pp_size,
             "pp_rank": self.pp_rank,
             "system_dp_size": self.system_dp_size,
