@@ -1167,15 +1167,15 @@ class AscendAttnBackend(AttentionBackend):
 
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                 # 图模式分支：使用预分配 buffer 和向量化操作
-                if self.graph_mode and not self.enable_torch_compile:
-                    # 图模式下使用专门的图模式实现
-                    return self.forward_mtp_graph_c8(
-                        query, k_cache, v_cache, layer, forward_batch,
-                        actual_seq_lengths_kv, kv_dequant_scale
-                    )
+                # if self.graph_mode and not self.enable_torch_compile:
+                #     # 图模式下使用专门的图模式实现
+                #     return self.forward_mtp_graph_c8(
+                #         query, k_cache, v_cache, layer, forward_batch,
+                #         actual_seq_lengths_kv, kv_dequant_scale
+                #     )
                 
                 # 非图模式：保持原有实现
-                kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, 0)
+                kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
 
                 bs = self.forward_metadata.block_tables.shape[0]
                 max_kv_len = max(actual_seq_lengths_kv)
@@ -1479,7 +1479,7 @@ class AscendAttnBackend(AttentionBackend):
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                 max_seq_len = torch.max(actual_seq_len_kv).item()
                 print(f"+++ {rank=}, {self.forward_metadata.seq_lens.shape=}")
-                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, max_seq_len)
+                kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
             num_tokens = query.shape[0]
             print(f"++++ {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {kv_dequant_scale.shape=}")
@@ -1720,7 +1720,7 @@ class AscendAttnBackend(AttentionBackend):
                     k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
                     v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
                     max_seq_len = torch.max(self.forward_metadata.seq_lens_cpu_int).item()
-                    kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables, 1)
+                    kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
 
                     attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                         query[:actual_bs],
