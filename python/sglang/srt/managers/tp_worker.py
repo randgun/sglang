@@ -240,6 +240,7 @@ class TpModelWorker(BaseTpWorker):
         self.tp_size = server_args.tp_size
         self.ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
+        self.pcp_size = server_args.attn_cp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
@@ -351,6 +352,7 @@ class TpModelWorker(BaseTpWorker):
             moe_ep_size=self.ep_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            pcp_size=self.pcp_size,
             nccl_port=self.nccl_port,
             dp_rank=self.dp_rank,
             server_args=self.server_args,
@@ -377,6 +379,7 @@ class TpModelWorker(BaseTpWorker):
                     moe_ep_size=self.ep_size,
                     pp_rank=self.pp_rank,
                     pp_size=self.pp_size,
+                    pcp_size=self.pcp_size,
                     nccl_port=self.nccl_port,
                     dp_rank=self.dp_rank,
                     server_args=self.server_args,
