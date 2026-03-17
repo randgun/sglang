@@ -30,10 +30,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    is_enable_prefill_cp,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -164,7 +164,10 @@ class DeepseekModelNextN(nn.Module):
                 )
             )
 
-        if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp) or self.enable_prefill_cp:
+        if (
+            nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+            or self.enable_prefill_cp
+        ):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
@@ -228,7 +231,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp()  if self.use_nsa else is_enable_prefill_cp()
+        self.enable_prefill_cp = (
+            is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        )
         if self.enable_prefill_cp:
             self.cp_rank = self.pcp_rank = get_attention_cp_rank()
             self.cp_size = self.pcp_size = get_attention_cp_size()
@@ -262,7 +267,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
                 )
         elif self.enable_prefill_cp:
@@ -271,7 +275,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
                 )
         hidden_states = self.model(input_ids, positions, forward_batch)

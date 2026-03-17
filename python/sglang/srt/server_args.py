@@ -5696,7 +5696,7 @@ class ServerArgs:
         else:
             if self.attn_cp_size > 1 and not self.enable_nsa_prefill_context_parallel:
                 assert (
-                    self.disaggregation_mode!="decode"
+                    self.disaggregation_mode != "decode"
                 ), "Prefill context parallelism is not supported in decode mode"
                 assert (
                     self.chunked_prefill_size is None or self.chunked_prefill_size == -1

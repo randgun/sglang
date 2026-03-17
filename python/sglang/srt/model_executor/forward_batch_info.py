@@ -42,8 +42,6 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
-
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,

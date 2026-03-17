@@ -59,10 +59,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    is_enable_prefill_cp,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_cp
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -72,7 +72,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
-    get_attention_cp_rank,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_tp_rank,
@@ -174,7 +173,6 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
-        forward_prefill_mla_prepare_npu,
     )
 else:
     pass
@@ -1786,7 +1784,9 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        self.enable_prefill_cp = (
+            is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        )
         if self.enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
         else:
@@ -1957,7 +1957,7 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2040,7 +2040,9 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp):
+        if self.pp_group.is_last_rank and nsa_use_prefill_cp(
+            forward_batch, self.enable_prefill_cp
+        ):
             # allgather + rerrange
             hidden_states = pcp_ag_rearange_output(
                 hidden_states,
@@ -2112,7 +2114,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.capture_aux_hidden_states = False
 
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        self.enable_prefill_cp = (
+            is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        )
         if self.enable_prefill_cp:
             self.cp_rank = self.pcp_rank = get_attention_cp_rank()
             self.cp_size = self.pcp_size = get_attention_cp_size()

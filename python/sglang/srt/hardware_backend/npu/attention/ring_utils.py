@@ -3,13 +3,11 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import inspect
-from functools import cache
+
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
 )
-
 
 @torch.jit.script
 def _update_out_and_lse(
@@ -17,16 +15,11 @@ def _update_out_and_lse(
     lse: torch.Tensor,
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
-    lse_trans: bool = True
+    lse_trans: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     if lse_trans:
         block_lse = block_lse.transpose(1, 2)
-
-    # new_lse = lse + torch.log(1 + torch.exp(block_lse - lse))
-    # torch.exp(lse - new_lse) * out + torch.exp(block_lse - new_lse) * block_out
-    # For additional context and discussion, please refer to:
-    # https://github.com/zhuzilin/ring-flash-attention/pull/34#issuecomment-2076126795
     out = out - F.sigmoid(block_lse - lse) * (out - block_out)
     lse = lse - F.logsigmoid(lse - block_lse)
 
@@ -39,7 +32,7 @@ def update_out_and_lse(
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
     lse_trans: bool = True,
-    last_lse_trans: bool = False
+    last_lse_trans: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         out = block_out
@@ -67,12 +60,14 @@ class RingComm:
         self.recv_rank = pcp_ranks[self.pcp_rank - 1]
 
     def send_recv(
-        self, 
-        to_send: torch.Tensor, 
+        self,
+        to_send: torch.Tensor,
     ) -> torch.Tensor:
         res = torch.zeros_like(to_send)
 
-        send_op = dist.P2POp(dist.isend, to_send, self.send_rank, group=self._process_group)
+        send_op = dist.P2POp(
+            dist.isend, to_send, self.send_rank, group=self._process_group
+        )
         recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=self._process_group)
         self._ops.append(send_op)
         self._ops.append(recv_op)

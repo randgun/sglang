@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -34,7 +35,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_local_ip_auto,
@@ -43,9 +43,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
-
-# Constant for prefill context parallel TP size
-PREFILL_CP_ATTN_TP_SIZE = 16
 
 
 @dataclasses.dataclass
@@ -271,9 +268,9 @@ class CommonKVManager(BaseKVManager):
         attn_dp_size = self.attn_dp_size
         if is_enable_prefill_cp():
             attn_dp_rank = 0
-            attn_tp_size = PREFILL_CP_ATTN_TP_SIZE
+            attn_tp_size = self.pcp_size * self.attn_tp_size
             attn_dp_size = 1
-            attn_tp_rank = self.pcp_rank * attn_tp_size + self.attn_tp_rank
+            attn_tp_rank = self.pcp_rank * self.attn_tp_size + self.attn_tp_rank
         payload = {
             "attn_tp_size": attn_tp_size,
             "attn_tp_rank": attn_tp_rank,

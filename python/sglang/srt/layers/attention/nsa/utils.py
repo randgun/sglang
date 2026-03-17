@@ -1,7 +1,7 @@
 # temp NSA debugging environ
-from itertools import accumulate
-from typing import TYPE_CHECKING, List, Tuple, Union,Optional
 from dataclasses import dataclass
+from itertools import accumulate
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -18,8 +18,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
-    get_attention_tp_rank,
-    get_attention_tp_size,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -55,7 +53,6 @@ class ContextParallelMetadata:
     is_gqa: Optional[bool] = False
 
 
-
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
     return original_seq_lens.clamp(max=nsa_index_topk)
 
@@ -77,9 +74,14 @@ def is_nsa_prefill_cp_round_robin_split():
         and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
     )
 
+
 def is_enable_prefill_cp():
     server_args = get_global_server_args()
-    return server_args.attn_cp_size > 1 and not server_args.enable_nsa_prefill_context_parallel
+    return (
+        server_args.attn_cp_size > 1
+        and not server_args.enable_nsa_prefill_context_parallel
+    )
+
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
@@ -197,9 +199,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
-    input_list = list(
-        torch.split(input_, forward_batch.cp_metadata.split_list, dim=0)
-    )
+    input_list = list(torch.split(input_, forward_batch.cp_metadata.split_list, dim=0))
     result = torch.cat(
         [input_list[i] for i in forward_batch.cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
@@ -304,11 +304,14 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     else:
         return False
 
+
 def use_pcp(forward_batch):
-    if (forward_batch.cp_metadata is not None
+    if (
+        forward_batch.cp_metadata is not None
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_enable_prefill_cp()):
-            return True
+        and is_enable_prefill_cp()
+    ):
+        return True
     else:
         return False
 
@@ -356,6 +359,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     )
     return outputs
 
+
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
@@ -402,7 +406,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         )
         return output_tensor
 
-
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
@@ -412,9 +415,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         stream,
     )
     outputs_list = list(
-        torch.split(
-            output_tensor, forward_batch.cp_metadata.reverse_split_len, dim=0
-        )
+        torch.split(output_tensor, forward_batch.cp_metadata.reverse_split_len, dim=0)
     )
     output_tensor = torch.cat(
         [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
@@ -486,14 +487,26 @@ def _compute_attention_metadata(
     tail_q_seqlens = [tail_chunk_len]
 
     # Compute nomask seqlens
-    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
-    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
+    head_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [head_start_global]], dtype=torch.int32
+    ).to(device=device)
+    tail_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [tail_start_global]], dtype=torch.int32
+    ).to(device=device)
 
     # Compute indices using torch.arange for efficiency
-    kv_with_q_head_nomask_idx_tensor = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
-    kv_with_q_head_mask_idx_tensor = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
-    kv_with_q_tail_nomask_idx_tensor = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
-    kv_with_q_tail_mask_idx_tensor = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
+    kv_with_q_head_nomask_idx_tensor = torch.arange(
+        0, head_start_global, dtype=torch.int32, device=device
+    )
+    kv_with_q_head_mask_idx_tensor = torch.arange(
+        head_start_global, head_end_global, dtype=torch.int32, device=device
+    )
+    kv_with_q_tail_nomask_idx_tensor = torch.arange(
+        0, tail_start_global, dtype=torch.int32, device=device
+    )
+    kv_with_q_tail_mask_idx_tensor = torch.arange(
+        tail_start_global, tail_end_global, dtype=torch.int32, device=device
+    )
 
     cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
     cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
@@ -624,7 +637,9 @@ def prepare_input_dp_with_cp_dsa(
         device=device, dtype=torch.int32
     )
 
-    attn_mask_seqlens = torch.tensor([[seq_per_batch], [seq_per_batch]], dtype=torch.int32)
+    attn_mask_seqlens = torch.tensor(
+        [[seq_per_batch], [seq_per_batch]], dtype=torch.int32
+    )
 
     cp_metadata = ContextParallelMetadata(
         split_list=split_list,

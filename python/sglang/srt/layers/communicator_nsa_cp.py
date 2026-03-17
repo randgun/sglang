@@ -35,15 +35,13 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    get_local_dp_buffer,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_tp_group,
+    get_local_dp_buffer,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def nsa_enable_prefill_cp():
@@ -175,9 +173,13 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 hidden_states, residual = layernorm(hidden_states, residual)
                 local_hidden_states = hidden_states
                 cp_size = get_attention_cp_size()
-                hidden_states = torch.empty(cp_size, hidden_states.shape[0], hidden_states.shape[1],
-                                            device=hidden_states.device,
-                                            dtype=hidden_states.dtype)
+                hidden_states = torch.empty(
+                    cp_size,
+                    hidden_states.shape[0],
+                    hidden_states.shape[1],
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
                 get_attention_cp_group().cp_all_gather_into_tensor_async(
                     hidden_states, local_hidden_states, torch.npu.current_stream()
                 )
@@ -187,7 +189,6 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 hidden_states, residual = layernorm(hidden_states, residual)
 
             return hidden_states, residual
-
 
 
 class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
@@ -243,10 +244,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                 else:
                     cp_size = get_attention_cp_size()
                     cp_rank = get_attention_cp_rank()
-                    hidden_states = hidden_states.tensor_split(cp_size)[
-                        cp_rank
-                    ]
+                    hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
             return hidden_states, residual
         else:
             return hidden_states, residual
-

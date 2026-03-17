@@ -35,9 +35,19 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
+    is_enable_prefill_cp,
+    prepare_input_dp_with_cp_dsa,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_cp_size, get_attention_cp_rank, get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -59,12 +69,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
-from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_cp,
-    cp_all_gather_rerange_output,
-)
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -317,9 +321,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            # if is_enable_prefill_cp():
-            #     final_hidden_states = get_attention_tp_group().all_reduce(final_hidden_states)
-            # else:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -931,9 +932,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3MoeModel(
-            config,
-            quant_config,
-            prefix=add_prefix("model", prefix)
+            config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -974,7 +973,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_rank,
                     self.pcp_size,
                     input_ids.device,
-                    is_gqa=True
+                    is_gqa=True,
                 )
 
         hidden_states = self.model(

@@ -19,19 +19,18 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.ring_utils import (
+    RingComm,
+    update_out_and_lse,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     use_pcp,
-    cp_all_gather_rerange_output,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     get_attention_cp_size,
-)
-from sglang.srt.hardware_backend.npu.attention.ring_utils import (
-    RingComm, 
-    update_out_and_lse
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -46,13 +45,16 @@ import logging
 
 import numpy as np
 
+
 def _reshape_kv_for_fia_nz(
     tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 
+
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ForwardMetadata:
@@ -72,6 +74,7 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
 
 class AscendAttnMaskBuilder:
     def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
@@ -278,7 +281,6 @@ class AscendAttnBackend(AttentionBackend):
         Typically, these are tree mask and position buffers.
         """
         return [None, None]
-
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -772,10 +774,16 @@ class AscendAttnBackend(AttentionBackend):
     ):
         kv_mask_idx = kv_mask_idx.to(k_nope.device)
         attn_output = torch.zeros(
-            q_nope.shape[0], layer.tp_q_head_num, layer.v_head_dim, dtype=k_pe.dtype, device=k_pe.device
+            q_nope.shape[0],
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            dtype=k_pe.dtype,
+            device=k_pe.device,
         )
 
-        attn_lse = torch.zeros(layer.tp_q_head_num, q_pe.shape[0], dtype=torch.float32, device=k_pe.device)
+        attn_lse = torch.zeros(
+            layer.tp_q_head_num, q_pe.shape[0], dtype=torch.float32, device=k_pe.device
+        )
         # mask
         k_nope_mask = torch.index_select(k_nope, 0, kv_mask_idx)
         value_mask = torch.index_select(value, 0, kv_mask_idx)
@@ -849,7 +857,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope_head = q_rope_head.contiguous()
         q_rope_tail = q_rope_tail.contiguous()
         """
-            输入64k, pcp=4
+            input 64k, pcp=4
             [4096,4096,4096,4096,4096,4096,4096,4096]
             [0     1    2    3    4    5    6    7]
             pcp_size = 4
@@ -866,7 +874,7 @@ class AscendAttnBackend(AttentionBackend):
             tail_attn_nomask_seqlens: [4096, 4096 * pcp_res_rank]
         """
         """
-            输入8, pcp=2
+            input 8, pcp=2
             [2, 2, 2, 2]
             [0  1  2  3]
             pcp_size = 2
@@ -888,7 +896,7 @@ class AscendAttnBackend(AttentionBackend):
         kv_with_q_head_mask_idx = forward_batch.cp_metadata.kv_with_q_head_mask_idx
         kv_with_q_tail_nomask_idx = forward_batch.cp_metadata.kv_with_q_tail_nomask_idx
         kv_with_q_tail_mask_idx = forward_batch.cp_metadata.kv_with_q_tail_mask_idx
-        attn_mask_seqlens = forward_batch.cp_metadata.attn_mask_seqlens # []
+        attn_mask_seqlens = forward_batch.cp_metadata.attn_mask_seqlens  # []
         head_attn_nomask_seqlens = forward_batch.cp_metadata.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = forward_batch.cp_metadata.tail_attn_nomask_seqlens
         output_head, lse_head = self._attention_with_mask_and_nomask(
@@ -920,7 +928,9 @@ class AscendAttnBackend(AttentionBackend):
         )
         attn_output = torch.cat([output_head, output_tail], dim=0)
         attn_lse = torch.cat([lse_head, lse_tail], dim=1)
-        attn_output = attn_output.reshape([seq_len, layer.tp_q_head_num * layer.v_head_dim])
+        attn_output = attn_output.reshape(
+            [seq_len, layer.tp_q_head_num * layer.v_head_dim]
+        )
         return attn_output
 
     def _fia_attention_with_mask_and_nomask(
@@ -965,7 +975,6 @@ class AscendAttnBackend(AttentionBackend):
         k_mask = torch.index_select(k, 0, kv_mask_idx)
         v_mask = torch.index_select(v, 0, kv_mask_idx)
 
-
         mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
             q,
             k_mask,
@@ -975,7 +984,7 @@ class AscendAttnBackend(AttentionBackend):
             input_layout="TND",
             atten_mask=atten_mask,
             sparse_mode=3,
-            antiquant_mode = 0,
+            antiquant_mode=0,
             antiquant_scale=None,
             scale=layer.scaling,
             next_tokens=0,
@@ -987,11 +996,11 @@ class AscendAttnBackend(AttentionBackend):
 
         if not has_no_mask:
             return mask_out, mask_lse
-        attn_output,attn_lse = self._update_out_and_lse(
+        attn_output, attn_lse = self._update_out_and_lse(
             torch.stack([nomask_out, mask_out], dim=0),
             torch.stack([nomask_lse, mask_lse], dim=0),
         )
-        return attn_output,attn_lse
+        return attn_output, attn_lse
 
     def _update_out_and_lse(
         self,
@@ -1012,7 +1021,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         seq_len = q.shape[0]
         if seq_len == 0:
-            return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
+            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
         split_len = (seq_len + 1) // 2
         tail_len = seq_len - split_len
 
@@ -1020,7 +1029,6 @@ class AscendAttnBackend(AttentionBackend):
 
         q_head = q_head.contiguous()
         q_tail = q_tail.contiguous()
-
 
         pcp_metadata = forward_batch.cp_metadata
         atten_mask = self.fia_mask
@@ -1046,8 +1054,8 @@ class AscendAttnBackend(AttentionBackend):
             atten_mask=atten_mask,
         )
 
-        output=[output_head]
-        if q_tail.shape[0]>0:
+        output = [output_head]
+        if q_tail.shape[0] > 0:
             output_tail, attn_lse_tail = self._fia_attention_with_mask_and_nomask(
                 q=q_tail,
                 k=k,
@@ -1060,7 +1068,7 @@ class AscendAttnBackend(AttentionBackend):
                 layer=layer,
                 atten_mask=atten_mask,
             )
-            output = torch.cat([output_head,output_tail], dim=0)
+            output = torch.cat([output_head, output_tail], dim=0)
         else:
             output = torch.cat(output, dim=0)
         return output.reshape(seq_len, -1).to(q.dtype)
@@ -1075,7 +1083,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         seq_len = q.shape[0]
         if seq_len == 0:
-            return q.new_empty((0, layer.tp_q_head_num  * layer.v_head_dim))
+            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
         split_len = (seq_len + 1) // 2
 
         k = k.contiguous()
@@ -1112,26 +1120,52 @@ class AscendAttnBackend(AttentionBackend):
             k_head, k_tail = torch.split(k, [split_len, seq_len - split_len], dim=0)
             v_head, v_tail = torch.split(v, [split_len, seq_len - split_len], dim=0)
             if loop == 0:
-                out_head, lse_head = _forward(q_head, k_head, v_head, layer, attn_mask=True)
+                out_head, lse_head = _forward(
+                    q_head, k_head, v_head, layer, attn_mask=True
+                )
                 out_dtype = out_head.dtype
-                out_tail1, lse_tail1 = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
-                out_tail2, lse_tail2 = _forward(q_tail, k_tail, v_tail, layer, attn_mask=True)
-                out_tail, lse_tail = update_out_and_lse(out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True)
+                out_tail1, lse_tail1 = _forward(
+                    q_tail, k_head, v_head, layer, attn_mask=False
+                )
+                out_tail2, lse_tail2 = _forward(
+                    q_tail, k_tail, v_tail, layer, attn_mask=True
+                )
+                out_tail, lse_tail = update_out_and_lse(
+                    out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True
+                )
                 block_out = torch.cat([out_head, out_tail], dim=1)
                 lse_head = lse_head.transpose(1, 2)
                 block_lse = torch.cat([lse_head, lse_tail], dim=1)
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_trans=False)
+                out, lse = update_out_and_lse(
+                    out, lse, block_out, block_lse, lse_trans=False
+                )
             elif loop <= comm.pcp_rank:
-                out_head, lse_head = _forward(q_head, k_head, v_head, layer, attn_mask=False)
-                out_tail, lse_tail = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
+                out_head, lse_head = _forward(
+                    q_head, k_head, v_head, layer, attn_mask=False
+                )
+                out_tail, lse_tail = _forward(
+                    q_tail, k_head, v_head, layer, attn_mask=False
+                )
                 block_out = torch.cat([out_head, out_tail], dim=1)
                 block_lse = torch.cat([lse_head, lse_tail], dim=2)
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
             else:
-                out_tail1, lse_tail1 = _forward(q_tail, k_head, v_head, layer, attn_mask=False)
-                out_tail2, lse_tail2 = _forward(q_tail, k_tail, v_tail, layer, attn_mask=False)
-                out_tail, lse_tail = update_out_and_lse(out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True)
-                out[:, split_len:], lse[:, split_len:] = update_out_and_lse(out[:, split_len:], lse[:, split_len:], out_tail, lse_tail, lse_trans=False)
+                out_tail1, lse_tail1 = _forward(
+                    q_tail, k_head, v_head, layer, attn_mask=False
+                )
+                out_tail2, lse_tail2 = _forward(
+                    q_tail, k_tail, v_tail, layer, attn_mask=False
+                )
+                out_tail, lse_tail = update_out_and_lse(
+                    out_tail1, lse_tail1, out_tail2, lse_tail2, last_lse_trans=True
+                )
+                out[:, split_len:], lse[:, split_len:] = update_out_and_lse(
+                    out[:, split_len:],
+                    lse[:, split_len:],
+                    out_tail,
+                    lse_tail,
+                    lse_trans=False,
+                )
 
             if loop + 1 != pcp_size:
                 comm.wait()
@@ -1460,15 +1494,14 @@ class AscendAttnBackend(AttentionBackend):
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             attn_output = self.forward_mla_pcp(
-                    q_nope,
-                    k_nope,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache,
-                    q_rope=q_rope,
-                    k_rope=k_rope,
-                )
+                q_nope,
+                k_nope,
+                v,
+                layer,
+                forward_batch,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
         else:
             assert (
                 layer.qk_head_dim != layer.v_head_dim
@@ -2255,6 +2288,7 @@ class AscendAttnBackend(AttentionBackend):
         return attn_output.view(
             attn_output.shape[0], layer.tp_q_head_num * layer.v_head_dim
         )
+
 
 class AscendAttnMultiStepDraftBackend:
     """

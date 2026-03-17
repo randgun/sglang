@@ -36,6 +36,12 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.nsa.utils import (
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_enable_prefill_cp,
+    use_pcp,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -66,12 +72,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.attention.nsa.utils import (
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    is_enable_prefill_cp,
-    use_pcp,
-)
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -677,7 +677,7 @@ class Qwen2MoeModel(nn.Module):
                             else None
                         ),
                     )
-                    
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -691,13 +691,13 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-                
+
         if self.enable_prefill_cp and use_pcp(forward_batch):
             hidden_states = pcp_ag_rearange_output(
                 hidden_states.contiguous(),
                 self.pcp_size,
                 forward_batch,
-                )
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -734,7 +734,6 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-
 
     @torch.no_grad()
     def forward(
