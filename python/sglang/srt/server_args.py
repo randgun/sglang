@@ -3764,8 +3764,6 @@ class ServerArgs:
         parser.add_argument(
             "--attention-context-parallel-size",
             "--attn-cp-size",
-            "--prefill-context-parallel-size",
-            "--pcp-size",
             type=int,
             default=ServerArgs.attn_cp_size,
             help="The attention context parallelism size (also used for prefill context parallelism).",

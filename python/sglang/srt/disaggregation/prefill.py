@@ -24,10 +24,12 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -48,6 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.layers.dp_attention import get_attention_cp_rank
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -707,12 +710,6 @@ class SchedulerDisaggregationPrefillMixin:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
-        req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -758,10 +755,72 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
-        page_indices = kv_to_page_indices(kv_indices, page_size)
-        if len(page_indices) == 0:
-            logger.info(
-                f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
+        enable_cp = req.cp_metadata is not None
+
+        if enable_cp:
+            cp_metadata = req.cp_metadata
+            cp_rank = get_attention_cp_rank()
+
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :cp_metadata.actual_seq_len
+                ]
+                .cpu()
+                .numpy()
             )
-            return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+
+            # Process each block assigned to current CP rank
+            prefill_page_indices = []
+            block_page_counts = []
+            for block_idx in cp_metadata.zigzag_index:
+                block_token_start = sum(cp_metadata.split_list[j] for j in range(block_idx))
+                block_token_end = block_token_start + cp_metadata.split_list[block_idx]
+
+                block_kv_indices = kv_indices[block_token_start:block_token_end]
+                block_kv_indices = block_kv_indices[block_kv_indices != -1]
+
+                if len(block_kv_indices) == 0:
+                    block_page_counts.append(0)
+                    continue
+
+                block_prefill_pages = kv_to_page_indices(block_kv_indices, page_size)
+                prefill_page_indices.extend(block_prefill_pages)
+                block_page_counts.append(len(block_prefill_pages))
+
+            prefill_page_indices_array = np.array(prefill_page_indices, dtype=np.int32)
+            cp_metadata.block_page_counts = block_page_counts
+            local_pages = len(prefill_page_indices_array)
+
+            if isinstance(req.disagg_kv_sender, FakeKVSender):
+                req.disagg_kv_sender.send(prefill_page_indices_array, state_indices)
+                return
+
+            if (
+                hasattr(req.disagg_kv_sender, "curr_idx")
+                and req.disagg_kv_sender.curr_idx == 0
+                and hasattr(req.disagg_kv_sender, "num_kv_indices")
+            ):
+                req.disagg_kv_sender.num_kv_indices = local_pages
+
+            req.disagg_kv_sender.send(
+                prefill_page_indices_array,
+                state_indices,
+                cp_rank=cp_rank,
+                cp_metadata=cp_metadata,
+            )
+            req.start_send_idx = end_idx
+        else:
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+                .cpu()
+                .numpy()
+            )
+            req.start_send_idx = end_idx
+
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if len(page_indices) == 0:
+                logger.info(
+                    f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
+                )
+                return
+            req.disagg_kv_sender.send(page_indices, state_indices)

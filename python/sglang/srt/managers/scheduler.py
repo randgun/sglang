@@ -949,7 +949,7 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=self.dp_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 tp_rank=self.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
@@ -967,7 +967,7 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=self.dp_tp_cpu_group,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
@@ -1011,7 +1011,7 @@ class Scheduler(
                 tp_size=self.tp_size,
                 gpu_id=self.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=self.dp_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
                 pp_rank=self.pp_rank,

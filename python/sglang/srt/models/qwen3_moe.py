@@ -37,8 +37,10 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
+    cp_pad_local_tokens,
     is_enable_prefill_cp,
     prepare_input_dp_with_cp_dsa,
+    use_pcp,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
@@ -321,6 +323,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
+            # if is_enable_prefill_cp():
+            #     final_hidden_states = get_attention_tp_group().all_reduce(final_hidden_states)
+            # else:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -537,6 +542,9 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if use_pcp(forward_batch):
+            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
+            positions = cp_pad_local_tokens(forward_batch, positions)
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -563,11 +571,15 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if use_pcp(forward_batch):
+            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
+            positions = cp_pad_local_tokens(forward_batch, positions)
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
         inner_state = q, k, v, forward_batch
+
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
@@ -619,6 +631,7 @@ class Qwen3MoeAttention(nn.Module):
                         forward_batch=forward_batch,
                     )
                     if enable_fused_set_kv_buffer(forward_batch)
+                    and not use_pcp(forward_batch)
                     and self.compatible_with_fused_kv_buffer
                     else None
                 ),
@@ -633,7 +646,11 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
-            return hidden_states, forward_batch, None
+            # Outside PCP, the empty rank can exit early. In PCP we still route
+            # through forward_prepare_* so the rank stays on the shared path and
+            # pad to the fixed local PCP layout before attention.
+            if not use_pcp(forward_batch):
+                return hidden_states, forward_batch, None
         if (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -661,6 +678,7 @@ class Qwen3MoeAttention(nn.Module):
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
+
         attn_output = self.attn(
             q,
             k,
@@ -668,6 +686,8 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
+        if attn_output.numel() == 0:
+            return attn_output.new_empty((0, self.hidden_size))
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -802,12 +822,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
-        if hidden_states.shape[0] != 0:
+        if hidden_states.shape[0] != 0 or use_pcp(forward_batch):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        if use_pcp(forward_batch):
+            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
+            if residual is not None:
+                residual = cp_pad_local_tokens(forward_batch, residual)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -932,7 +956,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3MoeModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

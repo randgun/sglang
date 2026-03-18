@@ -1,8 +1,8 @@
-# temp NSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import logging
 import torch
 import torch.nn.functional as F
 import triton
@@ -18,6 +18,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
+    get_attention_tp_rank,
+    get_attention_tp_size,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -25,6 +27,7 @@ from sglang.srt.utils.common import ceil_align, ceil_div
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ContextParallelMetadata:
@@ -32,8 +35,13 @@ class ContextParallelMetadata:
     max_rank_len: Optional[List[int]] = None
     zigzag_index: Optional[List[int]] = None
     per_rank_actual_token: Optional[List[int]] = None
+    per_rank_head_actual_token: Optional[List[int]] = None
+    per_rank_tail_actual_token: Optional[List[int]] = None
+    head_padded_len: int = 0
+    tail_padded_len: int = 0
     reverse_split_len: Optional[List[int]] = None
     cp_reverse_index: Optional[List[int]] = None
+    rank_valid_ranges: Optional[List[Tuple[int, int]]] = None
     kv_len_prev: int = -1
     kv_len_next: int = -1
     actual_seq_q_prev: int = -1
@@ -50,7 +58,14 @@ class ContextParallelMetadata:
     head_attn_nomask_seqlens: Optional[torch.Tensor] = None
     tail_attn_nomask_seqlens: Optional[torch.Tensor] = None
     attn_mask_seqlens: Optional[torch.Tensor] = None
-    is_gqa: Optional[bool] = False
+    head_q_seqlens: Optional[List[int]] = None
+    tail_q_seqlens: Optional[List[int]] = None
+    cp_size: Optional[int] = None
+    cp_rank: Optional[int] = None
+    aligned_seq_len: Optional[int] = None
+    actual_seq_len: Optional[int] = None
+    block_page_counts: Optional[List[int]] = None
+    is_gqa: Optional[bool] = True
 
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
@@ -199,13 +214,35 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
-    input_list = list(torch.split(input_, forward_batch.cp_metadata.split_list, dim=0))
+    cp_metadata = forward_batch.cp_metadata
+
+    if cp_metadata.rank_valid_ranges is not None:
+        # Use rank_valid_ranges to select real tokens only.
+        parts = []
+        expected = 0
+        for start, end in cp_metadata.rank_valid_ranges:
+            if end > start:
+                expected += end - start
+                parts.append(input_[start:end])
+        if not parts:
+            return input_.new_empty((0, *input_.shape[1:]))
+        result = torch.cat(parts, dim=0).contiguous()
+        if result.shape[0] != expected:
+            logger.warning(
+                "cp_split_and_rebuild_data: unexpected token count, got=%s expected=%s",
+                result.shape[0],
+                expected,
+            )
+        return result
+
+    input_list = list(
+        torch.split(input_, cp_metadata.split_list, dim=0)
+    )
     result = torch.cat(
-        [input_list[i] for i in forward_batch.cp_metadata.zigzag_index], dim=0
+        [input_list[i] for i in cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
 
     return result
-
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
@@ -216,14 +253,98 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         )
         return nsa_cp_round_robin_split_data(positions)
 
+    cp_metadata = forward_batch.cp_metadata
+    assert cp_metadata is not None, "CP metadata is not available"
+
+    if cp_metadata.rank_valid_ranges is not None:
+        parts = []
+        expected = 0
+        for start, end in cp_metadata.rank_valid_ranges:
+            if end > start:
+                expected += end - start
+                parts.append(positions[..., start:end])
+        if not parts:
+            return positions.new_empty((*positions.shape[:-1], 0))
+        result = torch.cat(parts, dim=-1).contiguous()
+        if result.shape[-1] != expected:
+            logger.warning(
+                "cp_split_and_rebuild_position: unexpected token count, got=%s expected=%s",
+                result.shape[-1],
+                expected,
+            )
+        return result
+
     position_id_list = list(
-        torch.split(positions, forward_batch.cp_metadata.split_list, dim=-1)
+        torch.split(positions, cp_metadata.split_list, dim=-1)
     )
     positions = torch.cat(
-        [position_id_list[i] for i in forward_batch.cp_metadata.zigzag_index],
+        [position_id_list[i] for i in cp_metadata.zigzag_index],
         dim=-1,
     )
     return positions
+
+def cp_pad_local_tokens(forward_batch, input_: torch.Tensor):
+    cp_metadata = getattr(forward_batch, "cp_metadata", None)
+    if cp_metadata is None:
+        return input_
+
+    head_actual = max(cp_metadata.actual_seq_q_prev, 0)
+    tail_actual = max(cp_metadata.actual_seq_q_next, 0)
+    actual_total = head_actual + tail_actual
+    padded_head = max(cp_metadata.head_padded_len, head_actual)
+    padded_tail = max(cp_metadata.tail_padded_len, tail_actual)
+    padded_total = padded_head + padded_tail
+
+    if padded_total == actual_total or input_.shape[0] == padded_total:
+        return input_
+
+    if input_.shape[0] != actual_total:
+        raise ValueError(
+            "Unexpected local CP token count before padding: "
+            f"got={input_.shape[0]} expected={actual_total}"
+        )
+
+    output = input_.new_zeros((padded_total, *input_.shape[1:]))
+    offset = 0
+    if head_actual > 0:
+        output[:head_actual].copy_(input_[:head_actual])
+        offset += head_actual
+    if tail_actual > 0:
+        output[padded_head : padded_head + tail_actual].copy_(
+            input_[offset : offset + tail_actual]
+        )
+    return output
+
+
+def cp_extract_local_tokens(forward_batch, input_: torch.Tensor):
+    cp_metadata = getattr(forward_batch, "cp_metadata", None)
+    if cp_metadata is None:
+        return input_
+
+    head_actual = max(cp_metadata.actual_seq_q_prev, 0)
+    tail_actual = max(cp_metadata.actual_seq_q_next, 0)
+    actual_total = head_actual + tail_actual
+    padded_head = max(cp_metadata.head_padded_len, head_actual)
+    padded_total = padded_head + max(cp_metadata.tail_padded_len, tail_actual)
+
+    if input_.shape[0] == actual_total:
+        return input_
+    if input_.shape[0] == 0 and actual_total == 0:
+        return input_
+    if input_.shape[0] != padded_total:
+        raise ValueError(
+            "Unexpected local CP token count before extraction: "
+            f"got={input_.shape[0]} expected={padded_total}"
+        )
+
+    parts = []
+    if head_actual > 0:
+        parts.append(input_[:head_actual])
+    if tail_actual > 0:
+        parts.append(input_[padded_head : padded_head + tail_actual])
+    if not parts:
+        return input_.new_empty((0, *input_.shape[1:]))
+    return torch.cat(parts, dim=0).contiguous()
 
 
 @triton.jit
@@ -304,16 +425,11 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     else:
         return False
 
-
 def use_pcp(forward_batch):
-    if (
-        forward_batch.cp_metadata is not None
+    return (
+        is_enable_prefill_cp()
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_enable_prefill_cp()
-    ):
-        return True
-    else:
-        return False
+    )
 
 
 def cp_attn_tp_all_gather_reorganazied_into_tensor(
@@ -358,7 +474,6 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dim=0,
     )
     return outputs
-
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
@@ -405,6 +520,8 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             .reshape(out_shape)
         )
         return output_tensor
+
+
 
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
