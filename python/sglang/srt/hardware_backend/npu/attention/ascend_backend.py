@@ -339,23 +339,23 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        max_blocks = (self.max_context_len + self.page_size - 1) // self.page_size
         self.graph_metadata = {
-            "block_tables": torch.empty(
-                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+            "block_tables": torch.zeros(
+                (max_bs, max_blocks),
                 dtype=torch.int32,
                 device=self.device,
             ),
         }
 
         if envs.SGLANG_NPU_PD_ENABLE_C8.get():
-            max_seq_len = max_num_tokens // max_bs
             self.graph_metadata["np_page_k"] = torch.empty(
-                (max_bs, max_seq_len, self.k_hidden_size),
+                (max_bs, self.max_context_len, self.k_hidden_size),
                 dtype=torch.int8,
                 device=self.device,
             )
             self.graph_metadata["np_page_v"] = torch.empty(
-                (max_bs, max_seq_len, self.v_hidden_size),
+                (max_bs, self.max_context_len, self.v_hidden_size),
                 dtype=torch.int8,
                 device=self.device,
             )
@@ -410,6 +410,8 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
     ):
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
@@ -426,6 +428,22 @@ class AscendAttnBackend(AttentionBackend):
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+
+        if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+            # 获取 buffer
+            np_page_k_buffer = self.graph_metadata["np_page_k"]
+            np_page_v_buffer = self.graph_metadata["np_page_v"]
+
+            gathered_k = k_cache[metadata.block_tables].view(
+                bs, -1, self.k_hidden_size
+            )
+            gathered_v = v_cache[metadata.block_tables].view(
+                bs, -1, self.v_hidden_size
+            )
+            
+            # copy 到预分配的 buffer
+            np_page_k_buffer[:bs, :max_len, :].copy_(gathered_k)
+            np_page_v_buffer[:bs, :max_len, :].copy_(gathered_v)
 
         self.forward_metadata = metadata
 
@@ -1166,24 +1184,20 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
-                # 图模式分支：使用预分配 buffer 和向量化操作
+                kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 # if self.graph_mode and not self.enable_torch_compile:
                 #     # 图模式下使用专门的图模式实现
                 #     return self.forward_mtp_graph_c8(
                 #         query, k_cache, v_cache, layer, forward_batch,
                 #         actual_seq_lengths_kv, kv_dequant_scale
                 #     )
-                
-                # 非图模式：保持原有实现
-                kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
-
                 bs = self.forward_metadata.block_tables.shape[0]
                 max_kv_len = max(actual_seq_lengths_kv)
                 query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
 
                 rank = torch.distributed.get_rank()
 
-                if not forward_batch.forward_mode.is_idle():
+                if not forward_batch.forward_mode.is_idle() and False:
                     print(f"+++ {rank=}, {layer.layer_id=}, {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {self.forward_metadata.block_tables.shape=}"
                         f", {self.page_size=}, {layer.tp_k_head_num=}, {actual_seq_lengths_kv=}, {kv_dequant_scale.shape=} {self.forward_metadata.seq_lens=}", flush=True)
 
@@ -1208,8 +1222,8 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_kvlen=actual_seq_lengths_kv,
                     key_quant_mode=1,
                     value_quant_mode=1,
-                    dequant_scale_key=kv_dequant_scale[0][:, :max_kv_len],
-                    dequant_scale_value=kv_dequant_scale[1][:, :max_kv_len],
+                    dequant_scale_key=kv_dequant_scale[0],
+                    dequant_scale_value=kv_dequant_scale[1],
                     sparse_mode=3,
                     atten_mask=self.mtp_mask,
                 )
@@ -1365,21 +1379,20 @@ class AscendAttnBackend(AttentionBackend):
         
         block_tables_static = self.forward_metadata.block_tables
         
-        page_size = k_cache.shape[1]
         block_tables_flat = block_tables_static.flatten()
 
         torch.index_select(
             k_cache, 
             dim=0, 
             index=block_tables_flat, 
-            out=np_page_k_buffer.view(-1, page_size, hidden_dim_k)
+            out=np_page_k_buffer.view(bs, -1, hidden_dim_k)
         )
 
         torch.index_select(
             v_cache, 
             dim=0, 
             index=block_tables_flat, 
-            out=np_page_v_buffer.view(-1, page_size, hidden_dim_v)
+            out=np_page_v_buffer.view(bs, -1, hidden_dim_v)
         )
         query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
         
@@ -1477,7 +1490,6 @@ class AscendAttnBackend(AttentionBackend):
                 )
             rank = torch.distributed.get_rank()
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
-                max_seq_len = torch.max(actual_seq_len_kv).item()
                 print(f"+++ {rank=}, {self.forward_metadata.seq_lens.shape=}")
                 kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")

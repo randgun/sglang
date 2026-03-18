@@ -325,7 +325,7 @@ class AscendKVManager(MooncakeKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
-        dst_kv_item_len: npt.NDArray[np.int32],
+        dst_kv_item_len: int,
         dequant_scale_ptrs: list[int],
         dequant_scale_item_len: int,
         dequant_unit_num: int,
@@ -342,7 +342,7 @@ class AscendKVManager(MooncakeKVManager):
                 self.kv_args.kv_data_ptrs[layer_id],
                 dst_kv_ptrs[layer_id],
                 self.kv_args.kv_item_lens[layer_id],
-                dst_kv_item_len[layer_id],
+                dst_kv_item_len,
                 dequant_scale_ptrs[layer_id],
                 dequant_scale_item_len,
             )

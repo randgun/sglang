@@ -40,7 +40,7 @@ def gather_paged_kv_kernel(
     tl.store(out_ptrs, data, mask=valid_seq_mask)
 
 
-def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor, block_table: torch.Tensor, page_size: int):
+def gather_kv_cache_triton(cache: torch.Tensor, actual_seq_len_kv: torch.Tensor, block_table: torch.Tensor, page_size: int, mode: int):
     b, n = block_table.shape
     max_seq_len = n * page_size
     
