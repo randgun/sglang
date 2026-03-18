@@ -686,6 +686,8 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
+        if attn_output.numel() == 0:
+            return attn_output.new_empty((0, self.hidden_size))
         output, _ = self.o_proj(attn_output)
         return output
 
