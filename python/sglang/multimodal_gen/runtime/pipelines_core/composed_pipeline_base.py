@@ -324,7 +324,7 @@ class ComposedPipelineBase(ABC):
                 )
 
         logger.debug(
-            "Memory usage of loaded modules (GiB): %s. avail mem: %s GB",
+            "Memory usage of loaded modules (GiB): %s. Available memory: %s",
             self.memory_usages,
             round(current_platform.get_available_gpu_memory(), 2),
         )

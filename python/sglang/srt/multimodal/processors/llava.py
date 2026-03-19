@@ -16,11 +16,7 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
-from sglang.srt.multimodal.mm_utils import (
-    ensure_numpy,
-    expand2square,
-    process_anyres_image,
-)
+from sglang.srt.multimodal.mm_utils import expand2square, process_anyres_image
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import ImageData, load_image, logger
 from sglang.utils import get_exception_traceback
@@ -54,8 +50,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 # It is a video with multiple images
                 image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
-                for i in range(len(pixel_values)):
-                    pixel_values[i] = ensure_numpy(pixel_values[i]).astype(np.float16)
+                for _ in range(len(pixel_values)):
+                    pixel_values[_] = pixel_values[_].astype(np.float16)
                 pixel_values = np.stack(pixel_values, axis=0)
                 return pixel_values, image_hash, image_size
             else:
@@ -79,7 +75,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 else:
                     pixel_values = image_processor(image)["pixel_values"][0]
 
-                pixel_values = ensure_numpy(pixel_values)
                 if isinstance(pixel_values, np.ndarray):
                     pixel_values = pixel_values.astype(np.float16)
 
