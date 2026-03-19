@@ -601,6 +601,7 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
+
 def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
     # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
@@ -645,18 +646,12 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     output_tensor = torch.cat(
         [
             splitted_tensor[index][:per_rank_len]
-            for index, per_rank_len in enumerate(
-                cp_metadata.per_rank_actual_token
-            )
+            for index, per_rank_len in enumerate(cp_metadata.per_rank_actual_token)
         ],
         dim=0,
     )
     outputs_list = list(
-        torch.split(
-            output_tensor, cp_metadata.reverse_split_len, dim=0
-        )
+        torch.split(output_tensor, cp_metadata.reverse_split_len, dim=0)
     )
-    outputs = torch.cat(
-        [outputs_list[i] for i in cp_metadata.cp_reverse_index], dim=0
-    )
+    outputs = torch.cat([outputs_list[i] for i in cp_metadata.cp_reverse_index], dim=0)
     return outputs

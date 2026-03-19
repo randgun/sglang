@@ -1107,11 +1107,7 @@ class AscendAttnBackend(AttentionBackend):
             v_chunk: torch.Tensor,
             attn_mask: bool,
         ):
-            if (
-                q_chunk.shape[0] == 0
-                or k_chunk.shape[0] == 0
-                or v_chunk.shape[0] == 0
-            ):
+            if q_chunk.shape[0] == 0 or k_chunk.shape[0] == 0 or v_chunk.shape[0] == 0:
                 return None, None
             return torch.ops.npu.npu_fused_infer_attention_score(
                 q_chunk.unsqueeze(0),
@@ -1197,9 +1193,9 @@ class AscendAttnBackend(AttentionBackend):
         if head_out is not None and q_head_actual > 0:
             output[:q_head_actual].copy_(head_out.reshape(q_head_actual, -1))
         if tail_out is not None and q_tail_actual > 0:
-            output[
-                head_padded_len : head_padded_len + q_tail_actual
-            ].copy_(tail_out.reshape(q_tail_actual, -1))
+            output[head_padded_len : head_padded_len + q_tail_actual].copy_(
+                tail_out.reshape(q_tail_actual, -1)
+            )
         return output.to(q.dtype)
 
     def forward_extend(

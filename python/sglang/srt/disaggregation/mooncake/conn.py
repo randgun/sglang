@@ -30,8 +30,8 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
-from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 

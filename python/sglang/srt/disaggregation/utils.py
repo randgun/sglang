@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import dataclasses
 import os
 import random
-from itertools import accumulate
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
+from itertools import accumulate
 from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, Union, overload
 
 import numpy as np
@@ -14,8 +13,9 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
 from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
+from sglang.srt.utils import is_npu
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs
     from sglang.srt.disaggregation.common.conn import (
@@ -37,6 +37,7 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+
 #########################
 # CP Transfer Metadata
 #########################
@@ -46,7 +47,9 @@ def _build_cp_block_layout(actual_seq_len: int, cp_size: int, page_size: int):
     """Build the global block layout shared by all CP ranks."""
     cp_block_num = cp_size * 2
     alignment_unit = page_size * cp_block_num
-    aligned_seq_len = ((actual_seq_len + alignment_unit - 1) // alignment_unit) * alignment_unit
+    aligned_seq_len = (
+        (actual_seq_len + alignment_unit - 1) // alignment_unit
+    ) * alignment_unit
     seq_len_per_block = aligned_seq_len // cp_block_num
     split_list = [seq_len_per_block] * cp_block_num
     prefix_offsets = [0] + list(accumulate(split_list))
@@ -58,7 +61,14 @@ def _build_cp_block_layout(actual_seq_len: int, cp_size: int, page_size: int):
             block_actual_lens.append(0)
         else:
             block_actual_lens.append(min(block_end, actual_seq_len) - block_start)
-    return cp_block_num, aligned_seq_len, seq_len_per_block, split_list, prefix_offsets, block_actual_lens
+    return (
+        cp_block_num,
+        aligned_seq_len,
+        seq_len_per_block,
+        split_list,
+        prefix_offsets,
+        block_actual_lens,
+    )
 
 
 def _build_cp_rank_metadata(
@@ -74,7 +84,9 @@ def _build_cp_rank_metadata(
 ):
     """Build the rank-local CP metadata on top of the shared block layout."""
     bs_per_cp_group = 1  # Currently only support batch=1
-    zigzag_index = list(range(cp_rank, cp_rank + bs_per_cp_group * cp_block_num, cp_block_num)) + list(
+    zigzag_index = list(
+        range(cp_rank, cp_rank + bs_per_cp_group * cp_block_num, cp_block_num)
+    ) + list(
         range(cp_block_num - cp_rank - 1, bs_per_cp_group * cp_block_num, cp_block_num)
     )
 
@@ -82,7 +94,13 @@ def _build_cp_rank_metadata(
     for batch_id in range(bs_per_cp_group):
         cp_reverse_index.extend(
             list(range(batch_id, cp_block_num * bs_per_cp_group, 2 * bs_per_cp_group))
-            + list(range((cp_block_num - 1) * bs_per_cp_group + batch_id, 0, -2 * bs_per_cp_group))
+            + list(
+                range(
+                    (cp_block_num - 1) * bs_per_cp_group + batch_id,
+                    0,
+                    -2 * bs_per_cp_group,
+                )
+            )
         )
 
     rank_valid_ranges: List[Tuple[int, int]] = []
@@ -98,14 +116,22 @@ def _build_cp_rank_metadata(
     per_rank_tail_actual_token = [
         block_actual_lens[cp_block_num - 1 - rank_idx] for rank_idx in range(cp_size)
     ]
-    head_padded_len = max(per_rank_head_actual_token) if per_rank_head_actual_token else 0
-    tail_padded_len = max(per_rank_tail_actual_token) if per_rank_tail_actual_token else 0
+    head_padded_len = (
+        max(per_rank_head_actual_token) if per_rank_head_actual_token else 0
+    )
+    tail_padded_len = (
+        max(per_rank_tail_actual_token) if per_rank_tail_actual_token else 0
+    )
 
     per_rank_actual_token = []
     reverse_split_len = []
     for rank_idx in range(cp_size):
-        per_rank_actual_token.append(per_rank_head_actual_token[rank_idx] + per_rank_tail_actual_token[rank_idx])
-        reverse_split_len.extend([per_rank_head_actual_token[rank_idx], per_rank_tail_actual_token[rank_idx]])
+        per_rank_actual_token.append(
+            per_rank_head_actual_token[rank_idx] + per_rank_tail_actual_token[rank_idx]
+        )
+        reverse_split_len.extend(
+            [per_rank_head_actual_token[rank_idx], per_rank_tail_actual_token[rank_idx]]
+        )
     max_rank_len = head_padded_len + tail_padded_len
 
     head_chunk_id = cp_rank
@@ -149,24 +175,48 @@ def _build_cp_attention_tensors(
 ):
     """Populate device tensors used by CP attention kernels."""
     head_start_global = cp_metadata.kv_len_prev
-    head_end_global = cp_metadata.kv_len_prev + cp_metadata.split_list[cp_metadata.cp_rank]
+    head_end_global = (
+        cp_metadata.kv_len_prev + cp_metadata.split_list[cp_metadata.cp_rank]
+    )
     tail_chunk_id = len(cp_metadata.split_list) - 1 - cp_metadata.cp_rank
     tail_start_global = cp_metadata.kv_len_next
     tail_end_global = tail_start_global + cp_metadata.split_list[tail_chunk_id]
 
-    cp_metadata.kv_len_prev_tensor = torch.tensor(cp_metadata.kv_len_prev, device=device, dtype=torch.int32)
-    cp_metadata.kv_len_next_tensor = torch.tensor(cp_metadata.kv_len_next, device=device, dtype=torch.int32)
-    cp_metadata.actual_seq_q_prev_tensor = torch.tensor(cp_metadata.actual_seq_q_prev, device=device, dtype=torch.int32)
-    cp_metadata.actual_seq_q_next_tensor = torch.tensor(cp_metadata.actual_seq_q_next, device=device, dtype=torch.int32)
+    cp_metadata.kv_len_prev_tensor = torch.tensor(
+        cp_metadata.kv_len_prev, device=device, dtype=torch.int32
+    )
+    cp_metadata.kv_len_next_tensor = torch.tensor(
+        cp_metadata.kv_len_next, device=device, dtype=torch.int32
+    )
+    cp_metadata.actual_seq_q_prev_tensor = torch.tensor(
+        cp_metadata.actual_seq_q_prev, device=device, dtype=torch.int32
+    )
+    cp_metadata.actual_seq_q_next_tensor = torch.tensor(
+        cp_metadata.actual_seq_q_next, device=device, dtype=torch.int32
+    )
 
-    cp_metadata.attn_mask_seqlens = torch.tensor([[seq_len_per_block], [seq_len_per_block]], device=device, dtype=torch.int32)
-    cp_metadata.head_attn_nomask_seqlens = torch.tensor([[seq_len_per_block], [head_start_global]], device=device, dtype=torch.int32)
-    cp_metadata.tail_attn_nomask_seqlens = torch.tensor([[seq_len_per_block], [tail_start_global]], device=device, dtype=torch.int32)
+    cp_metadata.attn_mask_seqlens = torch.tensor(
+        [[seq_len_per_block], [seq_len_per_block]], device=device, dtype=torch.int32
+    )
+    cp_metadata.head_attn_nomask_seqlens = torch.tensor(
+        [[seq_len_per_block], [head_start_global]], device=device, dtype=torch.int32
+    )
+    cp_metadata.tail_attn_nomask_seqlens = torch.tensor(
+        [[seq_len_per_block], [tail_start_global]], device=device, dtype=torch.int32
+    )
 
-    cp_metadata.kv_with_q_head_nomask_idx = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
-    cp_metadata.kv_with_q_head_mask_idx = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
-    cp_metadata.kv_with_q_tail_nomask_idx = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
-    cp_metadata.kv_with_q_tail_mask_idx = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
+    cp_metadata.kv_with_q_head_nomask_idx = torch.arange(
+        0, head_start_global, dtype=torch.int32, device=device
+    )
+    cp_metadata.kv_with_q_head_mask_idx = torch.arange(
+        head_start_global, head_end_global, dtype=torch.int32, device=device
+    )
+    cp_metadata.kv_with_q_tail_nomask_idx = torch.arange(
+        0, tail_start_global, dtype=torch.int32, device=device
+    )
+    cp_metadata.kv_with_q_tail_mask_idx = torch.arange(
+        tail_start_global, tail_end_global, dtype=torch.int32, device=device
+    )
     return cp_metadata
 
 
@@ -181,9 +231,14 @@ def calculate_cp_metadata(
     """
     Build the canonical CP metadata shared by allocation, transfer, and compute
     """
-    cp_block_num, aligned_seq_len, seq_len_per_block, split_list, prefix_offsets, block_actual_lens = (
-        _build_cp_block_layout(actual_seq_len, cp_size, page_size)
-    )
+    (
+        cp_block_num,
+        aligned_seq_len,
+        seq_len_per_block,
+        split_list,
+        prefix_offsets,
+        block_actual_lens,
+    ) = _build_cp_block_layout(actual_seq_len, cp_size, page_size)
     cp_metadata = _build_cp_rank_metadata(
         actual_seq_len=actual_seq_len,
         cp_size=cp_size,
@@ -196,6 +251,7 @@ def calculate_cp_metadata(
         is_gqa=is_gqa,
     )
     return _build_cp_attention_tensors(cp_metadata, seq_len_per_block, device)
+
 
 #########################
 # Synchronization

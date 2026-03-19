@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.utils import ContextParallelMetadata
 
 
-
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]

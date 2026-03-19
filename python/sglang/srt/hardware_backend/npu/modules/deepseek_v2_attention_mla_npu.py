@@ -2,12 +2,10 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-import torch_npu
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
-    is_fia_nz,
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import scattered_to_tp_attn_full
@@ -15,7 +13,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dp_attention import pcp_ag_rearange_output 
+from sglang.srt.layers.dp_attention import pcp_ag_rearange_output
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -86,7 +84,7 @@ def forward_mha_prepare_npu(
         latent_cache[..., : m.kv_lora_rank] = k_nope
         latent_cache[..., m.kv_lora_rank :] = k_pe
         if nsa_use_prefill_cp(forward_batch, m.enable_prefill_cp):
-            latent_cache = pcp_ag_rearange_output (
+            latent_cache = pcp_ag_rearange_output(
                 latent_cache.squeeze(1).contiguous(), m.pcp_size, forward_batch
             )  # [n, 1, 576]
         kv_a = latent_cache[..., : m.kv_lora_rank]

@@ -204,7 +204,9 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 and len(cp_metadata.per_rank_actual_token) == pcp_size
             ):
                 gathered_parts = []
-                for rank_idx, per_rank_len in enumerate(cp_metadata.per_rank_actual_token):
+                for rank_idx, per_rank_len in enumerate(
+                    cp_metadata.per_rank_actual_token
+                ):
                     if per_rank_len <= 0:
                         continue
                     start = rank_idx * max_len
@@ -285,9 +287,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                         end = start + cp_metadata.per_rank_actual_token[pcp_rank]
                         hidden_states = hidden_states[start:end].contiguous()
                     else:
-                        hidden_states = hidden_states.tensor_split(pcp_size)[
-                            pcp_rank
-                        ]
+                        hidden_states = hidden_states.tensor_split(pcp_size)[pcp_rank]
                     if residual is not None and cp_metadata is not None:
                         residual = cp_extract_local_tokens(forward_batch, residual)
             return hidden_states, residual

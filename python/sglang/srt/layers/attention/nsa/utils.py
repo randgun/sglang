@@ -1,8 +1,8 @@
+import logging
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-import logging
 import torch
 import torch.nn.functional as F
 import triton
@@ -18,8 +18,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
-    get_attention_tp_rank,
-    get_attention_tp_size,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -28,6 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ContextParallelMetadata:
@@ -235,14 +234,13 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
             )
         return result
 
-    input_list = list(
-        torch.split(input_, cp_metadata.split_list, dim=0)
+    input_list = list(torch.split(input_, cp_metadata.split_list, dim=0))
+    result = torch.cat([input_list[i] for i in cp_metadata.zigzag_index], dim=0).view(
+        -1, input_.shape[-1]
     )
-    result = torch.cat(
-        [input_list[i] for i in cp_metadata.zigzag_index], dim=0
-    ).view(-1, input_.shape[-1])
 
     return result
+
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
@@ -274,14 +272,13 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
             )
         return result
 
-    position_id_list = list(
-        torch.split(positions, cp_metadata.split_list, dim=-1)
-    )
+    position_id_list = list(torch.split(positions, cp_metadata.split_list, dim=-1))
     positions = torch.cat(
         [position_id_list[i] for i in cp_metadata.zigzag_index],
         dim=-1,
     )
     return positions
+
 
 def cp_pad_local_tokens(forward_batch, input_: torch.Tensor):
     cp_metadata = getattr(forward_batch, "cp_metadata", None)
@@ -425,6 +422,7 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     else:
         return False
 
+
 def use_pcp(forward_batch):
     return (
         is_enable_prefill_cp()
@@ -475,6 +473,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     )
     return outputs
 
+
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
@@ -520,8 +519,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             .reshape(out_shape)
         )
         return output_tensor
-
-
 
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(

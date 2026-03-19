@@ -7,16 +7,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.distributed.parallel_state import (
-    get_context_parallel_world_size,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -594,7 +591,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         padding_pages = (
             req.cp_padding_pages[req.cp_padding_pages > 0]
             if req.cp_padding_pages is not None
-            else torch.empty(0, device=tree_cache.req_to_token_pool.req_to_token.device, dtype=torch.int64)
+            else torch.empty(
+                0,
+                device=tree_cache.req_to_token_pool.req_to_token.device,
+                dtype=torch.int64,
+            )
         )
         if req.cp_written_pages is not None and padding_pages.numel() > 0:
             padding_pages = padding_pages[
@@ -613,9 +614,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 if free_group:
                     pending_indices = torch.cat(free_group)
                     if pending_indices.numel() > 0:
-                        pending_free_pages = torch.unique(
-                            pending_indices // page_size
-                        )
+                        pending_free_pages = torch.unique(pending_indices // page_size)
             if release_pages.numel() > 0 or pending_free_pages.numel() > 0:
                 already_free_pages = torch.unique(
                     torch.cat((free_pages, release_pages, pending_free_pages))

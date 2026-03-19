@@ -70,8 +70,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     get_pcp_rank,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1828,9 +1826,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 block_token_end = block_token_start + block_size
 
                 if block_token_start < actual_seq_len:
-                    write_size = min(block_token_end, actual_seq_len) - block_token_start
+                    write_size = (
+                        min(block_token_end, actual_seq_len) - block_token_start
+                    )
                     if write_size > 0:
-                        compact_out_cache_loc.append(out_cache_loc[pt : pt + write_size])
+                        compact_out_cache_loc.append(
+                            out_cache_loc[pt : pt + write_size]
+                        )
                 pt += block_size
 
         if compact_out_cache_loc:

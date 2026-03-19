@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.utils import (
@@ -44,13 +44,13 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
+from sglang.srt.layers.dp_attention import get_attention_cp_rank
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
     Req,
     ScheduleBatch,
 )
-from sglang.srt.layers.dp_attention import get_attention_cp_rank
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -780,7 +780,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             kv_indices = (
                 self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :cp_metadata.actual_seq_len
+                    req.req_pool_idx, : cp_metadata.actual_seq_len
                 ]
                 .cpu()
                 .numpy()
@@ -790,7 +790,9 @@ class SchedulerDisaggregationPrefillMixin:
             prefill_page_indices = []
             block_page_counts = []
             for block_idx in cp_metadata.zigzag_index:
-                block_token_start = sum(cp_metadata.split_list[j] for j in range(block_idx))
+                block_token_start = sum(
+                    cp_metadata.split_list[j] for j in range(block_idx)
+                )
                 block_token_end = block_token_start + cp_metadata.split_list[block_idx]
 
                 block_kv_indices = kv_indices[block_token_start:block_token_end]
