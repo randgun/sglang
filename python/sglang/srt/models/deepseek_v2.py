@@ -1109,10 +1109,11 @@ class DeepseekV2AttentionMLA(
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
+            assert self.use_nsa, "NSA CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
-        if self.nsa_enable_prefill_cp and self.use_nsa:
+        if self.nsa_enable_prefill_cp or self.enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -1524,6 +1525,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             get_global_server_args().speculative_algorithm
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
@@ -1592,7 +1594,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        if self.nsa_enable_prefill_cp:
+        if self.nsa_enable_prefill_cp or self.enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
@@ -1701,7 +1703,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
 
-        if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
+        if not self.nsa_enable_prefill_cp and not self.enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
         if not should_allreduce_fusion:
