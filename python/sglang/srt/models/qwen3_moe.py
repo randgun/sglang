@@ -36,10 +36,8 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
     cp_pad_local_tokens,
     is_enable_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
     use_pcp,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -998,17 +996,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp and self.pcp_size > 1:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
-                    input_ids.device,
-                    is_gqa=True,
-                )
-
         hidden_states = self.model(
             input_ids,
             positions,

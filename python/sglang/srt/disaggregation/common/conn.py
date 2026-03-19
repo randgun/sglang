@@ -328,8 +328,7 @@ class CommonKVManager(BaseKVManager):
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
 
-        bootstrap_host = maybe_wrap_ipv6_address(host)
-        url = f"http://{bootstrap_host}:{self.bootstrap_port}/route"
+        url = f"{NetworkAddress(host, self.bootstrap_port).to_url()}/route"
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
