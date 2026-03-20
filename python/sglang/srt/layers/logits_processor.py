@@ -295,6 +295,28 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
+        assert hidden_states is not None
+        # CP ranks can legitimately have zero valid tokens after splitting.
+        # In this case, return empty tensors to keep downstream slicing safe.
+        if hidden_states.numel() == 0:
+            vocab_size = getattr(self.config, "vocab_size", None)
+            if vocab_size is None:
+                if hasattr(lm_head, "weight"):
+                    vocab_size = lm_head.weight.shape[0]
+                    if self.do_tensor_parallel_all_gather:
+                        if self.use_attn_tp_group:
+                            vocab_size *= get_attention_tp_size()
+                        else:
+                            vocab_size *= get_tensor_model_parallel_world_size()
+                else:
+                    vocab_size = 0
+            empty_hidden = hidden_states
+            empty_logits = empty_hidden.new_empty((0, vocab_size))
+            return LogitsProcessorOutput(
+                next_token_logits=empty_logits,
+                hidden_states=empty_hidden,
+            )
+
         # Multi-item scoring only for prefill-only requests.
         if self.multi_item_delimiter is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(

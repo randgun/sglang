@@ -475,6 +475,12 @@ class RadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
+            from sglang.srt.distributed.parallel_state import (
+                get_context_parallel_world_size,
+            )
+
+            if get_context_parallel_world_size() > 1:
+                kv_indices = kv_indices[kv_indices > 0]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 

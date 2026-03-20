@@ -98,6 +98,10 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        assert logits is not None
+        if logits.numel() == 0:
+            # CP ranks can have zero valid tokens; return empty ids to avoid crashes.
+            return torch.empty((0,), device=sampling_info.device, dtype=torch.int64)
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)

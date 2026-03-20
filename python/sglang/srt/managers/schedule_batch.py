@@ -54,11 +54,24 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    calculate_cp_metadata,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_context_parallel_world_size,
+    get_tensor_model_parallel_rank,
+)
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.nsa.utils import (
+    ContextParallelMetadata,
+    is_enable_prefill_cp,
+)
+from sglang.srt.layers.dp_attention import (
+    get_pcp_rank,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
@@ -799,6 +812,12 @@ class Req(ReqDllmMixin):
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 
+        # For CP mode KV transfer
+        self.cp_metadata: Optional["ContextParallelMetadata"] = None
+        # CP page ownership tracked during req_to_token writes.
+        self.cp_written_pages: Optional[torch.Tensor] = None
+        self.cp_padding_pages: Optional[torch.Tensor] = None
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1120,6 +1139,8 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.cp_written_pages = None
+        self.cp_padding_pages = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1459,11 +1480,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Init tensors
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
+        seq_lens_actual = seq_lens.copy()
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+
+        enable_cp = is_enable_prefill_cp()
+        server_args = get_global_server_args()
+        if enable_cp:
+            (
+                seq_lens_actual,
+                seq_lens,
+                extend_lens_actual,
+                extend_lens,
+                extend_num_tokens_actual,
+                extend_num_tokens,
+            ) = self._prepare_cp_extend(reqs, prefix_lens, server_args)
+        else:
+            extend_lens = [r.extend_input_len for r in reqs]
+            extend_num_tokens = sum(len(ids) for ids in input_ids)
+            extend_lens_actual = extend_lens
+            extend_num_tokens_actual = extend_num_tokens
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1516,9 +1553,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
 
-        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+        seq_lens_for_req = seq_lens_actual if enable_cp else seq_lens
+        for i, (req, seq_len, pre_len) in enumerate(
+            zip(reqs, seq_lens_for_req, prefix_lens)
+        ):
             req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            if enable_cp:
+                actual_seq_len = req.cp_metadata.actual_seq_len
+                assert req.extend_input_len == actual_seq_len - pre_len
+            else:
+                assert seq_len - pre_len == req.extend_input_len
 
             req.extend_batch_idx += 1
 
@@ -1632,7 +1676,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
-        self.out_cache_loc = out_cache_loc
+        if enable_cp and server_args.disaggregation_mode != "null":
+            self.out_cache_loc = self._get_cp_out_cache_loc(reqs, out_cache_loc)
+        else:
+            self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(
                 self.device, non_blocking=True
@@ -1664,7 +1711,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
-        self.seq_lens_sum = sum(seq_lens)
+        if enable_cp:
+            self._restore_extend_actual_view(
+                seq_lens_actual, extend_lens_actual, extend_num_tokens_actual
+            )
+        else:
+            self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -1691,13 +1743,112 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if self.model_config.is_encoder_decoder:
-            self.prepare_encoder_info_extend(input_ids, seq_lens)
+            self.prepare_encoder_info_extend(
+                input_ids, seq_lens_actual if enable_cp else seq_lens
+            )
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
         )
+
+    def _prepare_cp_extend(self, reqs, prefix_lens, server_args):
+        if not server_args.disable_radix_cache:
+            raise ValueError(
+                "CP mode requires radix cache to be disabled. "
+                "Please set --disable-radix-cache when enabling CP mode."
+            )
+
+        for req in reqs:
+            if len(req.prefix_indices) > 0:
+                raise ValueError(
+                    "CP mode requires radix cache to be disabled, "
+                    f"but prefix_indices length is {len(req.prefix_indices)} for request {req.rid}"
+                )
+
+        cp_size = get_context_parallel_world_size()
+        cp_rank = get_pcp_rank()
+        page_size = self.token_to_kv_pool_allocator.page_size
+        seq_lens_actual = []
+        seq_lens_alloc = []
+        extend_lens_actual = []
+        extend_lens_alloc = []
+        for req, prefix_len in zip(reqs, prefix_lens):
+            actual_seq_len = len(req.fill_ids)
+            seq_lens_actual.append(actual_seq_len)
+            req.cp_metadata = calculate_cp_metadata(
+                actual_seq_len=actual_seq_len,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                page_size=page_size,
+                device=self.device,
+            )
+
+            cp_extend_tokens = (
+                sum(req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index)
+                - prefix_len
+            )
+            extend_lens_alloc.append(cp_extend_tokens)
+            extend_lens_actual.append(actual_seq_len - prefix_len)
+            seq_lens_alloc.append(prefix_len + cp_extend_tokens)
+
+        extend_num_tokens_actual = sum(extend_lens_actual)
+        if server_args.disaggregation_mode == "null":
+            seq_lens = seq_lens_actual.copy()
+            extend_lens = extend_lens_actual
+            extend_num_tokens = extend_num_tokens_actual
+        else:
+            seq_lens = seq_lens_alloc
+            extend_lens = extend_lens_alloc
+            extend_num_tokens = sum(extend_lens_alloc)
+
+        return (
+            seq_lens_actual,
+            seq_lens,
+            extend_lens_actual,
+            extend_lens,
+            extend_num_tokens_actual,
+            extend_num_tokens,
+        )
+
+    def _get_cp_out_cache_loc(self, reqs, out_cache_loc):
+        compact_out_cache_loc = []
+        pt = 0
+        for req in reqs:
+            cp_metadata = req.cp_metadata
+            actual_seq_len = cp_metadata.actual_seq_len
+            for block_idx in cp_metadata.zigzag_index:
+                block_size = cp_metadata.split_list[block_idx]
+                block_token_start = 0
+                for j in range(block_idx):
+                    block_token_start += cp_metadata.split_list[j]
+                block_token_end = block_token_start + block_size
+
+                if block_token_start < actual_seq_len:
+                    write_size = (
+                        min(block_token_end, actual_seq_len) - block_token_start
+                    )
+                    if write_size > 0:
+                        compact_out_cache_loc.append(
+                            out_cache_loc[pt : pt + write_size]
+                        )
+                pt += block_size
+
+        if compact_out_cache_loc:
+            return torch.cat(compact_out_cache_loc)
+        return torch.zeros(0, dtype=torch.int64).to(self.device, non_blocking=True)
+
+    def _restore_extend_actual_view(
+        self, seq_lens_actual, extend_lens_actual, extend_num_tokens_actual
+    ):
+        self.seq_lens = torch.tensor(seq_lens_actual, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens_cpu = torch.tensor(seq_lens_actual, dtype=torch.int64)
+        self.extend_lens = extend_lens_actual
+        self.extend_num_tokens = extend_num_tokens_actual
+        self.seq_lens_sum = sum(seq_lens_actual)
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -2232,6 +2383,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
+        prefill_cp_metadata = None
+        if len(self.reqs) > 0 and self.reqs[0].cp_metadata is not None:
+            prefill_cp_metadata = self.reqs[0].cp_metadata
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2289,6 +2444,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            prefill_cp_metadata=prefill_cp_metadata,
         )
 
     def copy(self):
@@ -2483,3 +2639,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For CP mode
+    prefill_cp_metadata: Optional[ContextParallelMetadata] = None

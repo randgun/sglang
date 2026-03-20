@@ -101,6 +101,8 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
+        self.pcp_size = server_args.attn_cp_size
+        self.pcp_rank = get_attention_cp_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_cp_size = get_attention_cp_size()
@@ -117,7 +119,8 @@ class CommonKVManager(BaseKVManager):
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         self.enable_all_cp_ranks_for_transfer = (
-            envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            self.attn_cp_size > 1
+            or envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
 
         # bind zmq socket
@@ -325,9 +328,7 @@ class CommonKVManager(BaseKVManager):
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
 
-        bootstrap_na = NetworkAddress(host, self.bootstrap_port)
-        bootstrap_server_url = bootstrap_na.to_host_port_str()
-        url = f"{bootstrap_na.to_url()}/route"
+        url = f"{NetworkAddress(host, self.bootstrap_port).to_url()}/route"
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
@@ -515,7 +516,37 @@ class CommonKVReceiver(BaseKVReceiver):
         self.required_prefill_response_num = (
             self.prefill_info.required_prefill_response_num
         )
+        enable_all_cp_ranks_for_transfer = (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            or self.prefill_info.attn_cp_size > 1
+        )
+        if self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size:
+            self.target_cp_ranks = [self.kv_mgr.attn_cp_rank]
+        else:
+            self.target_cp_ranks = [
+                rank for rank in range(self.prefill_info.attn_cp_size)
+            ]
+            if not enable_all_cp_ranks_for_transfer:
+                # Only retrieve from prefill CP rank 0 when not using all ranks
+                self.target_cp_ranks = self.target_cp_ranks[:1]
+            else:
+                self.required_prefill_response_num *= (
+                    self.prefill_info.attn_cp_size // self.kv_mgr.attn_cp_size
+                )
 
+        # Decode pp size should be equal to prefill pp size or 1
+        assert (
+            self.kv_mgr.pp_size == self.prefill_info.pp_size or self.kv_mgr.pp_size == 1
+        ), (
+            f"Decode pp size ({self.kv_mgr.pp_size}) should be equal to prefill pp size ({self.prefill_info.pp_size}) or 1",
+        )
+        if self.prefill_info.pp_size == self.kv_mgr.pp_size:
+            self.target_pp_ranks = [self.kv_mgr.pp_rank]
+        else:
+            self.target_pp_ranks = [rank for rank in range(self.prefill_info.pp_size)]
+            self.required_prefill_response_num *= (
+                self.prefill_info.pp_size // self.kv_mgr.pp_size
+            )
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
         )

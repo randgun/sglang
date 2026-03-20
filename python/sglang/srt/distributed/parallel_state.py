@@ -1528,6 +1528,10 @@ def get_moe_tp_group() -> GroupCoordinator:
     return _MOE_TP
 
 
+def get_pcp_group() -> GroupCoordinator:
+    return get_attn_cp_group()
+
+
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
@@ -2214,6 +2218,16 @@ def get_moe_tensor_parallel_world_size():
 def get_moe_tensor_parallel_rank():
     """Return my rank for the moe tensor parallel group."""
     return get_moe_tp_group().rank_in_group
+
+
+def get_context_parallel_world_size():
+    """Return world size for the context parallel group."""
+    return get_attn_context_model_parallel_world_size()
+
+
+def get_context_parallel_rank():
+    """Return my rank for the context parallel group."""
+    return get_attn_context_model_parallel_rank()
 
 
 def destroy_model_parallel():

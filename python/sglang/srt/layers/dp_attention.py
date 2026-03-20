@@ -7,6 +7,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -39,6 +40,8 @@ if TYPE_CHECKING:
 
 _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
+_ATTN_PCP_SIZE: Optional[int] = None
+_ATTN_PCP_RANK: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
@@ -272,8 +275,9 @@ def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
-    global _ATTN_DP_RANK, _ATTN_DP_SIZE
+    global _ATTN_DP_RANK, _ATTN_DP_SIZE, _ATTN_PCP_SIZE, _ATTN_PCP_RANK
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
@@ -301,11 +305,25 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
+    # Keep PCP helpers available as aliases to the attention CP topology.
+    _ATTN_PCP_RANK = get_attn_context_model_parallel_rank()
+    _ATTN_PCP_SIZE = get_attn_context_model_parallel_world_size()
+
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
         device=torch.device(server_args.device),
     )
+
+
+def get_pcp_rank() -> int:
+    assert _ATTN_PCP_RANK is not None, "pcp attention not initialized!"
+    return _ATTN_PCP_RANK
+
+
+def get_pcp_size() -> int:
+    assert _ATTN_PCP_SIZE is not None, "pcp attention not initialized!"
+    return _ATTN_PCP_SIZE
 
 
 def is_dp_attention_enabled() -> bool:
@@ -582,3 +600,58 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
+    # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
+    # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
+    # but communicate on PCP group (not attention-TP group).
+    cp_metadata = forward_batch.cp_metadata
+    if cp_metadata is None:
+        raise ValueError(
+            f"pcp_ag_rearange_output requires cp metadata, got None "
+            f"(forward_mode={getattr(forward_batch, 'forward_mode', None)})"
+        )
+    max_len = cp_metadata.max_rank_len[0]
+    pad_size = max_len - input_tensor.shape[0]
+    if pad_size > 0:
+        input_tensor = F.pad(
+            input_tensor,
+            (0, 0, 0, pad_size),
+            mode="constant",
+            value=0,
+        )
+    all_shuffled_sensor = torch.empty(
+        max_len * pcp_size,
+        input_tensor.shape[-1],
+        dtype=input_tensor.dtype,
+        device=input_tensor.device,
+    )
+
+    cp_group = get_attention_cp_group()
+
+    assert (
+        cp_group.world_size == pcp_size
+    ), f"pcp metadata/group mismatch: pcp_size={pcp_size}, cp_group.world_size={cp_group.world_size}"
+
+    cp_group.all_gather_into_tensor(all_shuffled_sensor, input_tensor)
+
+    splitted_tensor = list(
+        torch.split(
+            all_shuffled_sensor,
+            cp_metadata.max_rank_len,
+            dim=0,
+        )
+    )
+    output_tensor = torch.cat(
+        [
+            splitted_tensor[index][:per_rank_len]
+            for index, per_rank_len in enumerate(cp_metadata.per_rank_actual_token)
+        ],
+        dim=0,
+    )
+    outputs_list = list(
+        torch.split(output_tensor, cp_metadata.reverse_split_len, dim=0)
+    )
+    outputs = torch.cat([outputs_list[i] for i in cp_metadata.cp_reverse_index], dim=0)
+    return outputs
