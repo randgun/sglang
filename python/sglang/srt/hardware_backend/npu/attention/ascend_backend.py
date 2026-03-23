@@ -410,8 +410,6 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        k_cache: Optional[torch.Tensor] = None,
-        v_cache: Optional[torch.Tensor] = None,
     ):
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
@@ -429,24 +427,9 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
-        if envs.SGLANG_NPU_PD_ENABLE_C8.get():
-            # 获取 buffer
-            np_page_k_buffer = self.graph_metadata["np_page_k"]
-            np_page_v_buffer = self.graph_metadata["np_page_v"]
-
-            gathered_k = k_cache[metadata.block_tables].view(
-                bs, -1, self.k_hidden_size
-            )
-            gathered_v = v_cache[metadata.block_tables].view(
-                bs, -1, self.v_hidden_size
-            )
-            
-            # copy 到预分配的 buffer
-            np_page_k_buffer[:bs, :max_len, :].copy_(gathered_k)
-            np_page_v_buffer[:bs, :max_len, :].copy_(gathered_v)
+        metadata.max_len = max_len
 
         self.forward_metadata = metadata
-
         self.graph_mode = True
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -1185,12 +1168,12 @@ class AscendAttnBackend(AttentionBackend):
 
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                 kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
-                # if self.graph_mode and not self.enable_torch_compile:
-                #     # 图模式下使用专门的图模式实现
-                #     return self.forward_mtp_graph_c8(
-                #         query, k_cache, v_cache, layer, forward_batch,
-                #         actual_seq_lengths_kv, kv_dequant_scale
-                #     )
+                if self.graph_mode and not self.enable_torch_compile:
+                    # 图模式下使用专门的图模式实现
+                    return self.forward_mtp_graph_c8(
+                        query, k_cache, v_cache, layer, forward_batch,
+                        actual_seq_lengths_kv, kv_dequant_scale
+                    )
                 bs = self.forward_metadata.block_tables.shape[0]
                 max_kv_len = max(actual_seq_lengths_kv)
                 query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -1201,15 +1184,16 @@ class AscendAttnBackend(AttentionBackend):
                     print(f"+++ {rank=}, {layer.layer_id=}, {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {self.forward_metadata.block_tables.shape=}"
                         f", {self.page_size=}, {layer.tp_k_head_num=}, {actual_seq_lengths_kv=}, {kv_dequant_scale.shape=} {self.forward_metadata.seq_lens=}", flush=True)
 
-                hidden_dim = layer.tp_k_head_num * layer.v_head_dim
+                hidden_dim_k = layer.tp_k_head_num * layer.qk_head_dim
+                hidden_dim_v = layer.tp_v_head_num * layer.v_head_dim
                 # np_page_k = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
                 # np_page_v = torch.zeros((bs, max_kv_len, hidden_dim), device='npu', dtype=torch.int8)
 
                 # for i in range(bs):
                 #     np_page_k[i] = k_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
                 #     np_page_v[i] = v_cache[self.forward_metadata.block_tables[i]].view(-1, hidden_dim)[:max_kv_len, ...]
-                np_page_k = k_cache[self.forward_metadata.block_tables].view(bs, -1, hidden_dim)
-                np_page_v = v_cache[self.forward_metadata.block_tables].view(bs, -1, hidden_dim)
+                np_page_k = k_cache[self.forward_metadata.block_tables].view(bs, -1, hidden_dim_k)
+                np_page_v = v_cache[self.forward_metadata.block_tables].view(bs, -1, hidden_dim_v)
                 # 算子在Q_S>1时不支持page attention
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
@@ -1368,35 +1352,24 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv: List[int],
         kv_dequant_scale: torch.Tensor,
     ):
-        bs = self.graph_metadata["np_page_k"].shape[0]
+        bs = self.forward_metadata.block_tables.shape[0]
         
         hidden_dim_k = layer.tp_k_head_num * layer.qk_head_dim
         hidden_dim_v = layer.tp_v_head_num * layer.v_head_dim
         
-        # 1. 获取预分配的 Buffer
         np_page_k_buffer = self.graph_metadata["np_page_k"]
         np_page_v_buffer = self.graph_metadata["np_page_v"]
         
-        block_tables_static = self.forward_metadata.block_tables
+        block_tables = self.forward_metadata.block_tables
+        max_len = self.forward_metadata.max_len
         
-        block_tables_flat = block_tables_static.flatten()
-
-        torch.index_select(
-            k_cache, 
-            dim=0, 
-            index=block_tables_flat, 
-            out=np_page_k_buffer.view(bs, -1, hidden_dim_k)
-        )
-
-        torch.index_select(
-            v_cache, 
-            dim=0, 
-            index=block_tables_flat, 
-            out=np_page_v_buffer.view(bs, -1, hidden_dim_v)
-        )
+        block_tables_flat = block_tables.flatten()
+        
+        torch.index_select(k_cache, dim=0, index=block_tables_flat, out=np_page_k_buffer.view(bs, -1, hidden_dim_k))
+        torch.index_select(v_cache, dim=0, index=block_tables_flat, out=np_page_v_buffer.view(bs, -1, hidden_dim_v))
+        
         query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
         
-        # 3. 修正 scale 参数的传入
         attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query,
             np_page_k_buffer,
