@@ -427,8 +427,6 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
-        metadata.max_len = max_len
-
         self.forward_metadata = metadata
         self.graph_mode = True
 
@@ -1171,7 +1169,7 @@ class AscendAttnBackend(AttentionBackend):
                 if self.graph_mode and not self.enable_torch_compile:
                     # 图模式下使用专门的图模式实现
                     return self.forward_mtp_graph_c8(
-                        query, k_cache, v_cache, layer, forward_batch,
+                        query, k_cache, v_cache, layer, forward_batch, actual_seq_lengths,
                         actual_seq_lengths_kv, kv_dequant_scale
                     )
                 bs = self.forward_metadata.block_tables.shape[0]
@@ -1203,6 +1201,7 @@ class AscendAttnBackend(AttentionBackend):
                     num_key_value_heads=layer.tp_k_head_num,
                     input_layout="BSH",
                     softmax_scale=layer.scaling,
+                    actual_seq_qlen=actual_seq_lengths,
                     actual_seq_kvlen=actual_seq_lengths_kv,
                     key_quant_mode=1,
                     value_quant_mode=1,
@@ -1349,6 +1348,7 @@ class AscendAttnBackend(AttentionBackend):
         v_cache: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        actual_seq_lengths: List[int],
         actual_seq_lengths_kv: List[int],
         kv_dequant_scale: torch.Tensor,
     ):
@@ -1361,10 +1361,8 @@ class AscendAttnBackend(AttentionBackend):
         np_page_v_buffer = self.graph_metadata["np_page_v"]
         
         block_tables = self.forward_metadata.block_tables
-        max_len = self.forward_metadata.max_len
         
-        block_tables_flat = block_tables.flatten()
-        
+        block_tables_flat = block_tables.flatten()        
         torch.index_select(k_cache, dim=0, index=block_tables_flat, out=np_page_k_buffer.view(bs, -1, hidden_dim_k))
         torch.index_select(v_cache, dim=0, index=block_tables_flat, out=np_page_v_buffer.view(bs, -1, hidden_dim_v))
         
@@ -1378,6 +1376,7 @@ class AscendAttnBackend(AttentionBackend):
             num_key_value_heads=layer.tp_k_head_num,
             input_layout="BSH",
             softmax_scale=layer.scaling,
+            actual_seq_qlen=actual_seq_lengths,
             actual_seq_kvlen=actual_seq_lengths_kv,
             key_quant_mode=1,
             value_quant_mode=1,
