@@ -1153,26 +1153,21 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
-            if forward_batch.forward_mode.is_draft_extend():
-                actual_seq_lengths = (
-                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
-                )
-            else:
-                actual_seq_lengths = np.arange(
-                    self.speculative_num_draft_tokens,
-                    self.speculative_num_draft_tokens + query.shape[0],
-                    self.speculative_num_draft_tokens,
-                )
 
             if envs.SGLANG_NPU_PD_ENABLE_C8.get():
                 kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
+                
+                bs = self.forward_metadata.block_tables.shape[0]
+                if forward_batch.forward_mode.is_draft_extend():
+                    actual_seq_lengths = forward_batch.extend_seq_lens_cpu
+                else:
+                    actual_seq_lengths = [self.speculative_num_draft_tokens] * bs
                 if self.graph_mode and not self.enable_torch_compile:
                     # 图模式下使用专门的图模式实现
                     return self.forward_mtp_graph_c8(
                         query, k_cache, v_cache, layer, forward_batch, actual_seq_lengths,
                         actual_seq_lengths_kv, kv_dequant_scale
                     )
-                bs = self.forward_metadata.block_tables.shape[0]
                 max_kv_len = max(actual_seq_lengths_kv)
                 query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
 
@@ -1211,6 +1206,16 @@ class AscendAttnBackend(AttentionBackend):
                     atten_mask=self.mtp_mask,
                 )
             else:
+                if forward_batch.forward_mode.is_draft_extend():
+                    actual_seq_lengths = (
+                        np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
+                    )
+                else:
+                    actual_seq_lengths = np.arange(
+                        self.speculative_num_draft_tokens,
+                        self.speculative_num_draft_tokens + query.shape[0],
+                        self.speculative_num_draft_tokens,
+                    )
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     query,
                     k_cache,
