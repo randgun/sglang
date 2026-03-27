@@ -586,14 +586,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
-        is_prefill = (
+        is_npu_prefill = _is_npu and (
             forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_target_verify()
         )
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if is_prefill:
+            if is_npu_prefill:
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_experts
                 )
@@ -614,7 +614,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
-        if is_prefill:
+        if is_npu_prefill:
             wait_share_stream()
 
         if shared_output is not None:
