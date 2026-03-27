@@ -1112,6 +1112,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        use_c8 = envs.SGLANG_NPU_PD_ENABLE_C8.get()
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -1120,7 +1121,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                if use_c8:
                     k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k.view(-1, layer.tp_k_head_num * layer.qk_head_dim))
                     v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v.view(-1, layer.tp_v_head_num * layer.v_head_dim))
                     forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1154,7 +1155,7 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
-            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+            if use_c8:
                 kv_dequant_scale = forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 
                 bs = self.forward_metadata.block_tables.shape[0]
@@ -1168,7 +1169,6 @@ class AscendAttnBackend(AttentionBackend):
                         query, k_cache, v_cache, layer, forward_batch, actual_seq_lengths,
                         actual_seq_lengths_kv, kv_dequant_scale
                     )
-                max_kv_len = max(actual_seq_lengths_kv)
                 query = query.view(bs, -1, layer.tp_q_head_num * layer.qk_head_dim)
 
                 rank = torch.distributed.get_rank()
@@ -1407,6 +1407,7 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        use_c8 = envs.SGLANG_NPU_PD_ENABLE_C8.get()
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -1415,7 +1416,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                if use_c8:
                     k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k.view(-1, layer.tp_k_head_num * layer.qk_head_dim))
                     v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v.view(-1, layer.tp_v_head_num * layer.v_head_dim))
                     print(f"++++ {forward_batch.out_cache_loc.shape=}, {k_quant.dtype=}, {k_dynamic_scale.dtype=}")
@@ -1466,14 +1467,14 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             rank = torch.distributed.get_rank()
-            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+            if use_c8:
                 print(f"+++ {rank=}, {self.forward_metadata.seq_lens.shape=}")
                 kv_dequant_scale= forward_batch.token_to_kv_pool.get_scale_buffer(layer.layer_id, self.forward_metadata.seq_lens, self.forward_metadata.block_tables)
                 print(f"+++ {rank=}, {kv_dequant_scale.shape=}, {self.forward_metadata.block_tables.shape=}")
             num_tokens = query.shape[0]
             print(f"++++ {query.shape=}, {k_cache.shape=}, {v_cache.shape=}, {kv_dequant_scale.shape=}")
 
-            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+            if use_c8:
                 workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                     query,
                     k_cache,
@@ -1507,7 +1508,7 @@ class AscendAttnBackend(AttentionBackend):
                 device=q.device,
             )
             softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-            if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+            if use_c8:
                 torch_npu.npu_fused_infer_attention_score.out(
                     query,
                     k_cache,
@@ -1653,6 +1654,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
+            use_c8 = envs.SGLANG_NPU_PD_ENABLE_C8.get()
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 # support cross attention
@@ -1661,7 +1663,7 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                if use_c8:
                     k_quant, k_dynamic_scale = torch.ops.npu.npu_dynamic_quant(k.view(-1, layer.tp_k_head_num * layer.qk_head_dim))
                     v_quant, v_dynamic_scale = torch.ops.npu.npu_dynamic_quant(v.view(-1, layer.tp_v_head_num * layer.v_head_dim))
                     print(f"++++ {forward_batch.out_cache_loc.shape=}, {k_quant.dtype=}, {k_dynamic_scale.dtype=}")
@@ -1702,7 +1704,7 @@ class AscendAttnBackend(AttentionBackend):
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
                 
-                if envs.SGLANG_NPU_PD_ENABLE_C8.get():
+                if use_c8:
                     actual_bs = self.forward_metadata.block_tables.shape[0]
                     query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
                     padded_bs = query.shape[0]
