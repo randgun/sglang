@@ -585,14 +585,15 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
-        is_npu_prefill = _is_npu and (
+        enable_npu_dual_stream = _is_npu and (
             forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_target_verify()
-        )
+        ) and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if is_npu_prefill:
+            if enable_npu_dual_stream:
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_experts
                 )
@@ -613,7 +614,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
-        if is_npu_prefill:
+        if enable_npu_dual_stream:
             wait_share_stream()
 
         if shared_output is not None:
@@ -949,11 +950,7 @@ class Glm4MoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = (
-            torch.cuda.Stream()
-            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-            else None
-        )
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeDecoderLayer(
