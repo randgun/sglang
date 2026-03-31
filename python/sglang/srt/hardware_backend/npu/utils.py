@@ -135,7 +135,6 @@ def npu_format_cast(
 ) -> torch.Tensor:
     """
     Cast a tensor to a specific NPU ACL format.
-    Warning: This function would release the original tensor storage after the cast.
 
     Args:
         tensor (torch.Tensor): The input tensor.
