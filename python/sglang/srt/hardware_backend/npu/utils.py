@@ -138,8 +138,10 @@ def get_indexer_weight_stream():
         indexer_weight_stream = torch.npu.Stream()
     return indexer_weight_stream
 
+
 share_stream = None
 routed_stream = None
+
 
 def get_share_stream():
     global share_stream
@@ -199,4 +201,3 @@ def process_routed_expert(hidden_states, topk_output, forward_func):
     with torch.get_device_module().stream(stream):
         shared_output = forward_func(hidden_states, topk_output)
     return shared_output
-

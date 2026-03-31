@@ -110,7 +110,11 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
-    from sglang.srt.hardware_backend.npu.utils import wait_share_stream, process_shared_expert
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
+    )
 
 
 class Glm4MoeMLP(nn.Module):
@@ -585,10 +589,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
-        enable_npu_dual_stream = _is_npu and (
-            forward_batch.forward_mode.is_extend()
-            or forward_batch.forward_mode.is_target_verify()
-        ) and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        enable_npu_dual_stream = (
+            _is_npu
+            and (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        )
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
