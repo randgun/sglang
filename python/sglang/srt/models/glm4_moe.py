@@ -95,8 +95,6 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     make_layers,
-    process_shared_expert,
-    wait_share_stream,
 )
 
 _is_hip = is_hip()
@@ -112,6 +110,7 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    from sglang.srt.hardware_backend.npu.utils import wait_share_stream, process_shared_expert
 
 
 class Glm4MoeMLP(nn.Module):
