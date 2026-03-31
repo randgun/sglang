@@ -171,10 +171,7 @@ def npu_format_cast(
         )
         return tensor
 
-    formatted_tensor = torch.ops.npu.npu_format_cast(tensor, acl_format.value)
-    tensor.untyped_storage().resize_(0)
-
-    return formatted_tensor
+    return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
 def get_indexer_weight_stream():
