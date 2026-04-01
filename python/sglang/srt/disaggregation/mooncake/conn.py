@@ -167,7 +167,7 @@ class AuxDataCodec:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
-
+    kv_args_register_info_class = KVArgsRegisterInfo
     def __init__(
         self,
         args: KVArgs,
@@ -769,6 +769,37 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    def _handle_kvcache_transfer(
+        self, 
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        target_rank_registration_info: KVArgsRegisterInfo,
+        chunked_dst_kv_indice: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Handle KV cache transfer with appropriate method based on backend and TP size"""
+        if self.is_mla_backend or (
+            self.attn_tp_size == target_rank_registration_info.dst_attn_tp_size
+        ):
+            return self.send_kvcache(
+                mooncake_session_id,
+                prefill_kv_indices,
+                target_rank_registration_info.dst_kv_ptrs,
+                chunked_dst_kv_indice,
+                executor,
+            )
+        else:
+            return self.send_kvcache_slice(
+                mooncake_session_id,
+                prefill_kv_indices,
+                target_rank_registration_info.dst_kv_ptrs,
+                chunked_dst_kv_indice,
+                target_rank_registration_info.dst_tp_rank,
+                target_rank_registration_info.dst_attn_tp_size,
+                target_rank_registration_info.dst_kv_item_len,
+                executor,
+            )
+
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
@@ -824,28 +855,13 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
-                            self.attn_tp_size
-                            == target_rank_registration_info.dst_attn_tp_size
-                        ):
-                            ret = self.send_kvcache(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                executor,
-                            )
-                        else:
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
-                            )
+                        ret = self._handle_kvcache_transfer(
+                            req.mooncake_session_id,
+                            kv_chunk.prefill_kv_indices,
+                            target_rank_registration_info,
+                            chunked_dst_kv_indice,
+                            executor,
+                        )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -932,8 +948,11 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                        self.kv_args_register_info_class.from_zmq(waiting_req_bytes)
                     )
+                    import torch
+                    rank = torch.distributed.get_rank()
+                    print(f"+++ {rank=}, {self.decode_kv_args_table[mooncake_session_id]=}", flush=True)
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)

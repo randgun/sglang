@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List
 
 import torch
 import torch_npu
@@ -13,6 +13,8 @@ from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+
+from sglang.srt.hardware_backend.npu.gather_cache import gather_kv_cache_triton
 
 
 class NPUMHATokenToKVPool(MHATokenToKVPool):
@@ -171,6 +173,131 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 ),
                 slot_indices=loc,
             )
+
+
+class NPUMHAC8TokenToKVPool(NPUMHATokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dequant_scale_type: torch.dtype,
+        dequant_offset_type: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        self.dequant_scale_type = dequant_scale_type
+        self.dequant_offset_type = dequant_offset_type
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=torch.int8,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+        )
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.dequant_scale_buffer = torch.zeros(
+                (
+                    2,
+                    self.layer_num,
+                    (self.size // self.page_size + 1) * self.page_size,
+                    1
+                ),
+                dtype=self.dequant_scale_type,
+                device=self.device,
+            )
+
+        self.k_dequant_scale_buffer = self.dequant_scale_buffer[0]
+        self.v_dequant_scale_buffer = self.dequant_scale_buffer[1]
+
+    def get_contiguous_scale_buf_infos(self):
+        dequant_scale_data_ptrs = [
+            self.k_dequant_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+        ] + [self.v_dequant_scale_buffer[i].data_ptr() for i in range(self.layer_num)]
+        dequant_scale_data_lens = [
+            self.k_dequant_scale_buffer[i].nbytes for i in range(self.layer_num)
+        ] + [self.v_dequant_scale_buffer[i].nbytes for i in range(self.layer_num)]
+        dequant_scale_item_lens = [
+            self.k_dequant_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+        ] + [self.v_dequant_scale_buffer[i][0].nbytes for i in range(self.layer_num)]
+        return dequant_scale_data_ptrs, dequant_scale_data_lens, dequant_scale_item_lens
+
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_k_dequant_scale: torch.Tensor,
+        cache_v_dequant_scale: torch.Tensor,
+        cache_k_dequant_offset: Optional[torch.Tensor] = None,
+        cache_v_dequant_offset: Optional[torch.Tensor] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        super().set_kv_buffer(
+            layer=layer,
+            loc=loc,
+            cache_k=cache_k,
+            cache_v=cache_v,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            layer_id_override=layer_id_override,
+        )
+
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+
+        print(f"+++ {self.k_dequant_scale_buffer[layer_id - self.start_layer].shape=}, {loc.view(-1, 1).shape=},\
+               {cache_k_dequant_scale.view(-1, self.k_dequant_scale_buffer.shape[-1]).shape=}", flush=True)
+        torch_npu.npu_scatter_nd_update_(
+            self.k_dequant_scale_buffer[layer_id - self.start_layer],
+            loc.view(-1, 1),
+            cache_k_dequant_scale.view(-1, self.k_dequant_scale_buffer.shape[-1]),
+        )
+
+        torch_npu.npu_scatter_nd_update_(
+            self.v_dequant_scale_buffer[layer_id - self.start_layer],
+            loc.view(-1, 1),
+            cache_v_dequant_scale.view(-1, self.v_dequant_scale_buffer.shape[-1]),
+        )
+
+    def get_scale_buffer(self, layer_id: int, actual_seq_len_kv: torch.Tensor, block_tables: torch.Tensor, mode=0):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        k_scale = gather_kv_cache_triton(self.k_dequant_scale_buffer[layer_id - self.start_layer], actual_seq_len_kv, block_tables, self.page_size, mode)
+        v_scale = gather_kv_cache_triton(self.v_dequant_scale_buffer[layer_id - self.start_layer], actual_seq_len_kv, block_tables, self.page_size, mode)
+        return torch.stack([
+            k_scale,
+            v_scale,
+        ], dim=0)
+
+    def get_dequant_unit_num(self):
+        return self.head_num * self.head_dim
+
+    def get_offset_buffer(self, layer_id: int):
+        raise NotImplementedError
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
