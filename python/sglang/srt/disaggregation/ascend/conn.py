@@ -23,7 +23,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferKVChunk,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_local_ip_auto
+from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -91,6 +91,11 @@ class AscendKVManager(MooncakeKVManager):
         self.engine.batch_register(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         )
+        # Batch register state/extra pool data buffers
+        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
+            self.engine.batch_register(
+                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+            )
         if self.npu_c8 and self.disaggregation_mode == DisaggregationMode.DECODE:
             self.engine.batch_register(
                 self.kv_args.dequant_scale_data_ptrs,
@@ -110,15 +115,36 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        num_layers = len(self.kv_args.kv_data_ptrs)
-        layers_params = [
-            (
-                self.kv_args.kv_data_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
-                self.kv_args.kv_item_lens[layer_id],
+        if self.pp_size > 1:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
-            for layer_id in range(num_layers)
-        ]
+
+            layers_params = [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    self.kv_args.kv_item_lens[layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+        else:
+            num_layers = len(self.kv_args.kv_data_ptrs)
+            layers_params = [
+                (
+                    self.kv_args.kv_data_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    self.kv_args.kv_item_lens[layer_id],
+                )
+                for layer_id in range(num_layers)
+            ]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
