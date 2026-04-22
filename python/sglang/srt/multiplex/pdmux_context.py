@@ -9,7 +9,7 @@ from sglang.srt.utils.common import is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    from srt.hardware_backend.npu.multiplex.npu_pdmux_context import (
+    from sglang.srt.hardware_backend.npu.multiplex.npu_pdmux_context import (
         get_npu_pdmux_manager,
         load_npu_pdmux_config,
     )

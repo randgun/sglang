@@ -21,15 +21,15 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.multiplex.npu_pdmux_context import (
         get_npu_pdmux_manager,
     )
-else:
-    from sglang.srt.multiplex.pdmux_context import (
-        get_current_stream_idx,
-        get_sm_counts,
-        get_stream_groups,
-        initialize_stream_groups,
-        load_pdmux_config,
-        set_current_stream_idx,
-    )
+
+from sglang.srt.multiplex.pdmux_context import (
+    get_current_stream_idx,
+    get_sm_counts,
+    get_stream_groups,
+    initialize_stream_groups,
+    load_pdmux_config,
+    set_current_stream_idx,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
