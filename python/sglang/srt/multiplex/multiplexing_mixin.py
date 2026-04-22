@@ -18,7 +18,7 @@ from sglang.srt.utils.common import is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.pdmutex.npu_pdmutex_context import (
+    from sglang.srt.hardware_backend.npu.multiplex.npu_pdmux_context import (
         get_npu_pdmux_manager,
     )
 else:
@@ -47,7 +47,9 @@ class SchedulerMultiplexMixin:
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
         if _is_npu:
-            self.pdmux_manager = get_npu_pdmux_manager(npu_id=self.gpu_id, config=self.pdmux_config)
+            self.pdmux_manager = get_npu_pdmux_manager(
+                npu_id=self.gpu_id, config=self.pdmux_config
+            )
         else:
             initialize_stream_groups(self.gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()

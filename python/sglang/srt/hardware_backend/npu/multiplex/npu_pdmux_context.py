@@ -1,5 +1,7 @@
+import threading
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
+
 import torch
 import yaml
 
@@ -7,6 +9,7 @@ import yaml
 @dataclass
 class PDMuxConfig:
     """Configuration for NPU resource multiplexing."""
+
     sm_group_num: int = 8
     manual_divisions: List[List[int]] = field(default_factory=list)
     split_forward_token_budget: int = 65536
@@ -19,14 +22,13 @@ class _NPUMuxManagerImpl:
         self.npu_id = npu_id
         self.config = config
         self.stream_groups: List[Tuple[torch.npu.Stream, torch.npu.Stream]] = []
-        self.cube_counts: List[Tuple[int, int]] = []   # (prefill_cubes, decode_cubes)
+        self.cube_counts: List[Tuple[int, int]] = []  # (prefill_cubes, decode_cubes)
         self.current_idx: int = 0
 
         self._initialize()
         self._initialized = True
 
     def _get_total_cubes(self) -> int:
-        """获取当前NPU设备的Cube核心总数。"""
         if self.config.total_cubes is not None:
             return self.config.total_cubes
 
@@ -61,9 +63,7 @@ class _NPUMuxManagerImpl:
         stream = torch.npu.Stream(device=self.npu_id)
         if cube_num > 0:
             torch.npu.set_stream_limit(
-                stream,
-                cube_num=cube_num,
-                vector_num=cube_num * 2
+                stream, cube_num=cube_num, vector_num=cube_num * 2
             )
         return stream
 
@@ -72,8 +72,7 @@ class _NPUMuxManagerImpl:
 
         if self.config.manual_divisions:
             divisions = [
-                (prefill, decode)
-                for prefill, decode, _ in self.config.manual_divisions
+                (prefill, decode) for prefill, decode, _ in self.config.manual_divisions
             ]
 
             for prefill, decode in divisions:
@@ -84,27 +83,21 @@ class _NPUMuxManagerImpl:
         else:
             divisions = self._divide_cubes(total_cubes, self.config.sm_group_num - 2)
 
-        # 2. 构建cube_counts和stream_groups
-        #    第一个组：全量cube用于prefill（不设限制）
         self.cube_counts.append((total_cubes, 0))
-        self.stream_groups.append((
-            torch.npu.Stream(device=self.npu_id),   # prefill流，不控核
-            torch.npu.Stream(device=self.npu_id)    # decode流，不控核
-        ))
+        self.stream_groups.append(
+            (torch.npu.Stream(device=self.npu_id), torch.npu.Stream(device=self.npu_id))
+        )
 
-        #    中间组：按划分设置控核流
         for prefill_cubes, decode_cubes in divisions:
             self.cube_counts.append((prefill_cubes, decode_cubes))
             prefill_stream = self._create_limited_stream(prefill_cubes)
             decode_stream = self._create_limited_stream(decode_cubes)
             self.stream_groups.append((prefill_stream, decode_stream))
 
-        #    最后一个组：全量cube用于decode（不设限制）
         self.cube_counts.append((0, total_cubes))
-        self.stream_groups.append((
-            torch.npu.Stream(device=self.npu_id),
-            torch.npu.Stream(device=self.npu_id)
-        ))
+        self.stream_groups.append(
+            (torch.npu.Stream(device=self.npu_id), torch.npu.Stream(device=self.npu_id))
+        )
 
         self.current_idx = 0
 
