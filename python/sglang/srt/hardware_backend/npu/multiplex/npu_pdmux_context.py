@@ -42,7 +42,7 @@ class _NPUMuxManagerImpl:
             raise ValueError(f"Total cubes {total_cubes} too small for partitioning.")
 
         possible = []
-        for prefill in range(total_cubes - min_decode, total_cubes // 2, -1):
+        for prefill in range(total_cubes - min_decode, total_cubes // 2, -2):
             decode = total_cubes - prefill
             if decode >= min_decode and prefill >= decode:
                 possible.append((prefill, decode))

@@ -35,6 +35,9 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_npu,
 )
+from sglang.srt.multiplex.pdmux_context import (
+    get_current_stream_idx,
+)
 
 is_npu = is_npu()
 
