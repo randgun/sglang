@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -24,6 +24,43 @@ _FLOAT8_E8M0FNU_DTYPE = (
     if _is_npu
     else getattr(torch, "float8_e8m0fnu", None)
 )
+
+
+def npu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    del input_scale, bias
+
+    if block_size != [128, 128]:
+        raise ValueError("npu_w8a8_block_fp8_linear only supports block_size == [128, 128]")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError("npu_w8a8_block_fp8_linear only supports torch.float8_e4m3fn")
+
+    orig_shape = input.shape
+    k = orig_shape[-1]
+    input_2d = input.reshape(-1, k).contiguous()
+
+    x_fp8, x_scale = torch.ops.npu.npu_dynamic_block_quant(
+        input_2d,
+        dst_type=torch.float8_e4m3fn,
+        row_block_size=1,
+        col_block_size=128,
+    )
+    output_2d = torch.ops.npu.npu_quant_matmul(
+        x_fp8,
+        weight,
+        scale=weight_scale,
+        pertoken_scale=x_scale,
+        output_dtype=torch.bfloat16,
+        group_sizes=(1, 128, 128),
+    )
+
+    return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
 
 
 class _NPULinearMethodBase(LinearMethodBase):

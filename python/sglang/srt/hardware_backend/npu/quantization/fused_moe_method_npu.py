@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
+import torch_npu
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -14,6 +15,384 @@ if TYPE_CHECKING:
         DispatchOutput,
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+MXFP4_BLOCK_SIZE = 32
+
+
+class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
+    """DeepSeek-V4 native FP4 experts on NPU A5 using W4A8 MXFP GMM."""
+
+    def __init__(self, fp8_method, prefix: str = ""):
+        self._fp8 = fp8_method
+        self.prefix = prefix
+        self.moe_runner_config = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        self._fp8.create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
+        self.moe_runner_config = moe_runner_config
+        self._fp8.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight.data = torch_npu.npu_format_cast(
+            layer.w13_weight.data.view(torch.uint8),
+            29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        ).transpose(1, 2)
+        layer.w2_weight.data = torch_npu.npu_format_cast(
+            layer.w2_weight.data.view(torch.uint8),
+            29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        ).transpose(1, 2)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale_inv.format_ue8m0 = True
+        layer.w2_weight_scale_inv.format_ue8m0 = True
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config(
+                {
+                    "dispatcher_output_dtype": "bf16",
+                }
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "DispatchOutput",
+    ) -> "CombineInput":
+        combine_input = npu_apply_w4a8_mxfp_moe_deepep(layer, dispatch_output)
+        if combine_input is not None:
+            return combine_input
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        hidden_states = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        top_k = (
+            self.moe_runner_config.top_k
+            if self.moe_runner_config is not None
+            else topk_ids.shape[1]
+        )
+        output = npu_fused_experts_w4a8_mxfp(
+            hidden_states,
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            topk_weights,
+            topk_ids,
+            top_k,
+        )
+        return StandardCombineInput(hidden_states=output)
+
+
+def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype != torch_npu.float8_e8m0fnu:
+        scale = scale.to(torch_npu.float8_e8m0fnu)
+    if scale.dim() == 3:
+        num_experts, n, k32 = scale.shape
+        if k32 % 2 != 0:
+            raise ValueError(
+                "MXFP4 scale K dimension must be divisible by 2 for "
+                "[E, K/64, N, 2] layout."
+            )
+        scale = scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
+    return scale.contiguous()
+
+
+def npu_fused_experts_w4a8_mxfp(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w13_weight_scale_inv: torch.Tensor,
+    w2: torch.Tensor,
+    w2_weight_scale_inv: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    **kwargs,
+):
+    if torch.npu.is_current_stream_capturing():
+        return npu_fused_experts_w4a8_mxfp_decode(
+            hidden_states=hidden_states,
+            w13=w13,
+            w13_weight_scale_inv=w13_weight_scale_inv,
+            w2=w2,
+            w2_weight_scale_inv=w2_weight_scale_inv,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=top_k,
+            **kwargs,
+        )
+
+    original_shape = hidden_states.shape
+    original_dtype = hidden_states.dtype
+    if len(original_shape) == 3:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    num_tokens = hidden_states.shape[0]
+    num_experts = w13.shape[0]
+    row_idx_len = num_tokens * top_k
+    row_idx = (
+        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
+        .view(top_k, -1)
+        .permute(1, 0)
+        .contiguous()
+    )
+    hidden_states, expanded_row_idx, expanded_expert_idx = (
+        torch.ops.npu.npu_moe_init_routing(
+            hidden_states,
+            row_idx=row_idx,
+            expert_idx=topk_ids,
+            active_num=num_tokens,
+        )
+    )
+    expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
+        expanded_expert_idx, num_experts
+    )
+    expert_tokens = expert_tokens.to(torch.int64)
+
+    rows = hidden_states.shape[0]
+    row_ids = torch.arange(rows, device=hidden_states.device, dtype=torch.int64)
+    valid_mask = row_ids < expert_tokens[-1]
+    valid_mask_2d = valid_mask.unsqueeze(1)
+
+    hidden_states = w4a8_mxfp_gmm_npu(
+        input=hidden_states,
+        input_scale=None,
+        weight=w13,
+        weight_scale=w13_weight_scale_inv,
+        group_list_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states = w4a8_mxfp_gmm_npu(
+        input=hidden_states,
+        input_scale=None,
+        weight=w2,
+        weight_scale=w2_weight_scale_inv,
+        group_list_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )
+
+    hidden_states = hidden_states * valid_mask_2d.to(hidden_states.dtype)
+
+    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+    )
+
+    if len(original_shape) == 3:
+        final_hidden_states = final_hidden_states.view(original_shape)
+    return final_hidden_states
+
+
+def npu_fused_experts_w4a8_mxfp_decode(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w13_weight_scale_inv: torch.Tensor,
+    w2: torch.Tensor,
+    w2_weight_scale_inv: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    **kwargs,
+):
+    num_tokens = hidden_states.shape[:-1].numel()
+    global_num_experts = w13.shape[0]
+    original_shape = hidden_states.shape
+    original_dtype = hidden_states.dtype
+    group_list_type = 1
+
+    hidden_states, expanded_row_idx, expert_tokens, _ = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=num_tokens * top_k,
+            expert_num=global_num_experts,
+            expert_tokens_num_type=group_list_type,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, global_num_experts],
+            quant_mode=-1,
+        )
+    )
+    expert_tokens = expert_tokens.to(torch.int64)
+
+    hidden_states = w4a8_mxfp_gmm_npu(
+        input=hidden_states,
+        input_scale=None,
+        weight=w13,
+        weight_scale=w13_weight_scale_inv,
+        group_list_type=group_list_type,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states = w4a8_mxfp_gmm_npu(
+        input=hidden_states,
+        input_scale=None,
+        weight=w2,
+        weight_scale=w2_weight_scale_inv,
+        group_list_type=group_list_type,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )
+
+    final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
+        permuted_tokens=hidden_states,
+        sorted_indices=torch.abs(expanded_row_idx),
+        probs=topk_weights,
+    )
+
+    if len(original_shape) == 3:
+        final_hidden_states = final_hidden_states.view(original_shape)
+    return final_hidden_states
+
+
+def npu_apply_w4a8_mxfp_moe_deepep(
+    layer: torch.nn.Module,
+    dispatch_output: "DispatchOutput",
+) -> Optional["CombineInput"]:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        DeepEPLLCombineInput,
+        DeepEPNormalCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+
+    if not dispatch_output.format.is_deepep():
+        return None
+
+    output_dtype = torch.bfloat16
+    group_list_type = 1
+
+    if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+        hidden_states, hidden_states_scale, _, _, num_recv_tokens_per_expert = (
+            dispatch_output
+        )
+        group_list = torch.tensor(
+            num_recv_tokens_per_expert,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        combine_cls = DeepEPNormalCombineInput
+    else:
+        hidden_states, hidden_states_scale, _, _, group_list, _ = dispatch_output
+        group_list = group_list.to(torch.int64)
+        combine_cls = DeepEPLLCombineInput
+
+    hidden_states = npu_apply_without_routing_weights_w4a8_mxfp(
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    )
+    return combine_cls(
+        hidden_states=hidden_states,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )
+
+
+def npu_apply_without_routing_weights_w4a8_mxfp(
+    layer,
+    hidden_states,
+    hidden_states_scale,
+    group_list_type,
+    group_list,
+    output_dtype,
+):
+    hidden_states = w4a8_mxfp_gmm_npu(
+        input=hidden_states,
+        input_scale=hidden_states_scale,
+        weight=layer.w13_weight,
+        weight_scale=layer.w13_weight_scale_inv,
+        group_list_type=group_list_type,
+        group_list=group_list,
+        output_dtype=output_dtype,
+    )
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states = w4a8_mxfp_gmm_npu(
+        input=hidden_states,
+        input_scale=None,
+        weight=layer.w2_weight,
+        weight_scale=layer.w2_weight_scale_inv,
+        group_list_type=group_list_type,
+        group_list=group_list,
+        output_dtype=output_dtype,
+    )
+    return hidden_states
+
+
+def w4a8_mxfp_gmm_npu(
+    input: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list_type: int,
+    group_list: torch.Tensor,
+    output_dtype=torch.bfloat16,
+) -> torch.Tensor:
+    group_list = group_list.to(torch.int64)
+    if input_scale is None:
+        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            input,
+            axis=1,
+            round_mode="rint",
+            dst_type=torch.float8_e4m3fn,
+            block_size=MXFP4_BLOCK_SIZE,
+            scale_alg=None,
+        )
+    else:
+        x, x_scale = input, input_scale
+
+    return torch.ops.npu.npu_grouped_matmul(
+        [x],
+        [weight],
+        scale=None,
+        scale_dtype=None,
+        per_token_scale=[x_scale],
+        antiquant_scale=[weight_scale],
+        split_item=2,
+        group_type=0,
+        group_list=group_list,
+        group_list_type=group_list_type,
+        output_dtype=output_dtype,
+        x_dtype=torch.float8_e4m3fn,
+        weight_dtype=torch_npu.float4_e2m1fn_x2,
+        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+    )[0]
 
 
 def npu_fused_experts_w4a4(

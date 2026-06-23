@@ -88,6 +88,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_before_atlas_a5,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -97,7 +98,6 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -108,6 +108,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -279,6 +280,13 @@ class Fp8Config(QuantizationConfig):
                 )
 
             fp8_method = Fp8MoEMethod(self)
+
+            if self.is_fp4_experts and is_npu():
+                from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+                    NPUW4A8Fp4MoEMethod,
+                )
+
+                return NPUW4A8Fp4MoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
@@ -532,6 +540,20 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
+            return
+        elif _is_npu:
+            if _is_npu_before_atlas_a5:
+                layer.weight.data = (
+                    layer.weight.data.view(torch.uint8).transpose(-1, -2).contiguous()
+                )
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
+                    -1, -2
+                ).contiguous()
+            else:
+                layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
+                    -1, -2
+                ).contiguous()
             return
         else:
             # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
