@@ -92,8 +92,8 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        w13_weight_scale.format_ue8m0 = True
-        w2_weight_scale.format_ue8m0 = True
+        w13_weight_scale.format_ue8m0 = False
+        w2_weight_scale.format_ue8m0 = False
         layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, scale_attrs)
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
@@ -120,8 +120,6 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
             requires_grad=False,
         )
-        layer.w13_weight_scale_inv.format_ue8m0 = True
-        layer.w2_weight_scale_inv.format_ue8m0 = True
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
