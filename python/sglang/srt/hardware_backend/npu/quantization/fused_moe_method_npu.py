@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 MXFP4_BLOCK_SIZE = 32
 
 
-class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
-    """DeepSeek-V4 native FP4 experts on NPU A5 using W4A8 MXFP GMM."""
+class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
+    """DeepSeek-V4 native FP4 experts on NPU A5 using W4A4 MXFP GMM."""
 
     def __init__(self, fp8_method, prefix: str = ""):
         self._fp8 = fp8_method
@@ -48,7 +48,7 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // 2,
                 ),
-                dtype=torch.int8,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
@@ -59,7 +59,7 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // 2,
                 ),
-                dtype=torch.int8,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
@@ -77,7 +77,7 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // MXFP4_BLOCK_SIZE,
                 ),
-                dtype=torch_npu.float8_e8m0fnu,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
@@ -88,7 +88,7 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // MXFP4_BLOCK_SIZE,
                 ),
-                dtype=torch_npu.float8_e8m0fnu,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
@@ -107,14 +107,10 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight.data = torch_npu.npu_format_cast(
             layer.w13_weight.data.view(torch.uint8),
             29,
-            customize_dtype=torch.float8_e4m3fn,
-            input_dtype=torch_npu.float4_e2m1fn_x2,
         ).transpose(1, 2)
         layer.w2_weight.data = torch_npu.npu_format_cast(
             layer.w2_weight.data.view(torch.uint8),
             29,
-            customize_dtype=torch.float8_e4m3fn,
-            input_dtype=torch_npu.float4_e2m1fn_x2,
         ).transpose(1, 2)
         layer.w13_weight_scale_inv = torch.nn.Parameter(
             _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
@@ -139,7 +135,7 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: "DispatchOutput",
     ) -> "CombineInput":
-        combine_input = npu_apply_w4a8_mxfp_moe_deepep(layer, dispatch_output)
+        combine_input = npu_apply_w4a4_mxfp_moe_deepep(layer, dispatch_output)
         if combine_input is not None:
             return combine_input
 
@@ -147,12 +143,14 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
 
         hidden_states = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(hidden_states.dtype)
         top_k = (
             self.moe_runner_config.top_k
             if self.moe_runner_config is not None
             else topk_ids.shape[1]
         )
-        output = npu_fused_experts_w4a8_mxfp(
+        output = npu_fused_experts_w4a4_mxfp(
             hidden_states,
             layer.w13_weight,
             layer.w13_weight_scale_inv,
@@ -177,7 +175,7 @@ def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     return scale.contiguous()
 
 
-def npu_fused_experts_w4a8_mxfp(
+def npu_fused_experts_w4a4_mxfp(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
     w13_weight_scale_inv: torch.Tensor,
@@ -189,7 +187,7 @@ def npu_fused_experts_w4a8_mxfp(
     **kwargs,
 ):
     if torch.npu.is_current_stream_capturing():
-        return npu_fused_experts_w4a8_mxfp_decode(
+        return npu_fused_experts_w4a4_mxfp_decode(
             hidden_states=hidden_states,
             w13=w13,
             w13_weight_scale_inv=w13_weight_scale_inv,
@@ -232,7 +230,7 @@ def npu_fused_experts_w4a8_mxfp(
     valid_mask = row_ids < expert_tokens[-1]
     valid_mask_2d = valid_mask.unsqueeze(1)
 
-    hidden_states = w4a8_mxfp_gmm_npu(
+    hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
         weight=w13,
@@ -242,7 +240,7 @@ def npu_fused_experts_w4a8_mxfp(
         output_dtype=original_dtype,
     )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states = w4a8_mxfp_gmm_npu(
+    hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
         weight=w2,
@@ -269,7 +267,7 @@ def npu_fused_experts_w4a8_mxfp(
     return final_hidden_states
 
 
-def npu_fused_experts_w4a8_mxfp_decode(
+def npu_fused_experts_w4a4_mxfp_decode(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
     w13_weight_scale_inv: torch.Tensor,
@@ -300,7 +298,7 @@ def npu_fused_experts_w4a8_mxfp_decode(
     )
     expert_tokens = expert_tokens.to(torch.int64)
 
-    hidden_states = w4a8_mxfp_gmm_npu(
+    hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
         weight=w13,
@@ -310,7 +308,7 @@ def npu_fused_experts_w4a8_mxfp_decode(
         output_dtype=original_dtype,
     )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states = w4a8_mxfp_gmm_npu(
+    hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
         weight=w2,
@@ -331,7 +329,7 @@ def npu_fused_experts_w4a8_mxfp_decode(
     return final_hidden_states
 
 
-def npu_apply_w4a8_mxfp_moe_deepep(
+def npu_apply_w4a4_mxfp_moe_deepep(
     layer: torch.nn.Module,
     dispatch_output: "DispatchOutput",
 ) -> Optional["CombineInput"]:
@@ -362,7 +360,7 @@ def npu_apply_w4a8_mxfp_moe_deepep(
         group_list = group_list.to(torch.int64)
         combine_cls = DeepEPLLCombineInput
 
-    hidden_states = npu_apply_without_routing_weights_w4a8_mxfp(
+    hidden_states = npu_apply_without_routing_weights_w4a4_mxfp(
         layer,
         hidden_states,
         hidden_states_scale,
@@ -377,7 +375,7 @@ def npu_apply_w4a8_mxfp_moe_deepep(
     )
 
 
-def npu_apply_without_routing_weights_w4a8_mxfp(
+def npu_apply_without_routing_weights_w4a4_mxfp(
     layer,
     hidden_states,
     hidden_states_scale,
@@ -385,7 +383,7 @@ def npu_apply_without_routing_weights_w4a8_mxfp(
     group_list,
     output_dtype,
 ):
-    hidden_states = w4a8_mxfp_gmm_npu(
+    hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=hidden_states_scale,
         weight=layer.w13_weight,
@@ -395,7 +393,7 @@ def npu_apply_without_routing_weights_w4a8_mxfp(
         output_dtype=output_dtype,
     )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states = w4a8_mxfp_gmm_npu(
+    hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
         weight=layer.w2_weight,
@@ -407,7 +405,7 @@ def npu_apply_without_routing_weights_w4a8_mxfp(
     return hidden_states
 
 
-def w4a8_mxfp_gmm_npu(
+def w4a4_mxfp_gmm_npu(
     input: torch.Tensor,
     input_scale: Optional[torch.Tensor],
     weight: torch.Tensor,
@@ -422,7 +420,7 @@ def w4a8_mxfp_gmm_npu(
             input,
             axis=1,
             round_mode="rint",
-            dst_type=torch.float8_e4m3fn,
+            dst_type=torch_npu.float4_e2m1fn_x2,
             block_size=MXFP4_BLOCK_SIZE,
             scale_alg=None,
         )
@@ -432,16 +430,15 @@ def w4a8_mxfp_gmm_npu(
     return torch.ops.npu.npu_grouped_matmul(
         [x],
         [weight],
-        scale=None,
-        scale_dtype=None,
+        scale=[weight_scale],
+        scale_dtype=torch_npu.float8_e8m0fnu,
         per_token_scale=[x_scale],
-        antiquant_scale=[weight_scale],
         split_item=2,
         group_type=0,
         group_list=group_list,
         group_list_type=group_list_type,
         output_dtype=output_dtype,
-        x_dtype=torch.float8_e4m3fn,
+        x_dtype=torch_npu.float4_e2m1fn_x2,
         weight_dtype=torch_npu.float4_e2m1fn_x2,
         per_token_scale_dtype=torch_npu.float8_e8m0fnu,
     )[0]

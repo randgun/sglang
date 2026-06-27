@@ -283,10 +283,10 @@ class Fp8Config(QuantizationConfig):
 
             if self.is_fp4_experts and is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-                    NPUW4A8Fp4MoEMethod,
+                    NPUW4A4Fp4MoEMethod,
                 )
 
-                return NPUW4A8Fp4MoEMethod(fp8_method, prefix=prefix)
+                return NPUW4A4Fp4MoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
