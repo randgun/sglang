@@ -6,6 +6,7 @@ import torch_npu
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -36,14 +37,67 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        self._fp8.create_weights(
-            layer,
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            params_dtype,
-            **extra_weight_attrs,
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            FusedMoeWeightScaleSupported,
         )
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                (
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // 2,
+                ),
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                (
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // 2,
+                ),
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        w13_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                (
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // MXFP4_BLOCK_SIZE,
+                ),
+                dtype=torch_npu.float8_e8m0fnu,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                (
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // MXFP4_BLOCK_SIZE,
+                ),
+                dtype=torch_npu.float8_e8m0fnu,
+            ),
+            requires_grad=False,
+        )
+        w13_weight_scale.format_ue8m0 = True
+        w2_weight_scale.format_ue8m0 = True
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, scale_attrs)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
         self.moe_runner_config = moe_runner_config
@@ -112,8 +166,6 @@ class NPUW4A8Fp4MoEMethod(FusedMoEMethodBase):
 
 
 def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
-    if scale.dtype != torch_npu.float8_e8m0fnu:
-        scale = scale.to(torch_npu.float8_e8m0fnu)
     if scale.dim() == 3:
         num_experts, n, k32 = scale.shape
         if k32 % 2 != 0:
