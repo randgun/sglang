@@ -167,9 +167,9 @@ def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
         if k32 % 2 != 0:
             raise ValueError(
                 "MXFP4 scale K dimension must be divisible by 2 for "
-                "[E, K/64, N, 2] layout."
+                "[E, N, K/64, 2] layout."
             )
-        scale = scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
+        scale = scale.view(num_experts, n, k32 // 2, 2)
     return scale.contiguous()
 
 
