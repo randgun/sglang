@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
 )
 
+_A5_KV_QUANT_GROUP_SIZE = 64
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU bf16 variant of the full / SWA / c4 / c128 single-KV pool.
@@ -62,11 +63,20 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         self.kernel_page_size = kernel_page_size
         super().__init__(*args, **kwargs)
 
+    @property
+    def a5_packed_kv_dim(self) -> int:
+        nope_dim = self.qk_nope_head_dim
+        rope_dim = self.qk_rope_head_dim
+        scale_dim = math.ceil(nope_dim / 64)
+        bytes_per_token = nope_dim + rope_dim * 2 + scale_dim
+        return math.ceil(bytes_per_token / 128) * 128
+
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
-        kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        kv_dim = self.a5_packed_kv_dim
         self.kv_cache_total_dim = kv_dim
         # GLOBAL kernel_page_size keeps cmp_kv.shape[1] == ori_kv.shape[1]; writes
         # are flat-indexed by loc, so page granularity affects shape not location.
@@ -76,7 +86,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             self.kernel_page_size,
             1,
             kv_dim,
-            dtype=torch.bfloat16,
+            dtype=torch.float8_e4m3fn,
             device=self.device,
         )
 
@@ -467,13 +477,41 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """
         # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
         buf = self.swa_kv_pool.kv_buffer[layer_id]
-        buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
-        # Caller (V4 MQALayer) may hand us cache shaped (T, dim); the buffer has
-        # an explicit num_kv_heads=1 axis, so insert it.
-        if cache.ndim == buf_flat.ndim - 1:
-            cache = cache.unsqueeze(1)
-        buf_flat[loc] = cache.to(buf_flat.dtype)
+        # buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
+        # # Caller (V4 MQALayer) may hand us cache shaped (T, dim); the buffer has
+        # # an explicit num_kv_heads=1 axis, so insert it.
+        # if cache.ndim == buf_flat.ndim - 1:
+        #     cache = cache.unsqueeze(1)
+        # buf_flat[loc] = cache.to(buf_flat.dtype)
+        self._set_a5_kv_buffer(buf, loc, cache)
 
+    def _set_a5_kv_buffer(
+        self,
+        buf: torch.Tensor,
+        loc: torch.Tensor,
+        cache: torch.Tensor,
+    ) -> None:
+        cache_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if cache.shape[-1] != cache_dim:
+            raise RuntimeError(
+                f"DSV4 A5 KV cache expects input last dim {cache_dim}, "
+                f"got shape={tuple(cache.shape)}."
+            )
+        cache_2d = cache.reshape(-1, cache_dim).to(torch.bfloat16).contiguous()
+        slot_mapping = loc.reshape(-1).contiguous()
+        if cache_2d.shape[0] != slot_mapping.shape[0]:
+            raise RuntimeError(
+                "DSV4 A5 KV cache write expects one slot per token, got "
+                f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
+            )
+        torch.ops.custom.kv_compress_epilog(
+            buf.view(-1, buf.shape[-1]),
+            cache_2d,
+            slot_mapping,
+            quant_group_size=_A5_KV_QUANT_GROUP_SIZE,
+            quant_mode=2,
+            round_scale_flag=True,
+        )
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
     # CompressStatePool stores a fused [kv | score] tensor; split is a last-dim slice.
@@ -542,14 +580,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             return
         compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
         if device_type == "npu":
-            # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
-            # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
+            # # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
+            # # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
-            buf_flat = buf.flatten(0, 1)
-            kv_view = kv.to(buf_flat.dtype)
-            if kv_view.ndim == buf_flat.ndim - 1:
-                kv_view = kv_view.unsqueeze(1)
-            buf_flat[loc] = kv_view
+            # buf_flat = buf.flatten(0, 1)
+            # kv_view = kv.to(buf_flat.dtype)
+            # if kv_view.ndim == buf_flat.ndim - 1:
+            #     kv_view = kv_view.unsqueeze(1)
+            # buf_flat[loc] = kv_view
+            self._set_a5_kv_buffer(buf, loc, kv)
             return
         compress_pool.set_key_buffer_fused(compress_layer_id, loc, kv)
 
