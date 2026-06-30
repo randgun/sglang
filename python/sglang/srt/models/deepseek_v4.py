@@ -150,6 +150,7 @@ logger = logging.getLogger(__name__)
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 _DSV4_NPU_DEBUG_MODEL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL"
+_DSV4_NPU_DEBUG_MODEL_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_LAYER"
 _DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _dsv4_npu_model_debug_log_counts: dict[str, int] = {}
@@ -157,6 +158,11 @@ _dsv4_npu_model_debug_log_counts: dict[str, int] = {}
 
 def _dsv4_npu_model_debug_enabled() -> bool:
     return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_ENV)
+
+
+def _dsv4_npu_should_probe_layer(layer_id: int) -> bool:
+    target_layer = get_int_env_var(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV, 0)
+    return target_layer < 0 or layer_id == target_layer
 
 
 def _dsv4_npu_is_stream_capturing() -> bool:
@@ -1527,6 +1533,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+        debug_this_layer = _dsv4_npu_should_probe_layer(self.layer_id)
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = mhc_fused_post_pre(
@@ -1549,6 +1556,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ),
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    residual, f"layer-{self.layer_id}-attn-fused-residual"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    post, f"layer-{self.layer_id}-attn-fused-post"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    comb, f"layer-{self.layer_id}-attn-fused-comb"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-attn-fused-pre"
+                )
             x_quant = None
         else:
             residual = hidden_states
@@ -1560,6 +1580,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm=self.input_layernorm,
                 forward_batch=forward_batch,
             )
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    residual, f"layer-{self.layer_id}-attn-residual"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-attn-hc-pre"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    post, f"layer-{self.layer_id}-attn-post"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    comb, f"layer-{self.layer_id}-attn-comb"
+                )
             if not norm_fused:
                 if _use_aiter and _is_gfx95_supported:
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
@@ -1570,6 +1603,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
                     x_quant = None
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states, f"layer-{self.layer_id}-after-input-norm"
+                    )
             else:
                 x_quant = None
 
@@ -1579,6 +1616,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             x_quant=x_quant,
         )
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                hidden_states, f"layer-{self.layer_id}-after-self-attn"
+            )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1598,6 +1639,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        residual, f"layer-{self.layer_id}-ffn-fused-residual"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states, f"layer-{self.layer_id}-after-ffn-fused-pre"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        post, f"layer-{self.layer_id}-ffn-fused-post"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        comb, f"layer-{self.layer_id}-ffn-fused-comb"
+                    )
             else:
                 residual, post, comb, hidden_states = mhc_fused_post_pre(
                     hidden_states,
@@ -1620,8 +1674,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_eps=self.post_attention_layernorm.variance_epsilon,
                 )
                 norm_fused = True
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        residual, f"layer-{self.layer_id}-ffn-fallback-residual"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        post, f"layer-{self.layer_id}-ffn-fallback-post"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        comb, f"layer-{self.layer_id}-ffn-fallback-comb"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states, f"layer-{self.layer_id}-after-ffn-fallback-pre"
+                    )
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-attn-hc-post"
+                )
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
@@ -1631,8 +1702,26 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm=self.post_attention_layernorm,
                 forward_batch=forward_batch,
             )
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    residual, f"layer-{self.layer_id}-ffn-residual"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-ffn-hc-pre"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    post, f"layer-{self.layer_id}-ffn-post"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    comb, f"layer-{self.layer_id}-ffn-comb"
+                )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states,
+                        f"layer-{self.layer_id}-after-post-attn-norm",
+                    )
 
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1689,6 +1778,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             # reduce via reduce_scatterv at the combine below (else double-reduce).
             use_reduce_scatter=_use_cp or _use_gatherv_pair,
         )
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                hidden_states, f"layer-{self.layer_id}-after-mlp"
+            )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -1716,6 +1809,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-ffn-hc-post"
+                )
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
