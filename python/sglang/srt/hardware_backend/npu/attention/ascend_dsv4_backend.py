@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _A5_KV_TILE_SIZE = 64
 _A5_KV_ROPE_HEAD_DIM = 64
+_A5_KV_QUANT_MODE_DEFAULT = 2
+_A5_KV_QUANT_MODE_ENV = "SGLANG_DSV4_NPU_KV_QUANT_MODE"
 _FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
 _DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
 _DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
@@ -37,6 +39,10 @@ def _is_npu_stream_capturing() -> bool:
         return bool(torch.npu.is_current_stream_capturing())
     except Exception:
         return False
+
+
+def _a5_kv_quant_mode() -> int:
+    return get_int_env_var(_A5_KV_QUANT_MODE_ENV, _A5_KV_QUANT_MODE_DEFAULT)
 
 
 def _debug_log_limited(key: str, message: str) -> None:
@@ -115,7 +121,12 @@ def _debug_probe_attention_tensor(
     _debug_sync_npu(f"{path} attention probe {label} layer_id={layer_id}")
     try:
         probe = tensor
-        if not probe.is_floating_point():
+        if (
+            probe.dtype == torch.float8_e4m3fn
+            or probe.dtype == getattr(torch, "float8_e4m3fnuz", None)
+        ):
+            probe = probe.to(torch.float32)
+        elif not probe.is_floating_point():
             probe = probe.to(torch.float32)
         finite = torch.isfinite(probe)
         finite_count = int(finite.sum().item())
@@ -1495,7 +1506,7 @@ class DeepseekV4AscendAttnBackend(
         is_nextn: bool,
     ) -> dict:
         common = {
-            "kv_quant_mode": 1,
+            "kv_quant_mode": _a5_kv_quant_mode(),
             "tile_size": _A5_KV_TILE_SIZE,
             "rope_head_dim": _A5_KV_ROPE_HEAD_DIM,
             "cu_seqlens_q": actual_seq_lengths_q_pa,
@@ -1634,7 +1645,7 @@ class DeepseekV4AscendAttnBackend(
         #     print("SHITTTTTTTTTTTTTTTTT")
         #     swa_kv_cache = swa_kv_cache.to(torch.float32).to(torch.float8_e4m3fn)
         attn_kwargs = dict(
-            kv_quant_mode=1,
+            kv_quant_mode=_a5_kv_quant_mode(),
             tile_size = _A5_KV_TILE_SIZE,
             rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
@@ -1704,7 +1715,7 @@ class DeepseekV4AscendAttnBackend(
         )
 
         attn_kwargs = dict(
-            kv_quant_mode=1,
+            kv_quant_mode=_a5_kv_quant_mode(),
             tile_size = _A5_KV_TILE_SIZE,
             rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
