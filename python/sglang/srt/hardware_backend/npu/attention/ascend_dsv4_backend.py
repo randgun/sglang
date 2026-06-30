@@ -100,6 +100,51 @@ def _debug_probe_attention_output(
         )
 
 
+def _debug_probe_attention_tensor(
+    tensor: torch.Tensor,
+    label: str,
+    *,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return
+    if _is_npu_stream_capturing():
+        return
+    _debug_sync_npu(f"{path} attention probe {label} layer_id={layer_id}")
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+        _debug_log_limited(
+            f"tensor-{path}-{layer_id}-{compress_ratio}-{label}",
+            "DSV4 NPU attention tensor stats: "
+            f"label={label}, path={path}, layer_id={layer_id}, "
+            f"compress_ratio={compress_ratio}, shape={tuple(tensor.shape)}, "
+            f"dtype={tensor.dtype}, finite_count={finite_count}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, "
+            f"zero_count={zero_count}, finite_min={min_val}, finite_max={max_val}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"tensor-probe-error-{path}-{label}",
+            f"DSV4 NPU attention tensor probe failed for {path}/{label}: {exc}",
+        )
+
+
 def _debug_log_c4_topk(
     topk: torch.Tensor,
     forward_batch,
@@ -1561,6 +1606,16 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+        _debug_probe_attention_tensor(
+            q, "dense-q", layer_id=layer.layer_id, path="dense", compress_ratio=1
+        )
+        _debug_probe_attention_tensor(
+            ori_kv,
+            "dense-ori-kv",
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
         # swa_kv_cache = torch.empty((ori_kv.shape[0],640), dtype=torch.float8_e4m3fn, device=ori_kv.device)
         # if ori_kv.shape[-1] != 640:
         #     ori_kv = ori_kv.view(-1, ori_kv.shape[-1])
@@ -1599,6 +1654,13 @@ class DeepseekV4AscendAttnBackend(
         )
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
         _debug_sync_npu(f"dense attention layer_id={layer.layer_id}")
+        _debug_probe_attention_tensor(
+            out,
+            "dense-out",
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
         _debug_probe_attention_output(
             out, layer_id=layer.layer_id, path="dense", compress_ratio=1
         )

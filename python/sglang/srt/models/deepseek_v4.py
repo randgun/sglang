@@ -913,16 +913,33 @@ class MQALayer(nn.Module):
                 )
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
+            probe_npu_layer = _dsv4_npu_should_probe_layer(self.layer_id)
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    q_lora, f"mqa-layer-{self.layer_id}-q-lora-after-norm"
+                )
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    q, f"mqa-layer-{self.layer_id}-q-before-rope"
+                )
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
             else:
                 kv, _ = self.wkv(x)
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    kv, f"mqa-layer-{self.layer_id}-kv-before-norm"
+                )
             kv = self.kv_norm(kv)
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    kv, f"mqa-layer-{self.layer_id}-kv-after-norm"
+                )
 
             v4_rope_inplace_npu(
                 q[..., -self.qk_rope_head_dim :],
@@ -930,6 +947,13 @@ class MQALayer(nn.Module):
                 self.freqs_cis,
                 positions,
             )
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    q, f"mqa-layer-{self.layer_id}-q-after-rope"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    kv, f"mqa-layer-{self.layer_id}-kv-after-rope-before-store"
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
