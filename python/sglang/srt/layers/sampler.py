@@ -19,6 +19,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_hip,
     is_musa,
@@ -61,8 +62,119 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+_DSV4_NPU_DEBUG_SAMPLER_ENV = "SGLANG_DSV4_NPU_DEBUG_SAMPLER"
+_DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_dsv4_npu_debug_log_counts: Dict[str, int] = {}
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+
+
+def _dsv4_npu_sampler_debug_enabled() -> bool:
+    return is_npu() and get_bool_env_var(_DSV4_NPU_DEBUG_SAMPLER_ENV)
+
+
+def _is_npu_stream_capturing() -> bool:
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _dsv4_npu_debug_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DSV4_NPU_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _dsv4_npu_debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _dsv4_npu_debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _dsv4_npu_debug_sync(label: str) -> None:
+    if not (
+        _dsv4_npu_sampler_debug_enabled()
+        and get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV)
+    ):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU sampler debug sync failed after %s", label)
+        raise
+
+
+def _dsv4_npu_debug_probe_logits(logits: torch.Tensor, label: str) -> None:
+    if not _dsv4_npu_sampler_debug_enabled() or _is_npu_stream_capturing():
+        return
+
+    _dsv4_npu_debug_sync(label)
+    try:
+        finite = torch.isfinite(logits)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(logits).sum().item())
+        inf_count = int(torch.isinf(logits).sum().item())
+        row_finite_counts = finite.sum(dim=-1)
+        min_row_finite = int(row_finite_counts.min().item())
+        max_row_finite = int(row_finite_counts.max().item())
+        all_invalid_rows = int((row_finite_counts == 0).sum().item())
+        if finite_count > 0:
+            finite_values = logits[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+
+        _dsv4_npu_debug_log_limited(
+            f"logits-{label}",
+            "DSV4 NPU sampler logits stats: "
+            f"label={label}, shape={tuple(logits.shape)}, dtype={logits.dtype}, "
+            f"finite_count={finite_count}, nan_count={nan_count}, "
+            f"inf_count={inf_count}, all_invalid_rows={all_invalid_rows}, "
+            f"min_row_finite={min_row_finite}, max_row_finite={max_row_finite}, "
+            f"finite_min={min_val}, finite_max={max_val}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU sampler logits probe failed at %s", label)
+        raise
+
+
+def _dsv4_npu_debug_probe_token_ids(
+    token_ids: torch.Tensor,
+    *,
+    vocab_size: int,
+    label: str,
+) -> None:
+    if not _dsv4_npu_sampler_debug_enabled() or _is_npu_stream_capturing():
+        return
+
+    _dsv4_npu_debug_sync(label)
+    try:
+        token_ids_i64 = token_ids.to(torch.int64)
+        neg_count = int((token_ids_i64 < 0).sum().item())
+        oob_count = int((token_ids_i64 >= vocab_size).sum().item())
+        if token_ids_i64.numel() > 0:
+            min_id = int(token_ids_i64.min().item())
+            max_id = int(token_ids_i64.max().item())
+            sample = token_ids_i64[:16].detach().cpu().tolist()
+        else:
+            min_id = -1
+            max_id = -1
+            sample = []
+
+        _dsv4_npu_debug_log_limited(
+            f"token-ids-{label}",
+            "DSV4 NPU sampler token id stats: "
+            f"label={label}, shape={tuple(token_ids.shape)}, "
+            f"dtype={token_ids.dtype}, vocab_size={vocab_size}, "
+            f"neg_count={neg_count}, oob_count={oob_count}, "
+            f"min_id={min_id}, max_id={max_id}, sample={sample}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU sampler token id probe failed at %s", label)
+        raise
 
 
 class Sampler(nn.Module):
@@ -117,6 +229,7 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+        _dsv4_npu_debug_probe_logits(logits, "sampler-preprocess-logits")
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -194,6 +307,12 @@ class Sampler(nn.Module):
                     )
                 del probs
 
+        _dsv4_npu_debug_probe_token_ids(
+            batch_next_token_ids,
+            vocab_size=logits.shape[-1],
+            label="sampler-output",
+        )
+
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
@@ -208,6 +327,11 @@ class Sampler(nn.Module):
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        _dsv4_npu_debug_probe_token_ids(
+            batch_next_token_ids,
+            vocab_size=logits.shape[-1],
+            label="sampler-after-tp-sync",
+        )
 
         return batch_next_token_ids
 
