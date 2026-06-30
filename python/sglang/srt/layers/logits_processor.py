@@ -508,6 +508,7 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
     ):
+        _dsv4_npu_debug_probe_tensor(hidden_states, "logits-prune-input")
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
         token_to_seq_idx = []
@@ -649,6 +650,7 @@ class LogitsProcessor(nn.Module):
                 pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
 
+        _dsv4_npu_debug_probe_tensor(pruned_states, "logits-pruned-states")
         return (
             pruned_states,
             pruned_states_before_norm,

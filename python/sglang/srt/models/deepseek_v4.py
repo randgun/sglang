@@ -136,6 +136,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import get_int_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -148,6 +149,80 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+_DSV4_NPU_DEBUG_MODEL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL"
+_DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_dsv4_npu_model_debug_log_counts: dict[str, int] = {}
+
+
+def _dsv4_npu_model_debug_enabled() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_ENV)
+
+
+def _dsv4_npu_is_stream_capturing() -> bool:
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _dsv4_npu_model_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DSV4_NPU_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _dsv4_npu_model_debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _dsv4_npu_model_debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _dsv4_npu_model_debug_sync(label: str) -> None:
+    if not (
+        _dsv4_npu_model_debug_enabled()
+        and get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV)
+    ):
+        return
+    if _dsv4_npu_is_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU model debug sync failed after %s", label)
+        raise
+
+
+def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
+    if not _dsv4_npu_model_debug_enabled() or _dsv4_npu_is_stream_capturing():
+        return
+
+    _dsv4_npu_model_debug_sync(label)
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+
+        _dsv4_npu_model_log_limited(
+            f"tensor-{label}",
+            "DSV4 NPU model tensor stats: "
+            f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_count={finite_count}, nan_count={nan_count}, "
+            f"inf_count={inf_count}, zero_count={zero_count}, "
+            f"finite_min={min_val}, finite_max={max_val}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU model tensor probe failed at %s", label)
+        raise
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -1752,7 +1827,9 @@ class DeepseekV4Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-embed")
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-mhc-repeat")
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -1761,6 +1838,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-pp-input")
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -1809,10 +1887,15 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states,
+                    f"model-layer-{i}-out",
+                )
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
             )
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-final-hc-post")
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
@@ -1828,11 +1911,14 @@ class DeepseekV4Model(nn.Module):
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
         pre_hc_head = hidden_states.flatten(1)
+        _dsv4_npu_model_probe_tensor(pre_hc_head, "model-pre-hc-head")
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
+        _dsv4_npu_model_probe_tensor(hidden_states, "model-after-hc-head")
         hidden_states = self.norm(hidden_states)
+        _dsv4_npu_model_probe_tensor(hidden_states, "model-after-final-norm")
 
         return hidden_states, pre_hc_head
 
