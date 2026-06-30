@@ -1075,6 +1075,11 @@ class MQALayer(nn.Module):
                 q_out,
                 x_quant=x_quant,
             )
+        debug_this_layer = _dsv4_npu_should_probe_layer(self.layer_id)
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(q, f"mqa-layer-{self.layer_id}-q")
+            if kv is not None:
+                _dsv4_npu_model_probe_tensor(kv, f"mqa-layer-{self.layer_id}-kv")
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
@@ -1124,6 +1129,10 @@ class MQALayer(nn.Module):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-attn-core"
+            )
         if _is_npu:
             v4_rope_inplace_npu(
                 o[..., -self.qk_rope_head_dim :],
@@ -1140,8 +1149,16 @@ class MQALayer(nn.Module):
                 positions=positions,
                 inverse=True,
             )
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-inverse-rope"
+            )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-group-view"
+            )
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
@@ -1165,10 +1182,22 @@ class MQALayer(nn.Module):
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-wo-a"
+            )
 
         o, _ = self.wo_b(o.flatten(1))
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-wo-b"
+            )
         if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
             o = attn_tp_all_reduce(o)
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    o, f"mqa-layer-{self.layer_id}-after-attn-tp-all-reduce"
+                )
 
         return o
 
@@ -1984,10 +2013,11 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
-                _dsv4_npu_model_probe_tensor(
-                    hidden_states,
-                    f"model-layer-{i}-out",
-                )
+                if _dsv4_npu_should_probe_layer(i):
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states,
+                        f"model-layer-{i}-out",
+                    )
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
