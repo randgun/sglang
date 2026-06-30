@@ -695,17 +695,33 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
     ) -> None:
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
+        if override_loc is not None:
+            loc = override_loc
+        else:
+            backend_fm = self.forward_metadata
+            loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
+
+        if li_kv_dtype == "float8" and compressor.is_in_indexer:
+            index_cache = self.token_to_kv_pool.get_compress_buffer(
+                compressor.layer_id, True
+            )
+            scale_cache = self.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                compressor.layer_id, True
+            )
+            torch.ops.custom.indexer_compress_epilog(
+                indexer_compress_cache=index_cache,
+                indexer_compress_scale=scale_cache,
+                x=kv,
+                slot_mapping=loc.to(torch.int32),
+            )
+            return
+
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
             import torch_npu
 
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
 
-        if override_loc is not None:
-            loc = override_loc
-        else:
-            backend_fm = self.forward_metadata
-            loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
         self.token_to_kv_pool.set_compress_buffer(
             compressor.layer_id,
             loc,
@@ -752,7 +768,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
             c4_indexer.compressor(x, forward_batch)
 
         li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
-        if li_kv_dtype == "int8":
+        if li_kv_dtype in ("int8", "float8"):
             # Empty/idle rank (T=0) must skip the indexer kernel; test is_idle
             # rather than .item() since a host sync is illegal during capture.
             if bs == 0 or forward_batch.forward_mode.is_idle():
@@ -834,7 +850,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        c4_indexer.compressor.li_kv_dtype = "int8"
+        c4_indexer.compressor.li_kv_dtype = "float8"
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
             c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
@@ -866,20 +882,31 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     ) -> torch.Tensor:
         import torch_npu
 
-        q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
+        if k.dtype == torch.float8_e4m3fn:
+            q_quant, q_scale = torch_npu.npu_dynamic_block_quant(
+                q.view(-1, q.shape[-1]), dst_type=k.dtype
+            )
+            q_quant = q_quant.view(-1, c4_indexer.n_heads, c4_indexer.head_dim)
+            q_scale = q_scale.view(-1, c4_indexer.n_heads)
+        else:
+            q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
+            q_scale = q_scale.to(torch.float16)
+
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
         kwargs = dict(
-            query=q_int8,
+            query=q_quant,
             key=k,
-            key_dequant_scale=k_scale.squeeze(-2),
+            key_dequant_scale=k_scale.squeeze(-2).to(q_scale.dtype),
             actual_seq_lengths_query=fm.actual_seq_lengths_q,
             actual_seq_lengths_key=fm.actual_seq_lengths_kv,
             block_table=fm.c4_page_table,
             layout_query="TND",
             layout_key="PA_BSND",
-            weights=weights.to(torch.float16),
-            query_dequant_scale=q_scale.to(torch.float16),
+            weights=weights.to(
+                torch.float32 if q_scale.dtype == torch.float32 else torch.float16
+            ),
+            query_dequant_scale=q_scale,
             cmp_ratio=4,
             query_quant_mode=0,
             key_quant_mode=0,

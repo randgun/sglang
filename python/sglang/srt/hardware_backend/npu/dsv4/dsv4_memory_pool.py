@@ -203,9 +203,9 @@ class NPUCompressStatePool(CompressStatePool):
 
 class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
     """NPU c4-indexer pool. Keeps the base packed CUDA buffer (read by
-    get_contiguous_buf_infos / NSA) and ADDS dedicated int8 K + float16 scale
+    get_contiguous_buf_infos / NSA) and ADDS dedicated FP8 K + float32 scale
     buffers in PA_ND layout at the global ``kernel_page_size``, written by
-    ``torch_npu.npu_scatter_nd_update_`` and read by
+    ``torch.ops.custom.indexer_compress_epilog`` and read by
     ``torch.ops.custom.npu_quant_lightning_indexer``.
     """
 
@@ -227,7 +227,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                     kp,
                     1,
                     self.index_head_dim,
-                    dtype=torch.int8,
+                    dtype=torch.float8_e4m3fn,
                     device=self.device,
                 )
                 for _ in range(self.layer_num)
@@ -238,7 +238,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                     kp,
                     1,
                     1,
-                    dtype=torch.float16,
+                    dtype=torch.float32,
                     device=self.device,
                 )
                 for _ in range(self.layer_num)
@@ -261,20 +261,23 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         index_k: torch.Tensor,
         index_k_scale: Optional[torch.Tensor],
     ) -> None:
-        # int8 K + fp16 scale come from _compressor_epilog_npu's npu_dynamic_quant
-        # output (index_k: int8 [T, D], index_k_scale: fp16 [T, 1]).
+        # The A5 path usually updates these buffers through
+        # custom.indexer_compress_epilog; keep this scatter path as a typed
+        # fallback for tests and older callers.
         d = self.index_head_dim
         loc_long = loc.view(-1, 1).long()
+        index_k_cache = self.index_k_buffer[layer_id]
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_buffer[layer_id].view(-1, 1, d),
+            index_k_cache.view(-1, 1, d),
             loc_long,
-            index_k.to(torch.int8).view(-1, 1, d),
+            index_k.to(index_k_cache.dtype).view(-1, 1, d),
         )
         if index_k_scale is not None:
+            index_scale_cache = self.index_scale_buffer[layer_id]
             torch_npu.npu_scatter_nd_update_(
-                self.index_scale_buffer[layer_id].view(-1, 1, 1),
+                index_scale_cache.view(-1, 1, 1),
                 loc_long,
-                index_k_scale.to(torch.float16).view(-1, 1, 1),
+                index_k_scale.to(index_scale_cache.dtype).view(-1, 1, 1),
             )
 
 
@@ -284,7 +287,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     The full / SWA / c4 / c128 KV pools use the NPU bf16 PA_ND layout
     (:class:`NPUDeepSeekV4SingleKVPool`); the compress-state pool is paged
     (:class:`NPUCompressStatePool`) rather than ring-buffered; and the indexer
-    pool adds dedicated int8 K + fp16 scale buffers
+    pool adds dedicated FP8 K + float32 scale buffers
     (:class:`NPUDeepSeekV4IndexerPool`). The generic-accessor / port-hook
     methods at the bottom of this class are the NPU equivalents of the CUDA
     DSV4 store-cache chain — kept here, not in the community base, which raises
@@ -376,7 +379,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         device: str,
         enable_memory_saver: bool,
     ) -> NPUDeepSeekV4IndexerPool:
-        # NPU dedicated int8 K + fp16 scale buffers use the GLOBAL page_size
+        # NPU dedicated FP8 K + float32 scale buffers use the GLOBAL page_size
         # (= self.page_size) as kernel_page_size, matching ori_kv for the kernel.
         return NPUDeepSeekV4IndexerPool(
             size,
@@ -445,7 +448,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         Routes to c4 / c128 kv_pool by layer compression ratio. Returns
         ``None`` for ratio == 0 (no compress KV exists). The
-        from_indexer=True branch returns the dedicated int8 K buffer that
+        from_indexer=True branch returns the dedicated FP8 K buffer that
         ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
         """
         item = self.layer_mapping[layer_id]
@@ -597,8 +600,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_id: int,
         from_indexer: bool,
     ) -> torch.Tensor:
-        # Returns the float16 dequant scale buffer (NPU indexer pool's dedicated
-        # scale buffer alongside the int8 K buffer).
+        # Returns the float32 dequant scale buffer (NPU indexer pool's dedicated
+        # scale buffer alongside the FP8 K buffer).
         assert from_indexer, "only indexer compress pool has dequant scale"
         compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
         return self.c4_indexer_kv_pool.get_index_scale(compress_layer_id)
