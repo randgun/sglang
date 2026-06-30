@@ -42,8 +42,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
+from sglang.srt.utils.common import get_bool_env_var
 
 _A5_KV_QUANT_GROUP_SIZE = 64
+_FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
+
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU bf16 variant of the full / SWA / c4 / c128 single-KV pool.
@@ -243,12 +246,31 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 )
                 for _ in range(self.layer_num)
             ]
+            if get_bool_env_var(_FORCE_BF16_INDEXER_ENV):
+                self.index_k_bf16_buffer = [
+                    torch.zeros(
+                        npu_num_pages,
+                        kp,
+                        1,
+                        self.index_head_dim,
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+            else:
+                self.index_k_bf16_buffer = None
 
     @property
     def has_npu_storage(self) -> bool:
         return True
 
     def get_index_k(self, layer_id: int) -> torch.Tensor:
+        if (
+            get_bool_env_var(_FORCE_BF16_INDEXER_ENV)
+            and self.index_k_bf16_buffer is not None
+        ):
+            return self.index_k_bf16_buffer[layer_id]
         return self.index_k_buffer[layer_id]
 
     def get_index_scale(self, layer_id: int) -> torch.Tensor:
@@ -272,6 +294,13 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
             loc_long,
             index_k.to(index_k_cache.dtype).view(-1, 1, d),
         )
+        if self.index_k_bf16_buffer is not None:
+            index_k_bf16_cache = self.index_k_bf16_buffer[layer_id]
+            torch_npu.npu_scatter_nd_update_(
+                index_k_bf16_cache.view(-1, 1, d),
+                loc_long,
+                index_k.to(index_k_bf16_cache.dtype).view(-1, 1, d),
+            )
         if index_k_scale is not None:
             index_scale_cache = self.index_scale_buffer[layer_id]
             torch_npu.npu_scatter_nd_update_(

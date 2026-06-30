@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -22,6 +23,128 @@ logger = logging.getLogger(__name__)
 
 _A5_KV_TILE_SIZE = 64
 _A5_KV_ROPE_HEAD_DIM = 64
+_FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
+_DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
+_DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
+_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_debug_log_counts: dict[str, int] = {}
+
+
+def _is_npu_stream_capturing() -> bool:
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _debug_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _debug_probe_attention_output(
+    out: torch.Tensor,
+    *,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        nan_count = int(torch.isnan(out).sum().item())
+        inf_count = int(torch.isinf(out).sum().item())
+        if nan_count == 0 and inf_count == 0:
+            return
+        finite = torch.isfinite(out)
+        finite_count = int(finite.sum().item())
+        if finite_count > 0:
+            finite_values = out[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+        _debug_log_limited(
+            f"nan-{path}-{layer_id}-{compress_ratio}",
+            "DSV4 NPU attention produced invalid values: "
+            f"path={path}, layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"shape={tuple(out.shape)}, dtype={out.dtype}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, "
+            f"finite_min={min_val}, finite_max={max_val}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"nan-probe-error-{path}",
+            f"DSV4 NPU attention NaN probe failed for {path}: {exc}",
+        )
+
+
+def _debug_log_c4_topk(
+    topk: torch.Tensor,
+    forward_batch,
+    *,
+    layer_id: int,
+    index_topk: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_TOPK_ENV):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        valid = topk >= 0
+        invalid_lt_neg1 = int((topk < -1).sum().item())
+        all_neg1_rows = int((topk == -1).all(dim=-1).sum().item())
+        valid_count = int(valid.sum().item())
+        if valid_count > 0:
+            valid_topk = topk[valid]
+            min_valid = int(valid_topk.min().item())
+            max_valid = int(valid_topk.max().item())
+            unique_valid = int(valid_topk.unique().numel())
+        else:
+            min_valid = -1
+            max_valid = -1
+            unique_valid = 0
+
+        seq_lens = forward_batch.seq_lens.to(device=topk.device, dtype=torch.int32)
+        row_limits = None
+        if topk.shape[0] == seq_lens.numel():
+            row_limits = seq_lens // 4
+        else:
+            total_tokens = int(seq_lens.sum().item())
+            if topk.shape[0] == total_tokens:
+                row_limits = torch.repeat_interleave(seq_lens // 4, seq_lens)
+        if row_limits is not None:
+            row_limits = row_limits.view(-1, 1)
+            over_seq_limit = int(((topk >= row_limits) & valid).sum().item())
+            max_limit = int(row_limits.max().item()) if row_limits.numel() > 0 else 0
+        else:
+            over_seq_limit = -1
+            max_limit = -1
+
+        sample_rows = topk[: min(4, topk.shape[0])].detach().cpu().tolist()
+        _debug_log_limited(
+            f"topk-{layer_id}",
+            "DSV4 NPU C4 topk stats: "
+            f"layer_id={layer_id}, shape={tuple(topk.shape)}, index_topk={index_topk}, "
+            f"invalid_lt_neg1={invalid_lt_neg1}, over_seq_limit={over_seq_limit}, "
+            f"all_neg1_rows={all_neg1_rows}, valid_count={valid_count}, "
+            f"min_valid={min_valid}, max_valid={max_valid}, "
+            f"max_seq_limit={max_limit}, unique_valid={unique_valid}, "
+            f"sample_rows={sample_rows}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"topk-probe-error-{layer_id}",
+            f"DSV4 NPU C4 topk probe failed for layer_id={layer_id}: {exc}",
+        )
+
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
@@ -850,7 +973,9 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        c4_indexer.compressor.li_kv_dtype = "float8"
+        c4_indexer.compressor.li_kv_dtype = (
+            "bf16" if get_bool_env_var(_FORCE_BF16_INDEXER_ENV) else "float8"
+        )
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
             c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
@@ -933,6 +1058,12 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
             return
         topk_idxs = self.forward_c4_indexer_npu(
             c4_indexer, x, q_lora, forward_batch, skip_compressor=skip_compressor
+        )
+        _debug_log_c4_topk(
+            topk_idxs,
+            forward_batch,
+            layer_id=c4_indexer.layer_id,
+            index_topk=self._dsv4_index_topk,
         )
         self.forward_metadata.c4_topk_indices = topk_idxs
 
@@ -1448,6 +1579,9 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=1,
         )
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        _debug_probe_attention_output(
+            out, layer_id=layer.layer_id, path="dense", compress_ratio=1
+        )
         return out
 
     def _forward_compressed(
@@ -1516,6 +1650,12 @@ class DeepseekV4AscendAttnBackend(
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        _debug_probe_attention_output(
+            out,
+            layer_id=layer.layer_id,
+            path="compressed",
+            compress_ratio=compress_ratio,
+        )
         return out
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
