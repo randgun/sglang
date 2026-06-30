@@ -26,7 +26,9 @@ _A5_KV_ROPE_HEAD_DIM = 64
 _FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
 _DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
 _DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
+_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_DEBUG_TOPK_SAMPLE_COLS_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK_SAMPLE_COLS"
 _debug_log_counts: dict[str, int] = {}
 
 
@@ -44,6 +46,18 @@ def _debug_log_limited(key: str, message: str) -> None:
         return
     _debug_log_counts[key] = count + 1
     logger.warning(message)
+
+
+def _debug_sync_npu(label: str) -> None:
+    if not get_bool_env_var(_DEBUG_SYNC_ENV):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU debug sync failed after %s", label)
+        raise
 
 
 def _debug_probe_attention_output(
@@ -128,7 +142,10 @@ def _debug_log_c4_topk(
             over_seq_limit = -1
             max_limit = -1
 
-        sample_rows = topk[: min(4, topk.shape[0])].detach().cpu().tolist()
+        sample_cols = get_int_env_var(_DEBUG_TOPK_SAMPLE_COLS_ENV, 16)
+        sample_rows = (
+            topk[: min(4, topk.shape[0]), :sample_cols].detach().cpu().tolist()
+        )
         _debug_log_limited(
             f"topk-{layer_id}",
             "DSV4 NPU C4 topk stats: "
@@ -837,6 +854,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 x=kv,
                 slot_mapping=loc.to(torch.int32),
             )
+            _debug_sync_npu(f"indexer_compress_epilog layer_id={compressor.layer_id}")
             return
 
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
@@ -1059,6 +1077,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         topk_idxs = self.forward_c4_indexer_npu(
             c4_indexer, x, q_lora, forward_batch, skip_compressor=skip_compressor
         )
+        _debug_sync_npu(f"c4_indexer layer_id={c4_indexer.layer_id}")
         _debug_log_c4_topk(
             topk_idxs,
             forward_batch,
@@ -1579,6 +1598,7 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=1,
         )
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        _debug_sync_npu(f"dense attention layer_id={layer.layer_id}")
         _debug_probe_attention_output(
             out, layer_id=layer.layer_id, path="dense", compress_ratio=1
         )
@@ -1650,6 +1670,9 @@ class DeepseekV4AscendAttnBackend(
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        _debug_sync_npu(
+            f"compressed attention layer_id={layer.layer_id} ratio={compress_ratio}"
+        )
         _debug_probe_attention_output(
             out,
             layer_id=layer.layer_id,

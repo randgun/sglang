@@ -46,6 +46,18 @@ from sglang.srt.utils.common import get_bool_env_var
 
 _A5_KV_QUANT_GROUP_SIZE = 64
 _FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
+_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+
+
+def _debug_sync_npu(label: str) -> None:
+    if not get_bool_env_var(_DEBUG_SYNC_ENV):
+        return
+    try:
+        if torch.npu.is_current_stream_capturing():
+            return
+    except Exception:
+        return
+    torch.npu.synchronize()
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
@@ -544,6 +556,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             quant_mode=2,
             round_scale_flag=True,
         )
+        _debug_sync_npu(f"kv_compress_epilog buf_shape={tuple(buf.shape)}")
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
     # CompressStatePool stores a fused [kv | score] tensor; split is a last-dim slice.
