@@ -294,6 +294,8 @@ class EagerRunner(BaseRunner):
         forward_positions = forward_batch.positions
         if cp_v2_active:
             prepare_cp_forward(forward_batch)
+            if hasattr(model_runner.attn_backend, "prepare_dsv4_cp_metadata"):
+                model_runner.attn_backend.prepare_dsv4_cp_metadata(forward_batch)
             complete_hidden_states = kwargs.get("input_embeds")
             if complete_hidden_states is None:
                 embed_layer = model_runner.model.get_input_embeddings()
@@ -358,18 +360,33 @@ class EagerRunner(BaseRunner):
                 )
                 if capture_aux_hidden_states:
                     hidden_states, aux_hidden_states = hidden_states
+                hidden_states_before_norm = None
+                if (
+                    isinstance(hidden_states, tuple)
+                    and len(hidden_states) == 2
+                    and torch.is_tensor(hidden_states[0])
+                    and torch.is_tensor(hidden_states[1])
+                ):
+                    hidden_states, hidden_states_before_norm = hidden_states
                 if model_runner.model.pp_group.is_last_rank:
                     hidden_states = cp_gather_after_forward(
                         hidden_states,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
+                    if hidden_states_before_norm is not None:
+                        hidden_states_before_norm = cp_gather_after_forward(
+                            hidden_states_before_norm,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
                     ret = model_runner.model.logits_processor(
                         forward_batch.input_ids,
                         hidden_states,
                         model_runner.model.lm_head,
                         forward_batch,
                         aux_hidden_states,
+                        hidden_states_before_norm=hidden_states_before_norm,
                     )
                 elif capture_aux_hidden_states:
                     ret = hidden_states, aux_hidden_states
