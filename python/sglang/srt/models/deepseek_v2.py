@@ -181,6 +181,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
@@ -212,6 +213,78 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+_DSV4_NPU_DEBUG_MODEL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL"
+_DSV4_NPU_DEBUG_MODEL_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_LAYER"
+_DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_dsv4_npu_moe_forward_debug_log_counts: dict[str, int] = {}
+
+
+def _dsv4_npu_moe_forward_debug_enabled() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_ENV)
+
+
+def _dsv4_npu_moe_forward_should_probe_layer(layer_id: int) -> bool:
+    target_layer = get_int_env_var(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV, 0)
+    return target_layer < 0 or layer_id == target_layer
+
+
+def _dsv4_npu_moe_forward_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DSV4_NPU_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _dsv4_npu_moe_forward_debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _dsv4_npu_moe_forward_debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _dsv4_npu_moe_forward_probe_tensor(
+    tensor: Optional[torch.Tensor],
+    label: str,
+    layer_id: int,
+) -> None:
+    if (
+        tensor is None
+        or not _dsv4_npu_moe_forward_debug_enabled()
+        or not _dsv4_npu_moe_forward_should_probe_layer(layer_id)
+        or get_is_capture_mode()
+    ):
+        return
+
+    if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("DSV4 NPU MoE forward debug sync failed after %s", label)
+            raise
+
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+        _dsv4_npu_moe_forward_log_limited(
+            f"{layer_id}-{label}",
+            "DSV4 NPU MoE forward tensor stats: "
+            f"label={label}, layer_id={layer_id}, shape={tuple(tensor.shape)}, "
+            f"dtype={tensor.dtype}, finite_count={finite_count}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, "
+            f"zero_count={zero_count}, finite_min={min_val}, finite_max={max_val}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU MoE forward tensor probe failed at %s", label)
+        raise
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1347,6 +1420,11 @@ class DeepseekV2MoE(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        _dsv4_npu_moe_forward_probe_tensor(
+            final_hidden_states,
+            "deepep-after-experts",
+            self.layer_id,
+        )
 
         if (
             hidden_states.shape[0] > 0
@@ -1357,6 +1435,11 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
+            _dsv4_npu_moe_forward_probe_tensor(
+                shared_output,
+                "shared-output",
+                self.layer_id,
+            )
             x = shared_output
             # aiter moe call will handle routed_scaling_factor in the function
             # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
@@ -1365,11 +1448,21 @@ class DeepseekV2MoE(nn.Module):
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
+            _dsv4_npu_moe_forward_probe_tensor(
+                final_hidden_states,
+                "after-shared-add",
+                self.layer_id,
+            )
         else:
             if not (
                 self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
             ):
                 final_hidden_states *= self.routed_scaling_factor
+            _dsv4_npu_moe_forward_probe_tensor(
+                final_hidden_states,
+                "after-routed-scale",
+                self.layer_id,
+            )
 
         return final_hidden_states
 

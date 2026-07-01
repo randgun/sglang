@@ -13,6 +13,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
 
 
+def _mask_padded_topk_rows_npu(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if num_token_non_padded is None:
+        return topk_weights, topk_ids
+
+    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+    mask = (indices >= num_token_non_padded).unsqueeze(-1)
+    topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
+    topk_weights = torch.where(mask, torch.zeros_like(topk_weights), topk_weights)
+    return topk_weights, topk_ids
+
+
 def fused_topk_npu(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -103,6 +118,9 @@ def fused_topk_npu(
 
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    topk_weights, topk_ids = _mask_padded_topk_rows_npu(
+        topk_weights, topk_ids, num_token_non_padded
+    )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     if (cap := get_global_experts_capturer()) is not None:
         cap.capture(
