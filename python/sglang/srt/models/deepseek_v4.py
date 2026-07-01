@@ -166,6 +166,8 @@ def _dsv4_npu_should_probe_layer(layer_id: int) -> bool:
 
 
 def _dsv4_npu_is_stream_capturing() -> bool:
+    if get_is_capture_mode():
+        return True
     try:
         return bool(torch.npu.is_current_stream_capturing())
     except Exception:

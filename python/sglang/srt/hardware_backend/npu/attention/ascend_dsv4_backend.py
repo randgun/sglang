@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
@@ -35,6 +36,8 @@ _debug_log_counts: dict[str, int] = {}
 
 
 def _is_npu_stream_capturing() -> bool:
+    if get_is_capture_mode():
+        return True
     try:
         return bool(torch.npu.is_current_stream_capturing())
     except Exception:

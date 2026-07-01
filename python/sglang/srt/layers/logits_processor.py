@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -85,6 +86,8 @@ def _dsv4_npu_logits_debug_enabled() -> bool:
 
 
 def _is_npu_stream_capturing() -> bool:
+    if get_is_capture_mode():
+        return True
     try:
         return bool(torch.npu.is_current_stream_capturing())
     except Exception:
