@@ -26,6 +26,7 @@ _A5_KV_TILE_SIZE = 64
 _A5_KV_ROPE_HEAD_DIM = 64
 _A5_KV_QUANT_MODE_DEFAULT = 1
 _A5_KV_QUANT_MODE_ENV = "SGLANG_DSV4_NPU_KV_QUANT_MODE"
+_A5_ROPE_FIRST_QK_ENV = "SGLANG_DSV4_NPU_ROPE_FIRST_QK"
 _FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
 _DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
 _DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
@@ -46,6 +47,24 @@ def _is_npu_stream_capturing() -> bool:
 
 def _a5_kv_quant_mode() -> int:
     return get_int_env_var(_A5_KV_QUANT_MODE_ENV, _A5_KV_QUANT_MODE_DEFAULT)
+
+
+def _a5_use_rope_first_qk() -> bool:
+    return get_bool_env_var(_A5_ROPE_FIRST_QK_ENV)
+
+
+def _a5_to_rope_first_q(q: torch.Tensor) -> torch.Tensor:
+    if not _a5_use_rope_first_qk():
+        return q
+    rope_dim = _A5_KV_ROPE_HEAD_DIM
+    return torch.cat([q[..., -rope_dim:], q[..., :-rope_dim]], dim=-1).contiguous()
+
+
+def _a5_from_rope_first_out(out: torch.Tensor) -> torch.Tensor:
+    if not _a5_use_rope_first_qk():
+        return out
+    rope_dim = _A5_KV_ROPE_HEAD_DIM
+    return torch.cat([out[..., rope_dim:], out[..., :rope_dim]], dim=-1).contiguous()
 
 
 def _debug_log_limited(key: str, message: str) -> None:
@@ -1630,6 +1649,14 @@ class DeepseekV4AscendAttnBackend(
             path="dense",
             compress_ratio=1,
         )
+        q_attn = _a5_to_rope_first_q(q)
+        _debug_probe_attention_tensor(
+            q_attn,
+            "dense-q-attn",
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
         # swa_kv_cache = torch.empty((ori_kv.shape[0],640), dtype=torch.float8_e4m3fn, device=ori_kv.device)
         # if ori_kv.shape[-1] != 640:
         #     ori_kv = ori_kv.view(-1, ori_kv.shape[-1])
@@ -1658,7 +1685,7 @@ class DeepseekV4AscendAttnBackend(
             ori_win_right=0,
             layout_q="TND",
             layout_kv="PA_ND",
-            q=q,
+            q=q_attn,
             ori_kv=ori_kv,
             ori_block_table=fm.swa_page_table,
             sinks=attn_sink,
@@ -1667,6 +1694,7 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=1,
         )
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        out = _a5_from_rope_first_out(out)
         _debug_sync_npu(f"dense attention layer_id={layer.layer_id}")
         _debug_probe_attention_tensor(
             out,
@@ -1717,6 +1745,7 @@ class DeepseekV4AscendAttnBackend(
             "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
+        q_attn = _a5_to_rope_first_q(q)
         attn_kwargs = dict(
             kv_quant_mode=_a5_kv_quant_mode(),
             tile_size = _A5_KV_TILE_SIZE,
@@ -1728,7 +1757,7 @@ class DeepseekV4AscendAttnBackend(
             ori_win_right=0,
             layout_q="TND",
             layout_kv="PA_ND",
-            q=q,
+            q=q_attn,
             ori_kv=ori_kv,
             ori_block_table=fm.swa_page_table,
             sinks=attn_sink,
@@ -1746,6 +1775,7 @@ class DeepseekV4AscendAttnBackend(
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        out = _a5_from_rope_first_out(out)
         _debug_sync_npu(
             f"compressed attention layer_id={layer.layer_id} ratio={compress_ratio}"
         )
