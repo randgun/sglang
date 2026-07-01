@@ -183,6 +183,60 @@ def _debug_probe_attention_tensor(
         )
 
 
+def _debug_probe_invalid_tensor(
+    tensor: torch.Tensor,
+    label: str,
+    *,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> bool:
+    if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return False
+    if _is_npu_stream_capturing():
+        return False
+    _debug_sync_npu(f"{path} invalid probe {label} layer_id={layer_id}")
+    try:
+        probe = tensor
+        if (
+            probe.dtype == torch.float8_e4m3fn
+            or probe.dtype == getattr(torch, "float8_e4m3fnuz", None)
+        ):
+            probe = probe.to(torch.float32)
+        elif not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        if nan_count == 0 and inf_count == 0:
+            return False
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+        _debug_log_limited(
+            f"invalid-{path}-{layer_id}-{compress_ratio}-{label}",
+            "DSV4 NPU tensor contains invalid values: "
+            f"label={label}, path={path}, layer_id={layer_id}, "
+            f"compress_ratio={compress_ratio}, shape={tuple(tensor.shape)}, "
+            f"dtype={tensor.dtype}, finite_count={finite_count}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, "
+            f"zero_count={zero_count}, finite_min={min_val}, finite_max={max_val}",
+        )
+        return True
+    except Exception as exc:
+        _debug_log_limited(
+            f"invalid-probe-error-{path}-{label}",
+            f"DSV4 NPU invalid tensor probe failed for {path}/{label}: {exc}",
+        )
+        return False
+
+
 def _debug_tensor_sample(tensor: Optional[torch.Tensor], limit: int = 16):
     if tensor is None:
         return None
@@ -317,7 +371,15 @@ def _debug_probe_active_compressed_rows(
         if bool(in_table.any().item()):
             pages[in_table] = cmp_block_table[0, block_ids[in_table]].to(torch.int64)
         active_locs = pages * page_size + offsets
-        flat_kv = cmp_kv.flatten(0, 1)
+        if (
+            cmp_kv.dtype == torch.float8_e4m3fn
+            or cmp_kv.dtype == getattr(torch, "float8_e4m3fnuz", None)
+        ):
+            flat_kv = cmp_kv.view(torch.uint8).view(-1, cmp_kv.shape[-1])
+            active_label = "compressed-active-cmp-row-bytes"
+        else:
+            flat_kv = cmp_kv.flatten(0, 1)
+            active_label = "compressed-active-cmp-rows"
         in_cache = (pages >= 0) & (active_locs >= 0) & (active_locs < flat_kv.shape[0])
         _debug_log_limited(
             f"active-cmp-locs-{layer_id}-{compress_ratio}",
@@ -333,7 +395,7 @@ def _debug_probe_active_compressed_rows(
             active_rows = flat_kv[active_locs[in_cache]]
             _debug_probe_attention_tensor(
                 active_rows,
-                "compressed-active-cmp-rows",
+                active_label,
                 layer_id=layer_id,
                 path="compressed",
                 compress_ratio=compress_ratio,
@@ -832,6 +894,14 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         device = x.device
         self._ensure_compressor_hadamard(compressor, device)
         dtype = x.dtype
+        probe_path = f"compressor-native-r{ratio}"
+        _debug_probe_invalid_tensor(
+            x,
+            "compressor-input-x",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
         x_f32 = x.float()
         # wkv + wgate are fused into one wkv_gate.weight [2*coff*head_dim, hidden_size]
         # (kv concatenated before wgate); split along the output dim to recover each.
@@ -839,6 +909,20 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         W = compressor.wkv_gate.weight.float()
         kv_full = F.linear(x_f32, W[: coff * d])  # [T, coff*d]
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
+        _debug_probe_invalid_tensor(
+            kv_full,
+            "compressor-kv-full",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
+        _debug_probe_invalid_tensor(
+            score_full,
+            "compressor-score-full",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
         is_prefill = forward_batch.forward_mode.is_prefill()
@@ -965,6 +1049,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     kv_compressed = (kv * score.softmax(dim=1)).sum(
                         dim=1
                     )  # [n_chunks, d]
+                    _debug_probe_invalid_tensor(
+                        kv_compressed,
+                        "compressor-prefill-kv-compressed",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
                     n_compressed_this_req = kv_compressed.shape[0]
                     kv_out_list.append(kv_compressed)
                     kv_out_positions.append(pos_compressed)
@@ -1035,6 +1126,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         kv_compressed = (
                             kv_state[:, 0] * score_state[:, 0].softmax(dim=0)
                         ).sum(dim=0, keepdim=True)
+                    _debug_probe_invalid_tensor(
+                        kv_compressed,
+                        "compressor-decode-kv-compressed",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
                     kv_out_list.append(kv_compressed)
                     kv_out_positions.append(pos_req)
                     # Decode: 1 compressed token at compressed_seq_pos = seqlen//ratio - 1
@@ -1064,7 +1162,21 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if kv_out_list:
             kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
             pos_out = torch.cat(kv_out_positions, dim=0)
+            _debug_probe_invalid_tensor(
+                kv_out,
+                "compressor-kv-out-before-norm",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             kv_out = compressor.norm(kv_out)
+            _debug_probe_invalid_tensor(
+                kv_out,
+                "compressor-kv-out-after-norm",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             # npu_rotary_mul wants cos/sin in repeat_interleave(2) layout, reshaped
             # to (T, 1, 1, rope_dim); cos=real, sin=imag of the complex freqs_cis.
             rope_dim = compressor.rope_head_dim
@@ -1094,8 +1206,22 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 rope_view, cos, sin, rotary_mode="interleave"
             )
             rope_slice.copy_(rope_rot.view_as(rope_slice))
+            _debug_probe_invalid_tensor(
+                kv_out,
+                "compressor-kv-out-after-rope",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             if compressor.rotate:
                 kv_out = _apply_hadamard(kv_out, compressor.hadamard_matrix)
+                _debug_probe_invalid_tensor(
+                    kv_out,
+                    "compressor-kv-out-after-hadamard",
+                    layer_id=compressor.layer_id,
+                    path=probe_path,
+                    compress_ratio=ratio,
+                )
             # c{N}_kv_pool slot per compressed token. DSV4NPUReqToTokenPool's
             # token-level slot id table is indexed directly by compressed-seq
             # position (elements already are c-pool slot ids; no page indirection).
