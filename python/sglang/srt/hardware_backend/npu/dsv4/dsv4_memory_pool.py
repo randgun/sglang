@@ -48,6 +48,8 @@ _A5_KV_QUANT_GROUP_SIZE = 64
 _A5_KV_COMPRESS_QUANT_MODE_DEFAULT = 2
 _A5_KV_COMPRESS_QUANT_MODE_ENV = "SGLANG_DSV4_NPU_KV_COMPRESS_QUANT_MODE"
 _A5_KV_ROUND_SCALE_ENV = "SGLANG_DSV4_NPU_KV_ROUND_SCALE"
+_A5_KV_USE_COMPRESS_EPILOG_ENV = "SGLANG_DSV4_NPU_USE_KV_COMPRESS_EPILOG"
+_A5_FP8_E4M3FN_MAX = 448.0
 _FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 
@@ -96,7 +98,9 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
         scale_dim = math.ceil(nope_dim / 64)
-        bytes_per_token = nope_dim + rope_dim * 2 + scale_dim
+        # KvQuantSparseAttnSharedkv kv_quant_mode=1 stores BF16 dequant scales
+        # in the FP8-typed cache byte stream: rope_bf16 + nope_fp8 + scale_bf16.
+        bytes_per_token = nope_dim + rope_dim * 2 + scale_dim * 2
         return math.ceil(bytes_per_token / 128) * 128
 
     def create_buffer(self, *, num_pages: int):
@@ -561,6 +565,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 "DSV4 A5 KV cache write expects one slot per token, got "
                 f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
             )
+        if not get_bool_env_var(_A5_KV_USE_COMPRESS_EPILOG_ENV):
+            self._set_a5_kv_buffer_quant_mode1(buf, slot_mapping, cache_2d)
+            _debug_sync_npu(f"kv quant-mode1 pack buf_shape={tuple(buf.shape)}")
+            return
         torch.ops.custom.kv_compress_epilog(
             buf.view(-1, buf.shape[-1]),
             cache_2d,
@@ -570,6 +578,67 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             round_scale_flag=_a5_kv_round_scale_flag(),
         )
         _debug_sync_npu(f"kv_compress_epilog buf_shape={tuple(buf.shape)}")
+
+    def _set_a5_kv_buffer_quant_mode1(
+        self,
+        buf: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        cache_2d: torch.Tensor,
+    ) -> None:
+        """Pack BF16 DSV4 KV for KvQuantSparseAttnSharedkv kv_quant_mode=1.
+
+        The attention op's reference generator stores each PA_ND row as:
+        rope_bf16 bytes, nope_fp8 bytes, BF16 dequant scales, then padding.
+        ``custom.kv_compress_epilog`` quant_mode=2 writes E8M0 scales instead,
+        which is a different wire format and makes kv_quant_mode=1 dequantize
+        with garbage scale values.
+        """
+        nope_dim = self.qk_nope_head_dim
+        rope_dim = self.qk_rope_head_dim
+        scale_dim = math.ceil(nope_dim / _A5_KV_QUANT_GROUP_SIZE)
+        packed_dim = buf.shape[-1]
+        rope_bytes = rope_dim * 2
+        scale_bytes = scale_dim * 2
+        data_bytes = rope_bytes + nope_dim + scale_bytes
+        if data_bytes > packed_dim:
+            raise RuntimeError(
+                "DSV4 A5 KV quant-mode1 pack exceeds cache row width: "
+                f"data_bytes={data_bytes}, packed_dim={packed_dim}."
+            )
+
+        cache_valid = cache_2d
+        slots = slot_mapping.to(torch.int64)
+        k_nope = cache_valid[:, :nope_dim]
+        k_rope = cache_valid[:, nope_dim:]
+
+        k_nope_grouped = k_nope.view(-1, scale_dim, _A5_KV_QUANT_GROUP_SIZE)
+        scale = k_nope_grouped.abs().amax(dim=-1).clamp(min=1e-4) / _A5_FP8_E4M3FN_MAX
+        k_nope_fp8 = (
+            (k_nope_grouped / scale.unsqueeze(-1))
+            .clamp(min=-_A5_FP8_E4M3FN_MAX, max=_A5_FP8_E4M3FN_MAX)
+            .reshape(-1, nope_dim)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        scale_bf16 = scale.to(torch.bfloat16).contiguous()
+
+        rows = torch.zeros(
+            cache_valid.shape[0],
+            packed_dim,
+            dtype=torch.uint8,
+            device=buf.device,
+        )
+        rows[:, :rope_bytes] = k_rope.contiguous().view(torch.uint8).view(
+            -1, rope_bytes
+        )
+        rows[:, rope_bytes : rope_bytes + nope_dim] = k_nope_fp8.view(torch.uint8)
+        rows[
+            :,
+            rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes,
+        ] = scale_bf16.view(torch.uint8).view(-1, scale_bytes)
+
+        buf_u8 = buf.view(torch.uint8).view(-1, packed_dim)
+        torch_npu.npu_scatter_nd_update_(buf_u8, slots.unsqueeze(-1), rows)
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
     # CompressStatePool stores a fused [kv | score] tensor; split is a last-dim slice.
