@@ -149,6 +149,7 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 _DSV4_NPU_DEBUG_MODEL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL"
 _DSV4_NPU_DEBUG_MODEL_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_LAYER"
+_DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_INVALID_ALL"
 _DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _dsv4_npu_model_debug_log_counts: dict[str, int] = {}
@@ -159,6 +160,29 @@ def _dsv4_npu_model_debug_enabled() -> bool:
 
 
 def _dsv4_npu_should_probe_layer(layer_id: int) -> bool:
+    target_layer = get_int_env_var(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV, 0)
+    return (
+        target_layer < 0
+        or layer_id == target_layer
+        or get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV)
+    )
+
+
+def _dsv4_npu_model_label_layer_id(label: str) -> Optional[int]:
+    for prefix in ("mqa-layer-", "model-layer-", "layer-"):
+        if label.startswith(prefix):
+            layer_text = label[len(prefix) :].split("-", 1)[0]
+            try:
+                return int(layer_text)
+            except ValueError:
+                return None
+    return None
+
+
+def _dsv4_npu_model_probe_full_stats(label: str) -> bool:
+    layer_id = _dsv4_npu_model_label_layer_id(label)
+    if layer_id is None:
+        return True
     target_layer = get_int_env_var(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV, 0)
     return target_layer < 0 or layer_id == target_layer
 
@@ -202,6 +226,7 @@ def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
 
     _dsv4_npu_model_debug_sync(label)
     try:
+        full_stats = _dsv4_npu_model_probe_full_stats(label)
         probe = tensor
         if not probe.is_floating_point():
             probe = probe.to(torch.float32)
@@ -209,6 +234,13 @@ def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
         finite_count = int(finite.sum().item())
         nan_count = int(torch.isnan(probe).sum().item())
         inf_count = int(torch.isinf(probe).sum().item())
+        if (
+            not full_stats
+            and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV)
+            and nan_count == 0
+            and inf_count == 0
+        ):
+            return
         zero_count = int((probe == 0).sum().item())
         if finite_count > 0:
             finite_values = probe[finite].to(torch.float32)
@@ -218,13 +250,21 @@ def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
             min_val = float("nan")
             max_val = float("nan")
 
-        _dsv4_npu_model_log_limited(
-            f"tensor-{label}",
+        message_prefix = (
             "DSV4 NPU model tensor stats: "
-            f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            if full_stats
+            else "DSV4 NPU model tensor contains invalid values: "
+        )
+        message = (
+            message_prefix
+            + f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
             f"finite_count={finite_count}, nan_count={nan_count}, "
             f"inf_count={inf_count}, zero_count={zero_count}, "
-            f"finite_min={min_val}, finite_max={max_val}",
+            f"finite_min={min_val}, finite_max={max_val}"
+        )
+        _dsv4_npu_model_log_limited(
+            f"{'tensor' if full_stats else 'invalid'}-{label}",
+            message,
         )
     except Exception:
         logger.exception("DSV4 NPU model tensor probe failed at %s", label)
