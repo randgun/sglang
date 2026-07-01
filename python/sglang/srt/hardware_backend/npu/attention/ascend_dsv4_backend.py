@@ -97,16 +97,16 @@ def _debug_probe_attention_output(
     layer_id: int,
     path: str,
     compress_ratio: int,
-) -> None:
+) -> bool:
     if not get_bool_env_var(_DEBUG_NAN_ENV):
-        return
+        return False
     if _is_npu_stream_capturing():
-        return
+        return False
     try:
         nan_count = int(torch.isnan(out).sum().item())
         inf_count = int(torch.isinf(out).sum().item())
         if nan_count == 0 and inf_count == 0:
-            return
+            return False
         finite = torch.isfinite(out)
         finite_count = int(finite.sum().item())
         if finite_count > 0:
@@ -124,11 +124,13 @@ def _debug_probe_attention_output(
             f"nan_count={nan_count}, inf_count={inf_count}, "
             f"finite_min={min_val}, finite_max={max_val}",
         )
+        return True
     except Exception as exc:
         _debug_log_limited(
             f"nan-probe-error-{path}",
             f"DSV4 NPU attention NaN probe failed for {path}: {exc}",
         )
+        return False
 
 
 def _debug_probe_attention_tensor(
@@ -231,6 +233,116 @@ def _debug_probe_cache_metadata(
             f"cache-meta-error-{path}-{layer_id}-{compress_ratio}",
             "DSV4 NPU cache metadata probe failed: "
             f"path={path}, layer_id={layer_id}, compress_ratio={compress_ratio}, exc={exc}",
+        )
+
+
+def _debug_probe_compressed_cache_metadata(
+    *,
+    forward_batch: ForwardBatch,
+    fm,
+    cmp_kv: torch.Tensor,
+    cmp_block_table: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    topk: Optional[torch.Tensor],
+) -> None:
+    if not get_bool_env_var(_DEBUG_CACHE_META_ENV):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        page_size = int(cmp_kv.shape[1])
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        cmp_loc = getattr(fm, f"c{compress_ratio}_loc", None)
+        if cmp_loc is not None:
+            cmp_loc_i64 = cmp_loc.to(torch.int64)
+            cmp_pages = cmp_loc_i64 // page_size
+            cmp_offsets = cmp_loc_i64 % page_size
+        else:
+            cmp_pages = None
+            cmp_offsets = None
+        _debug_log_limited(
+            f"cache-meta-compressed-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed cache metadata: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"page_size={page_size}, cmp_kv_shape={tuple(cmp_kv.shape)}, "
+            f"seq_lens={_debug_tensor_sample(seq_lens)}, "
+            f"actual_seq_lengths_kv={_debug_tensor_sample(getattr(fm, 'actual_seq_lengths_kv', None))}, "
+            f"cmp_loc={_debug_tensor_sample(cmp_loc)}, "
+            f"cmp_pages={_debug_tensor_sample(cmp_pages)}, "
+            f"cmp_offsets={_debug_tensor_sample(cmp_offsets)}, "
+            f"cmp_block_table_row0={_debug_tensor_sample(cmp_block_table[0] if cmp_block_table.shape[0] > 0 else None)}, "
+            f"topk_row0={_debug_tensor_sample(topk[0] if topk is not None and topk.shape[0] > 0 else None)}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"cache-meta-compressed-error-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed cache metadata probe failed: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, exc={exc}",
+        )
+
+
+def _debug_probe_active_compressed_rows(
+    *,
+    cmp_kv: torch.Tensor,
+    cmp_block_table: torch.Tensor,
+    topk: Optional[torch.Tensor],
+    layer_id: int,
+    compress_ratio: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return
+    if topk is None or topk.numel() == 0 or cmp_block_table.numel() == 0:
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        page_size = int(cmp_kv.shape[1])
+        valid_topk = topk.reshape(-1)
+        valid_topk = valid_topk[valid_topk >= 0].unique()
+        if valid_topk.numel() == 0:
+            _debug_log_limited(
+                f"active-cmp-empty-{layer_id}-{compress_ratio}",
+                "DSV4 NPU compressed active row probe skipped: "
+                f"layer_id={layer_id}, compress_ratio={compress_ratio}, no valid topk",
+            )
+            return
+
+        sample_logical = valid_topk[:16].to(torch.int64)
+        block_ids = sample_logical // page_size
+        offsets = sample_logical % page_size
+        table_width = cmp_block_table.shape[1]
+        in_table = block_ids < table_width
+        pages = torch.full_like(block_ids, -1)
+        if bool(in_table.any().item()):
+            pages[in_table] = cmp_block_table[0, block_ids[in_table]].to(torch.int64)
+        active_locs = pages * page_size + offsets
+        flat_kv = cmp_kv.flatten(0, 1)
+        in_cache = (pages >= 0) & (active_locs >= 0) & (active_locs < flat_kv.shape[0])
+        _debug_log_limited(
+            f"active-cmp-locs-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed active rows: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"logical={sample_logical.detach().cpu().tolist()}, "
+            f"pages={pages.detach().cpu().tolist()}, "
+            f"offsets={offsets.detach().cpu().tolist()}, "
+            f"active_locs={active_locs.detach().cpu().tolist()}, "
+            f"in_cache={in_cache.detach().cpu().tolist()}",
+        )
+        if bool(in_cache.any().item()):
+            active_rows = flat_kv[active_locs[in_cache]]
+            _debug_probe_attention_tensor(
+                active_rows,
+                "compressed-active-cmp-rows",
+                layer_id=layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+    except Exception as exc:
+        _debug_log_limited(
+            f"active-cmp-error-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed active row probe failed: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, exc={exc}",
         )
 
 
@@ -1058,6 +1170,30 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
 
+        _debug_probe_attention_tensor(
+            kv,
+            "compressor-epilog-kv",
+            layer_id=compressor.layer_id,
+            path=f"compressor-r{compressor.ratio}",
+            compress_ratio=compressor.ratio,
+        )
+        if get_bool_env_var(_DEBUG_CACHE_META_ENV) and not _is_npu_stream_capturing():
+            try:
+                _debug_log_limited(
+                    f"compressor-write-{compressor.layer_id}-{compressor.ratio}-{compressor.is_in_indexer}",
+                    "DSV4 NPU compressor write metadata: "
+                    f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, "
+                    f"from_indexer={compressor.is_in_indexer}, "
+                    f"loc={_debug_tensor_sample(loc)}, kv_shape={tuple(kv.shape)}, "
+                    f"kv_dtype={kv.dtype}, kv_scale_shape={tuple(kv_scale.shape) if kv_scale is not None else None}, "
+                    f"kv_scale_dtype={kv_scale.dtype if kv_scale is not None else None}",
+                )
+            except Exception as exc:
+                _debug_log_limited(
+                    f"compressor-write-error-{compressor.layer_id}-{compressor.ratio}",
+                    "DSV4 NPU compressor write metadata probe failed: "
+                    f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, exc={exc}",
+                )
         self.token_to_kv_pool.set_compress_buffer(
             compressor.layer_id,
             loc,
@@ -1902,6 +2038,7 @@ class DeepseekV4AscendAttnBackend(
             cmp_block_table=cmp_block_table,
         )
         # c4 attends via indexer topk; c128 reads the full compressed history
+        topk = None
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
@@ -1912,12 +2049,78 @@ class DeepseekV4AscendAttnBackend(
         _debug_sync_npu(
             f"compressed attention layer_id={layer.layer_id} ratio={compress_ratio}"
         )
-        _debug_probe_attention_output(
+        invalid = _debug_probe_attention_output(
             out,
             layer_id=layer.layer_id,
             path="compressed",
             compress_ratio=compress_ratio,
         )
+        if invalid:
+            _debug_probe_compressed_cache_metadata(
+                forward_batch=forward_batch,
+                fm=fm,
+                cmp_kv=cmp_kv,
+                cmp_block_table=cmp_block_table,
+                layer_id=layer.layer_id,
+                compress_ratio=compress_ratio,
+                topk=topk,
+            )
+            _debug_probe_attention_tensor(
+                q,
+                "compressed-q",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                q_attn,
+                "compressed-q-attn",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                ori_kv,
+                "compressed-ori-kv",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                cmp_kv,
+                "compressed-cmp-kv",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                cmp_block_table,
+                "compressed-cmp-block-table",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            if topk is not None:
+                _debug_log_c4_topk(
+                    topk,
+                    forward_batch,
+                    layer_id=layer.layer_id,
+                    index_topk=self._dsv4_index_topk,
+                )
+                _debug_probe_attention_tensor(
+                    topk,
+                    "compressed-topk",
+                    layer_id=layer.layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+                _debug_probe_active_compressed_rows(
+                    cmp_kv=cmp_kv,
+                    cmp_block_table=cmp_block_table,
+                    topk=topk,
+                    layer_id=layer.layer_id,
+                    compress_ratio=compress_ratio,
+                )
         return out
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
