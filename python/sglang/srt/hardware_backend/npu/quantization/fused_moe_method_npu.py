@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -7,6 +8,7 @@ import torch_npu
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -18,6 +20,182 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 MXFP4_BLOCK_SIZE = 32
+_DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
+_DEBUG_MOE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE"
+_DEBUG_MOE_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_LAYER"
+_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_debug_log_counts: dict[str, int] = {}
+
+logger = logging.getLogger(__name__)
+
+
+def _npu_moe_debug_enabled() -> bool:
+    return get_bool_env_var(_DEBUG_MOE_ENV) or get_bool_env_var(_DEBUG_NAN_ENV)
+
+
+def _npu_moe_layer_id(layer: torch.nn.Module) -> int:
+    return int(getattr(layer, "layer_id", -1))
+
+
+def _npu_moe_should_probe_layer(layer: torch.nn.Module) -> bool:
+    target_layer = get_int_env_var(_DEBUG_MOE_LAYER_ENV, -1)
+    return target_layer < 0 or _npu_moe_layer_id(layer) == target_layer
+
+
+def _npu_moe_full_stats(layer: torch.nn.Module) -> bool:
+    if not get_bool_env_var(_DEBUG_MOE_ENV):
+        return False
+    target_layer = get_int_env_var(_DEBUG_MOE_LAYER_ENV, -1)
+    return target_layer < 0 or _npu_moe_layer_id(layer) == target_layer
+
+
+def _npu_moe_is_stream_capturing() -> bool:
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _npu_moe_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _npu_moe_debug_sync(label: str) -> None:
+    if not get_bool_env_var(_DEBUG_SYNC_ENV) or _npu_moe_is_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU MoE debug sync failed after %s", label)
+        raise
+
+
+def _npu_moe_probe_tensor(
+    tensor: Optional[torch.Tensor],
+    label: str,
+    layer: torch.nn.Module,
+) -> None:
+    if (
+        tensor is None
+        or not _npu_moe_debug_enabled()
+        or not _npu_moe_should_probe_layer(layer)
+        or _npu_moe_is_stream_capturing()
+    ):
+        return
+
+    _npu_moe_debug_sync(label)
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        full_stats = _npu_moe_full_stats(layer)
+        if not full_stats and nan_count == 0 and inf_count == 0:
+            return
+
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+
+        invalid_rows = []
+        if tensor.ndim >= 2 and (nan_count > 0 or inf_count > 0):
+            flat = probe.reshape(-1, probe.shape[-1])
+            invalid_mask = ~torch.isfinite(flat).all(dim=1)
+            invalid_rows = (
+                invalid_mask.nonzero(as_tuple=False).flatten()[:8].cpu().tolist()
+            )
+
+        prefix = (
+            "DSV4 NPU MoE tensor stats: "
+            if full_stats
+            else "DSV4 NPU MoE tensor contains invalid values: "
+        )
+        message = (
+            prefix
+            + f"label={label}, layer_id={_npu_moe_layer_id(layer)}, "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_count={finite_count}, nan_count={nan_count}, "
+            f"inf_count={inf_count}, zero_count={zero_count}, "
+            f"finite_min={min_val}, finite_max={max_val}, "
+            f"invalid_rows={invalid_rows}"
+        )
+        _npu_moe_log_limited(
+            f"{'tensor' if full_stats else 'invalid'}-{_npu_moe_layer_id(layer)}-{label}",
+            message,
+        )
+    except Exception:
+        logger.exception("DSV4 NPU MoE tensor probe failed at %s", label)
+        raise
+
+
+def _npu_moe_probe_group_list(
+    group_list: Optional[torch.Tensor],
+    label: str,
+    layer: torch.nn.Module,
+) -> None:
+    if (
+        group_list is None
+        or not get_bool_env_var(_DEBUG_MOE_ENV)
+        or not _npu_moe_should_probe_layer(layer)
+        or _npu_moe_is_stream_capturing()
+    ):
+        return
+
+    _npu_moe_debug_sync(label)
+    try:
+        cpu_list = group_list.detach().to(torch.int64).cpu()
+        sample = cpu_list[:16].tolist()
+        if cpu_list.numel() > 0:
+            min_val = int(cpu_list.min().item())
+            max_val = int(cpu_list.max().item())
+            total = int(cpu_list.sum().item())
+        else:
+            min_val = max_val = total = 0
+        _npu_moe_log_limited(
+            f"group-{_npu_moe_layer_id(layer)}-{label}",
+            "DSV4 NPU MoE group list stats: "
+            f"label={label}, layer_id={_npu_moe_layer_id(layer)}, "
+            f"shape={tuple(group_list.shape)}, dtype={group_list.dtype}, "
+            f"min={min_val}, max={max_val}, sum={total}, sample={sample}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU MoE group list probe failed at %s", label)
+        raise
+
+
+def _npu_moe_register_post_combine_probe(
+    layer: torch.nn.Module,
+    label: str,
+) -> None:
+    if not _npu_moe_debug_enabled() or not _npu_moe_should_probe_layer(layer):
+        return
+    dispatcher = getattr(layer, "dispatcher", None)
+    if dispatcher is None or not hasattr(dispatcher, "register_post_combine_hook"):
+        return
+
+    handle = None
+
+    def _post_combine_hook(_dispatcher, hidden_states: torch.Tensor):
+        _npu_moe_probe_tensor(hidden_states, label, layer)
+        if handle is not None:
+            handle.remove()
+        return None
+
+    handle = dispatcher.register_post_combine_hook(_post_combine_hook)
 
 
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
@@ -133,6 +311,21 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: "DispatchOutput",
     ) -> "CombineInput":
+        _npu_moe_probe_tensor(
+            getattr(dispatch_output, "hidden_states", None),
+            "apply-dispatch-hidden",
+            layer,
+        )
+        _npu_moe_probe_tensor(
+            getattr(dispatch_output, "topk_ids", None),
+            "apply-dispatch-topk-ids",
+            layer,
+        )
+        _npu_moe_probe_tensor(
+            getattr(dispatch_output, "topk_weights", None),
+            "apply-dispatch-topk-weights",
+            layer,
+        )
         combine_input = npu_apply_w4a4_mxfp_moe_deepep(layer, dispatch_output)
         if combine_input is not None:
             return combine_input
@@ -157,7 +350,10 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             topk_weights,
             topk_ids,
             top_k,
+            debug_layer=layer,
+            debug_label="standard",
         )
+        _npu_moe_probe_tensor(output, "standard-output-before-combine", layer)
         return StandardCombineInput(hidden_states=output)
 
 
@@ -182,6 +378,8 @@ def npu_fused_experts_w4a4_mxfp(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    debug_layer: Optional[torch.nn.Module] = None,
+    debug_label: str = "standard",
     **kwargs,
 ):
     if torch.npu.is_current_stream_capturing():
@@ -236,8 +434,14 @@ def npu_fused_experts_w4a4_mxfp(
         group_list_type=0,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_layer=debug_layer,
+        debug_label=f"{debug_label}-w13-gmm",
     )
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w13-gmm", debug_layer)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-swiglu", debug_layer)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
@@ -246,7 +450,11 @@ def npu_fused_experts_w4a4_mxfp(
         group_list_type=0,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_layer=debug_layer,
+        debug_label=f"{debug_label}-w2-gmm",
     )
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w2-gmm", debug_layer)
 
     hidden_states = hidden_states * valid_mask_2d.to(hidden_states.dtype)
 
@@ -262,6 +470,8 @@ def npu_fused_experts_w4a4_mxfp(
 
     if len(original_shape) == 3:
         final_hidden_states = final_hidden_states.view(original_shape)
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(final_hidden_states, f"{debug_label}-finalize", debug_layer)
     return final_hidden_states
 
 
@@ -304,6 +514,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list_type=group_list_type,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_label="decode-w13-gmm",
     )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a4_mxfp_gmm_npu(
@@ -314,6 +525,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list_type=group_list_type,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_label="decode-w2-gmm",
     )
 
     final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
@@ -358,6 +570,14 @@ def npu_apply_w4a4_mxfp_moe_deepep(
         group_list = group_list.to(torch.int64)
         combine_cls = DeepEPLLCombineInput
 
+    _npu_moe_probe_tensor(hidden_states, "deepep-dispatch-hidden", layer)
+    _npu_moe_probe_tensor(hidden_states_scale, "deepep-dispatch-scale", layer)
+    _npu_moe_probe_tensor(dispatch_output.topk_ids, "deepep-dispatch-topk-ids", layer)
+    _npu_moe_probe_tensor(
+        dispatch_output.topk_weights, "deepep-dispatch-topk-weights", layer
+    )
+    _npu_moe_probe_group_list(group_list, "deepep-group-list", layer)
+
     hidden_states = npu_apply_without_routing_weights_w4a4_mxfp(
         layer,
         hidden_states,
@@ -365,7 +585,10 @@ def npu_apply_w4a4_mxfp_moe_deepep(
         group_list_type,
         group_list,
         output_dtype,
+        debug_label="deepep",
     )
+    _npu_moe_probe_tensor(hidden_states, "deepep-output-before-combine", layer)
+    _npu_moe_register_post_combine_probe(layer, "deepep-after-dispatcher-combine")
     return combine_cls(
         hidden_states=hidden_states,
         topk_ids=dispatch_output.topk_ids,
@@ -380,7 +603,11 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
     group_list_type,
     group_list,
     output_dtype,
+    debug_label="moe",
 ):
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-input", layer)
+    _npu_moe_probe_tensor(hidden_states_scale, f"{debug_label}-input-scale", layer)
+    _npu_moe_probe_group_list(group_list, f"{debug_label}-group-list", layer)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=hidden_states_scale,
@@ -389,8 +616,12 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list_type=group_list_type,
         group_list=group_list,
         output_dtype=output_dtype,
+        debug_layer=layer,
+        debug_label=f"{debug_label}-w13-gmm",
     )
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w13-gmm", layer)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-swiglu", layer)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
@@ -399,7 +630,10 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list_type=group_list_type,
         group_list=group_list,
         output_dtype=output_dtype,
+        debug_layer=layer,
+        debug_label=f"{debug_label}-w2-gmm",
     )
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w2-gmm", layer)
     return hidden_states
 
 
@@ -411,9 +645,13 @@ def w4a4_mxfp_gmm_npu(
     group_list_type: int,
     group_list: torch.Tensor,
     output_dtype=torch.bfloat16,
+    debug_layer: Optional[torch.nn.Module] = None,
+    debug_label: str = "gmm",
 ) -> torch.Tensor:
     group_list = group_list.to(torch.int64)
     if input_scale is None:
+        if debug_layer is not None:
+            _npu_moe_probe_tensor(input, f"{debug_label}-quant-input", debug_layer)
         x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
             input,
             axis=1,
@@ -422,10 +660,15 @@ def w4a4_mxfp_gmm_npu(
             block_size=MXFP4_BLOCK_SIZE,
             scale_alg=None,
         )
+        if debug_layer is not None:
+            _npu_moe_probe_tensor(x_scale, f"{debug_label}-dynamic-scale", debug_layer)
     else:
         x, x_scale = input, input_scale
+        if debug_layer is not None:
+            _npu_moe_probe_tensor(x, f"{debug_label}-prequant-input", debug_layer)
+            _npu_moe_probe_tensor(x_scale, f"{debug_label}-prequant-scale", debug_layer)
 
-    return torch.ops.npu.npu_grouped_matmul(
+    output = torch.ops.npu.npu_grouped_matmul(
         [x],
         [weight],
         scale=[weight_scale],
@@ -440,6 +683,9 @@ def w4a4_mxfp_gmm_npu(
         weight_dtype=torch_npu.float4_e2m1fn_x2,
         per_token_scale_dtype=torch_npu.float8_e8m0fnu,
     )[0]
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(output, f"{debug_label}-output", debug_layer)
+    return output
 
 
 def npu_fused_experts_w4a4(
