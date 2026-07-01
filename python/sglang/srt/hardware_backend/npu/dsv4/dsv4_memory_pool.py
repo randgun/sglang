@@ -42,9 +42,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 _A5_KV_QUANT_GROUP_SIZE = 64
+_A5_KV_COMPRESS_QUANT_MODE_DEFAULT = 1
+_A5_KV_COMPRESS_QUANT_MODE_ENV = "SGLANG_DSV4_NPU_KV_COMPRESS_QUANT_MODE"
 _FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 
@@ -58,6 +60,12 @@ def _debug_sync_npu(label: str) -> None:
     except Exception:
         return
     torch.npu.synchronize()
+
+
+def _a5_kv_compress_quant_mode() -> int:
+    return get_int_env_var(
+        _A5_KV_COMPRESS_QUANT_MODE_ENV, _A5_KV_COMPRESS_QUANT_MODE_DEFAULT
+    )
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
@@ -553,7 +561,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             cache_2d,
             slot_mapping,
             quant_group_size=_A5_KV_QUANT_GROUP_SIZE,
-            quant_mode=2,
+            quant_mode=_a5_kv_compress_quant_mode(),
             round_scale_flag=True,
         )
         _debug_sync_npu(f"kv_compress_epilog buf_shape={tuple(buf.shape)}")
