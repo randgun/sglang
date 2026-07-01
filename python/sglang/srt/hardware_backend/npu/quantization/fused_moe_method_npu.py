@@ -23,6 +23,7 @@ MXFP4_BLOCK_SIZE = 32
 _DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
 _DEBUG_MOE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE"
 _DEBUG_MOE_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_LAYER"
+_DEBUG_MOE_POST_COMBINE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_POST_COMBINE"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _debug_log_counts: dict[str, int] = {}
@@ -51,6 +52,15 @@ def _npu_moe_full_stats(layer: torch.nn.Module) -> bool:
 
 
 def _npu_moe_is_stream_capturing() -> bool:
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return True
+    except Exception:
+        pass
     try:
         return bool(torch.npu.is_current_stream_capturing())
     except Exception:
@@ -181,7 +191,12 @@ def _npu_moe_register_post_combine_probe(
     layer: torch.nn.Module,
     label: str,
 ) -> None:
-    if not _npu_moe_debug_enabled() or not _npu_moe_should_probe_layer(layer):
+    if (
+        not _npu_moe_debug_enabled()
+        or not get_bool_env_var(_DEBUG_MOE_POST_COMBINE_ENV)
+        or not _npu_moe_should_probe_layer(layer)
+        or _npu_moe_is_stream_capturing()
+    ):
         return
     dispatcher = getattr(layer, "dispatcher", None)
     if dispatcher is None or not hasattr(dispatcher, "register_post_combine_hook"):
