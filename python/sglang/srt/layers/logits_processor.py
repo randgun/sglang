@@ -53,7 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     get_bool_env_var,

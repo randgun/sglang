@@ -97,10 +97,8 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.runner import (
-    compile_in_capture_mode,
-    get_is_capture_mode,
-)
+from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
