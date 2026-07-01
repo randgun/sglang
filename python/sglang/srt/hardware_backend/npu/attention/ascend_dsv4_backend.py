@@ -33,6 +33,9 @@ _DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _DEBUG_TOPK_SAMPLE_COLS_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK_SAMPLE_COLS"
+_DEBUG_CACHE_META_ENV = "SGLANG_DSV4_NPU_DEBUG_CACHE_META"
+_DEBUG_REF_ATTN_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN"
+_DEBUG_REF_ATTN_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN_LAYER"
 _debug_log_counts: dict[str, int] = {}
 
 
@@ -175,6 +178,120 @@ def _debug_probe_attention_tensor(
         _debug_log_limited(
             f"tensor-probe-error-{path}-{label}",
             f"DSV4 NPU attention tensor probe failed for {path}/{label}: {exc}",
+        )
+
+
+def _debug_tensor_sample(tensor: Optional[torch.Tensor], limit: int = 16):
+    if tensor is None:
+        return None
+    if _is_npu_stream_capturing():
+        return "<capturing>"
+    try:
+        flat = tensor.detach().reshape(-1)[:limit]
+        return flat.cpu().tolist()
+    except Exception as exc:
+        return f"<sample failed: {exc}>"
+
+
+def _debug_probe_cache_metadata(
+    *,
+    forward_batch: ForwardBatch,
+    fm,
+    pool,
+    ori_kv: torch.Tensor,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_CACHE_META_ENV):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        out_cache_loc = forward_batch.out_cache_loc
+        swa_loc = pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int64)
+        page_size = int(ori_kv.shape[1])
+        swa_pages = swa_loc // page_size
+        swa_offsets = swa_loc % page_size
+        page_table = getattr(fm, "swa_page_table", None)
+        seq_lens = getattr(fm, "actual_seq_lengths_kv", None)
+        _debug_log_limited(
+            f"cache-meta-{path}-{layer_id}-{compress_ratio}",
+            "DSV4 NPU cache metadata: "
+            f"path={path}, layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"page_size={page_size}, out_cache_loc={_debug_tensor_sample(out_cache_loc)}, "
+            f"swa_loc={_debug_tensor_sample(swa_loc)}, "
+            f"swa_pages={_debug_tensor_sample(swa_pages)}, "
+            f"swa_offsets={_debug_tensor_sample(swa_offsets)}, "
+            f"actual_seq_lengths_kv={_debug_tensor_sample(seq_lens)}, "
+            f"swa_page_table_row0={_debug_tensor_sample(page_table[0] if page_table is not None and page_table.shape[0] > 0 else None)}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"cache-meta-error-{path}-{layer_id}-{compress_ratio}",
+            "DSV4 NPU cache metadata probe failed: "
+            f"path={path}, layer_id={layer_id}, compress_ratio={compress_ratio}, exc={exc}",
+        )
+
+
+def _debug_probe_dense_reference_attention(
+    *,
+    q: torch.Tensor,
+    kv: Optional[torch.Tensor],
+    layer: RadixAttention,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_REF_ATTN_ENV):
+        return
+    if layer.layer_id != get_int_env_var(_DEBUG_REF_ATTN_LAYER_ENV, 0):
+        return
+    if _is_npu_stream_capturing():
+        return
+    if kv is None:
+        _debug_log_limited(
+            f"ref-attn-missing-{path}-{layer.layer_id}-{compress_ratio}",
+            "DSV4 NPU reference attention skipped: missing saved BF16 KV "
+            f"for path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}",
+        )
+        return
+    try:
+        kv_2d = kv.reshape(-1, kv.shape[-1])
+        if q.shape[0] != kv_2d.shape[0] or q.shape[0] > 128:
+            _debug_log_limited(
+                f"ref-attn-shape-{path}-{layer.layer_id}-{compress_ratio}",
+                "DSV4 NPU reference attention skipped: "
+                f"path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}, "
+                f"q_shape={tuple(q.shape)}, kv_shape={tuple(kv.shape)}",
+            )
+            return
+        q_f = q.to(torch.float32)
+        kv_f = kv_2d.to(torch.float32)
+        scores = torch.einsum("thd,sd->ths", q_f, kv_f) * layer.scaling
+        causal = torch.triu(
+            torch.ones(
+                q.shape[0],
+                q.shape[0],
+                dtype=torch.bool,
+                device=q.device,
+            ),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal.unsqueeze(1), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        ref = torch.einsum("ths,sd->thd", probs, kv_f).to(q.dtype)
+        _debug_probe_attention_tensor(
+            ref,
+            "dense-ref-out",
+            layer_id=layer.layer_id,
+            path=path,
+            compress_ratio=compress_ratio,
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"ref-attn-error-{path}-{layer.layer_id}-{compress_ratio}",
+            "DSV4 NPU reference attention probe failed: "
+            f"path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}, exc={exc}",
         )
 
 
@@ -1639,6 +1756,15 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+        _debug_probe_cache_metadata(
+            forward_batch=forward_batch,
+            fm=fm,
+            pool=pool,
+            ori_kv=ori_kv,
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
         _debug_probe_attention_tensor(
             q, "dense-q", layer_id=layer.layer_id, path="dense", compress_ratio=1
         )
@@ -1696,6 +1822,13 @@ class DeepseekV4AscendAttnBackend(
         out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
         out = _a5_from_rope_first_out(out)
         _debug_sync_npu(f"dense attention layer_id={layer.layer_id}")
+        _debug_probe_dense_reference_attention(
+            q=q,
+            kv=getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id),
+            layer=layer,
+            path="dense",
+            compress_ratio=1,
+        )
         _debug_probe_attention_tensor(
             out,
             "dense-out",
@@ -1790,6 +1923,10 @@ class DeepseekV4AscendAttnBackend(
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
         swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        if get_bool_env_var(_DEBUG_REF_ATTN_ENV):
+            if not hasattr(self, "_debug_last_swa_kv_by_layer"):
+                self._debug_last_swa_kv_by_layer = {}
+            self._debug_last_swa_kv_by_layer[layer_id] = swa_k.detach()
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,
