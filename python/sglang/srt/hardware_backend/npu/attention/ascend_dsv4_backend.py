@@ -32,6 +32,7 @@ _DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
 _DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_DEBUG_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_LAYER"
 _DEBUG_TOPK_SAMPLE_COLS_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK_SAMPLE_COLS"
 _DEBUG_CACHE_META_ENV = "SGLANG_DSV4_NPU_DEBUG_CACHE_META"
 _DEBUG_REF_ATTN_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN"
@@ -79,6 +80,11 @@ def _debug_log_limited(key: str, message: str) -> None:
     logger.warning(message)
 
 
+def _debug_should_probe_layer(layer_id: int) -> bool:
+    target_layer = get_int_env_var(_DEBUG_LAYER_ENV, -1)
+    return target_layer < 0 or layer_id == target_layer
+
+
 def _debug_sync_npu(label: str) -> None:
     if not get_bool_env_var(_DEBUG_SYNC_ENV):
         return
@@ -99,6 +105,8 @@ def _debug_probe_attention_output(
     compress_ratio: int,
 ) -> bool:
     if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return False
+    if not _debug_should_probe_layer(layer_id):
         return False
     if _is_npu_stream_capturing():
         return False
@@ -142,6 +150,8 @@ def _debug_probe_attention_tensor(
     compress_ratio: int,
 ) -> None:
     if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return
+    if not _debug_should_probe_layer(layer_id):
         return
     if _is_npu_stream_capturing():
         return
@@ -192,6 +202,8 @@ def _debug_probe_invalid_tensor(
     compress_ratio: int,
 ) -> bool:
     if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return False
+    if not _debug_should_probe_layer(layer_id):
         return False
     if _is_npu_stream_capturing():
         return False
@@ -260,6 +272,8 @@ def _debug_probe_cache_metadata(
     compress_ratio: int,
 ) -> None:
     if not get_bool_env_var(_DEBUG_CACHE_META_ENV):
+        return
+    if not _debug_should_probe_layer(layer_id):
         return
     if _is_npu_stream_capturing():
         return
@@ -345,6 +359,8 @@ def _debug_probe_active_compressed_rows(
     compress_ratio: int,
 ) -> None:
     if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return
+    if not _debug_should_probe_layer(layer_id):
         return
     if topk is None or topk.numel() == 0 or cmp_block_table.numel() == 0:
         return
@@ -477,6 +493,8 @@ def _debug_log_c4_topk(
     index_topk: int,
 ) -> None:
     if not get_bool_env_var(_DEBUG_TOPK_ENV):
+        return
+    if not _debug_should_probe_layer(layer_id):
         return
     if _is_npu_stream_capturing():
         return
