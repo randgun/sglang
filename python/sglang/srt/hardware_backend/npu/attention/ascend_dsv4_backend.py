@@ -421,14 +421,56 @@ def _debug_probe_active_compressed_rows(
             )
             if is_fp8_cache:
                 # Indexing DT_FLOAT8_E4M3FN tensors is not supported by the NPU
-                # index kernel. Gather bytes first, then reinterpret the tiny
-                # sample on CPU for decoded-value stats.
-                decoded_active_rows = (
-                    active_rows.detach().cpu().view(cmp_kv.dtype).to(torch.float32)
+                # index kernel. Gather bytes first, then decode the tiny sample
+                # on CPU according to the packed A5 row layout:
+                # rope bf16 bytes, nope fp8 bytes, E8M0 scale bytes, padding.
+                active_rows_cpu = active_rows.detach().cpu().contiguous()
+                rope_bytes = _A5_KV_ROPE_HEAD_DIM * 2
+                nope_dim = 512 - _A5_KV_ROPE_HEAD_DIM
+                scale_bytes = math.ceil(nope_dim / 128)
+                decoded_rope = (
+                    active_rows_cpu[:, :rope_bytes]
+                    .contiguous()
+                    .view(torch.bfloat16)
+                    .to(torch.float32)
+                )
+                decoded_nope = (
+                    active_rows_cpu[:, rope_bytes : rope_bytes + nope_dim]
+                    .contiguous()
+                    .view(cmp_kv.dtype)
+                    .to(torch.float32)
+                )
+                scale_raw = active_rows_cpu[
+                    :,
+                    rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes,
+                ].to(torch.float32)
+                padding_raw = active_rows_cpu[
+                    :, rope_bytes + nope_dim + scale_bytes :
+                ].to(torch.float32)
+                _debug_probe_attention_tensor(
+                    decoded_rope,
+                    "compressed-active-cmp-rope-bf16-decoded",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
                 )
                 _debug_probe_attention_tensor(
-                    decoded_active_rows,
-                    "compressed-active-cmp-rows-decoded",
+                    decoded_nope,
+                    "compressed-active-cmp-nope-fp8-decoded",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+                _debug_probe_attention_tensor(
+                    scale_raw,
+                    "compressed-active-cmp-scale-e8m0-bytes",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+                _debug_probe_attention_tensor(
+                    padding_raw,
+                    "compressed-active-cmp-padding-bytes",
                     layer_id=layer_id,
                     path="compressed",
                     compress_ratio=compress_ratio,
