@@ -392,9 +392,11 @@ def _debug_probe_active_compressed_rows(
             or cmp_kv.dtype == getattr(torch, "float8_e4m3fnuz", None)
         ):
             flat_kv = cmp_kv.view(torch.uint8).view(-1, cmp_kv.shape[-1])
+            flat_decoded_kv = cmp_kv.flatten(0, 2)
             active_label = "compressed-active-cmp-row-bytes"
         else:
             flat_kv = cmp_kv.flatten(0, 1)
+            flat_decoded_kv = flat_kv
             active_label = "compressed-active-cmp-rows"
         in_cache = (pages >= 0) & (active_locs >= 0) & (active_locs < flat_kv.shape[0])
         _debug_log_limited(
@@ -408,7 +410,8 @@ def _debug_probe_active_compressed_rows(
             f"in_cache={in_cache.detach().cpu().tolist()}",
         )
         if bool(in_cache.any().item()):
-            active_rows = flat_kv[active_locs[in_cache]]
+            active_locs_in_cache = active_locs[in_cache]
+            active_rows = flat_kv[active_locs_in_cache]
             _debug_probe_attention_tensor(
                 active_rows,
                 active_label,
@@ -416,6 +419,14 @@ def _debug_probe_active_compressed_rows(
                 path="compressed",
                 compress_ratio=compress_ratio,
             )
+            if flat_decoded_kv is not flat_kv:
+                _debug_probe_attention_tensor(
+                    flat_decoded_kv[active_locs_in_cache],
+                    "compressed-active-cmp-rows-decoded",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
     except Exception as exc:
         _debug_log_limited(
             f"active-cmp-error-{layer_id}-{compress_ratio}",
