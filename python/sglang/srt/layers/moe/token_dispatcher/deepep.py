@@ -64,8 +64,60 @@ import torch
 import torch.distributed as dist
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_NPU_SANITIZE_DEEPEP_COMBINE_ENV = "SGLANG_DSV4_NPU_SANITIZE_DEEPEP_COMBINE"
+_NPU_DEBUG_MOE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE"
+_npu_deepep_debug_log_counts: dict[str, int] = {}
 
 logger = logging.getLogger(__name__)
+
+
+def _npu_deepep_log_limited(key: str, message: str, max_prints: int = 20) -> None:
+    count = _npu_deepep_debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _npu_deepep_debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _npu_sanitize_deepep_topk(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _is_npu:
+        return topk_ids, topk_weights
+
+    valid_ids = (topk_ids >= 0) & (topk_ids < num_experts)
+    finite_weights = torch.isfinite(topk_weights)
+    valid = valid_ids & finite_weights
+    topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
+    topk_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
+    return topk_ids, topk_weights
+
+
+def _npu_debug_deepep_combine_output(tensor: torch.Tensor, label: str) -> torch.Tensor:
+    if not _is_npu:
+        return tensor
+
+    sanitize = get_bool_env_var(_NPU_SANITIZE_DEEPEP_COMBINE_ENV)
+    debug = sanitize or get_bool_env_var(_NPU_DEBUG_MOE_ENV)
+    if not debug:
+        return tensor
+
+    finite = torch.isfinite(tensor)
+    invalid_count = int((~finite).sum().item())
+    if invalid_count == 0:
+        return tensor
+
+    _npu_deepep_log_limited(
+        f"{label}-invalid",
+        "DSV4 NPU DeepEP combine output contains invalid values: "
+        f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+        f"invalid_count={invalid_count}, sanitize={sanitize}",
+    )
+    if sanitize:
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+    return tensor
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -482,6 +534,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
+        topk_ids, topk_weights = _npu_sanitize_deepep_topk(
+            topk_ids, topk_weights, self.num_experts
+        )
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -611,6 +666,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
             config=DeepEPConfig.get_instance().normal_combine_config,
+        )
+        combined_x = _npu_debug_deepep_combine_output(
+            combined_x, "normal-combine"
         )
         return combined_x, event
 
