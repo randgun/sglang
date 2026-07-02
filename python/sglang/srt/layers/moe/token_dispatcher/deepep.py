@@ -65,6 +65,7 @@ import torch.distributed as dist
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _NPU_SANITIZE_DEEPEP_COMBINE_ENV = "SGLANG_DSV4_NPU_SANITIZE_DEEPEP_COMBINE"
+_NPU_SANITIZE_DEEPEP_TOPK_ENV = "SGLANG_DSV4_NPU_SANITIZE_DEEPEP_TOPK"
 _NPU_DEBUG_MOE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE"
 _npu_deepep_debug_log_counts: dict[str, int] = {}
 
@@ -79,24 +80,46 @@ def _npu_deepep_log_limited(key: str, message: str, max_prints: int = 20) -> Non
     logger.warning(message)
 
 
+def _npu_deepep_is_capture_mode() -> bool:
+    if not _is_npu:
+        return False
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 def _npu_sanitize_deepep_topk(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not _is_npu:
+    if (
+        not _is_npu
+        or not get_bool_env_var(_NPU_SANITIZE_DEEPEP_TOPK_ENV)
+        or _npu_deepep_is_capture_mode()
+    ):
         return topk_ids, topk_weights
 
     valid_ids = (topk_ids >= 0) & (topk_ids < num_experts)
     finite_weights = torch.isfinite(topk_weights)
     valid = valid_ids & finite_weights
-    topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
+    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
     topk_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
     return topk_ids, topk_weights
 
 
 def _npu_debug_deepep_combine_output(tensor: torch.Tensor, label: str) -> torch.Tensor:
-    if not _is_npu:
+    if not _is_npu or _npu_deepep_is_capture_mode():
         return tensor
 
     sanitize = get_bool_env_var(_NPU_SANITIZE_DEEPEP_COMBINE_ENV)

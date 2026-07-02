@@ -58,6 +58,15 @@ def _debug_sync_npu(label: str) -> None:
     if not get_bool_env_var(_DEBUG_SYNC_ENV):
         return
     try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return
+    except Exception:
+        pass
+    try:
         if torch.npu.is_current_stream_capturing():
             return
     except Exception:
