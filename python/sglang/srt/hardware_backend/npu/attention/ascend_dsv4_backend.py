@@ -392,11 +392,11 @@ def _debug_probe_active_compressed_rows(
             or cmp_kv.dtype == getattr(torch, "float8_e4m3fnuz", None)
         ):
             flat_kv = cmp_kv.view(torch.uint8).view(-1, cmp_kv.shape[-1])
-            flat_decoded_kv = cmp_kv.flatten(0, 2)
+            is_fp8_cache = True
             active_label = "compressed-active-cmp-row-bytes"
         else:
             flat_kv = cmp_kv.flatten(0, 1)
-            flat_decoded_kv = flat_kv
+            is_fp8_cache = False
             active_label = "compressed-active-cmp-rows"
         in_cache = (pages >= 0) & (active_locs >= 0) & (active_locs < flat_kv.shape[0])
         _debug_log_limited(
@@ -419,9 +419,15 @@ def _debug_probe_active_compressed_rows(
                 path="compressed",
                 compress_ratio=compress_ratio,
             )
-            if flat_decoded_kv is not flat_kv:
+            if is_fp8_cache:
+                # Indexing DT_FLOAT8_E4M3FN tensors is not supported by the NPU
+                # index kernel. Gather bytes first, then reinterpret the tiny
+                # sample on CPU for decoded-value stats.
+                decoded_active_rows = (
+                    active_rows.detach().cpu().view(cmp_kv.dtype).to(torch.float32)
+                )
                 _debug_probe_attention_tensor(
-                    flat_decoded_kv[active_locs_in_cache],
+                    decoded_active_rows,
                     "compressed-active-cmp-rows-decoded",
                     layer_id=layer_id,
                     path="compressed",
