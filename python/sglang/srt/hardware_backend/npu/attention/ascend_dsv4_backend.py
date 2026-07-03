@@ -37,6 +37,7 @@ _DEBUG_TOPK_SAMPLE_COLS_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK_SAMPLE_COLS"
 _DEBUG_CACHE_META_ENV = "SGLANG_DSV4_NPU_DEBUG_CACHE_META"
 _DEBUG_REF_ATTN_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN"
 _DEBUG_REF_ATTN_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN_LAYER"
+_FUSED_COMPRESSOR_ENV = "SGLANG_DSV4_NPU_FUSED_COMPRESSOR"
 _debug_log_counts: dict[str, int] = {}
 
 
@@ -888,7 +889,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        if not forward_batch.forward_mode.is_decode():
+        if not forward_batch.forward_mode.is_decode() or not get_bool_env_var(
+            _FUSED_COMPRESSOR_ENV, "true"
+        ):
             return self._forward_compress_native(compressor, x, forward_batch)
 
         from sglang.srt.layers.deepseek_v4_rope import (
@@ -919,6 +922,27 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         state_cache = pool.get_state_cache(
             compressor.layer_id, compressor.is_in_indexer
         )
+        if get_bool_env_var(_DEBUG_CACHE_META_ENV) and not _is_npu_stream_capturing():
+            try:
+                loc = getattr(fm, f"c{ratio}_loc", None)
+                state_loc = getattr(fm, f"c{ratio}_state_loc", None)
+                _debug_log_limited(
+                    f"fused-compressor-meta-{compressor.layer_id}-{ratio}",
+                    "DSV4 NPU fused compressor metadata: "
+                    f"layer_id={compressor.layer_id}, ratio={ratio}, "
+                    f"x_shape={tuple(x.shape)}, positions_cmp={_debug_tensor_sample(positions_cmp)}, "
+                    f"loc={_debug_tensor_sample(loc)}, state_loc={_debug_tensor_sample(state_loc)}, "
+                    f"start_pos={_debug_tensor_sample(start_pos)}, seqused={_debug_tensor_sample(seqused)}, "
+                    f"cu_seqlens={_debug_tensor_sample(cu_seqlens)}, "
+                    f"page_table_shape={tuple(page_table.shape)}, "
+                    f"page_table_row0={_debug_tensor_sample(page_table[0] if page_table.numel() > 0 else None)}",
+                )
+            except Exception as exc:
+                _debug_log_limited(
+                    f"fused-compressor-meta-error-{compressor.layer_id}-{ratio}",
+                    "DSV4 NPU fused compressor metadata probe failed: "
+                    f"layer_id={compressor.layer_id}, ratio={ratio}, exc={exc}",
+                )
 
         cos, sin = get_fused_compressor_rope_cos_sin(
             compressor.freqs_cis, positions_cmp, dtype=torch.float32
@@ -944,6 +968,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             rotary_mode=2,
             cache_mode=1,
         )
+        _debug_probe_attention_tensor(
+            cmp_kv,
+            "fused-compressor-out",
+            layer_id=compressor.layer_id,
+            path=f"compressor-r{ratio}",
+            compress_ratio=ratio,
+        )
 
         # prefill output may be padded; trim to loc length
         loc = getattr(fm, f"c{ratio}_loc", None)
@@ -953,6 +984,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if self.graph_mode or cmp_kv.shape[0] > 0:
             if compressor.rotate:
                 cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
+                _debug_probe_attention_tensor(
+                    cmp_kv,
+                    "fused-compressor-after-hadamard",
+                    layer_id=compressor.layer_id,
+                    path=f"compressor-r{ratio}",
+                    compress_ratio=ratio,
+                )
             self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
 
     def _forward_compress_native(
