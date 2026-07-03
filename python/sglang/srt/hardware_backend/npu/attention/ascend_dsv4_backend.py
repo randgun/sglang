@@ -1016,8 +1016,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         device = x.device
         self._ensure_compressor_hadamard(compressor, device)
         dtype = x.dtype
-        probe_path = f"compressor-native-r{ratio}"
-        _debug_probe_invalid_tensor(
+        probe_kind = "indexer" if compressor.is_in_indexer else "attn"
+        probe_path = f"compressor-native-r{ratio}-{probe_kind}"
+        _debug_probe_attention_tensor(
             x,
             "compressor-input-x",
             layer_id=compressor.layer_id,
@@ -1029,16 +1030,30 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         # (kv concatenated before wgate); split along the output dim to recover each.
         coff = 1 + int(overlap)
         W = compressor.wkv_gate.weight.float()
+        _debug_probe_attention_tensor(
+            W[: coff * d],
+            "compressor-weight-kv",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
+        _debug_probe_attention_tensor(
+            W[coff * d :],
+            "compressor-weight-score",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
         kv_full = F.linear(x_f32, W[: coff * d])  # [T, coff*d]
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
-        _debug_probe_invalid_tensor(
+        _debug_probe_attention_tensor(
             kv_full,
             "compressor-kv-full",
             layer_id=compressor.layer_id,
             path=probe_path,
             compress_ratio=ratio,
         )
-        _debug_probe_invalid_tensor(
+        _debug_probe_attention_tensor(
             score_full,
             "compressor-score-full",
             layer_id=compressor.layer_id,
@@ -1210,6 +1225,20 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     state_loc_decode = backend_fm.c4_state_loc
                 else:
                     state_loc_decode = backend_fm.c128_state_loc
+                _debug_probe_attention_tensor(
+                    kv,
+                    "compressor-decode-write-kv",
+                    layer_id=compressor.layer_id,
+                    path=probe_path,
+                    compress_ratio=ratio,
+                )
+                _debug_probe_attention_tensor(
+                    score,
+                    "compressor-decode-write-score",
+                    layer_id=compressor.layer_id,
+                    path=probe_path,
+                    compress_ratio=ratio,
+                )
                 token_to_kv_pool.set_state_buffer(
                     compressor.layer_id,
                     state_loc_decode[idx : idx + 1],
@@ -1344,6 +1373,20 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             kv_state_cat = torch.cat(kv_state_to_be_cached, dim=0).unsqueeze(1)
             score_state_cat = torch.cat(score_state_to_be_cached, dim=0).unsqueeze(1)
             state_loc_cat = torch.cat(state_loc_list, dim=0)
+            _debug_probe_attention_tensor(
+                kv_state_cat,
+                "compressor-state-write-kv",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
+            _debug_probe_attention_tensor(
+                score_state_cat,
+                "compressor-state-write-score",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             token_to_kv_pool.set_state_buffer(
                 compressor.layer_id,
                 state_loc_cat,
