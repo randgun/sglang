@@ -1225,6 +1225,33 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         kv_state, score_state = token_to_kv_pool.get_state_buffer(
                             compressor.layer_id, compressor.is_in_indexer, kv_indices
                         )
+                        if get_bool_env_var(
+                            _DEBUG_NAN_ENV
+                        ) and _debug_should_probe_layer(compressor.layer_id):
+                            _debug_log_limited(
+                                f"compressor-native-window-{compressor.layer_id}-{ratio}-{compressor.is_in_indexer}",
+                                "DSV4 NPU compressor decode window: "
+                                f"layer_id={compressor.layer_id}, ratio={ratio}, "
+                                f"from_indexer={compressor.is_in_indexer}, seqlen={seqlen}, "
+                                f"state_loc={_debug_tensor_sample(state_loc_decode[idx : idx + 1])}, "
+                                f"kv_indices={_debug_tensor_sample(kv_indices)}, "
+                                f"page_table_shape={tuple(page_table.shape)}, "
+                                f"page_table_row0={_debug_tensor_sample(page_table[0] if page_table.numel() > 0 else None)}",
+                            )
+                            _debug_probe_attention_tensor(
+                                kv_state,
+                                "compressor-decode-kv-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
+                            _debug_probe_attention_tensor(
+                                score_state,
+                                "compressor-decode-score-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
                         # kv_state / score_state: [2*r, 1, coff*d] → [2*r, d]
                         kv_state = kv_state.squeeze(1)
                         score_state = score_state.squeeze(1)
@@ -1235,9 +1262,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                             [score_state[:ratio, :d], score_state[ratio:, d:]],
                             dim=0,
                         )
-                        kv_compressed = (kv_state * score_state.softmax(dim=0)).sum(
-                            dim=0, keepdim=True
-                        )
                     else:
                         kv_indices = _get_kv_indices(
                             forward_batch, ratio, page_table, idx, seqlen
@@ -1245,9 +1269,58 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         kv_state, score_state = token_to_kv_pool.get_state_buffer(
                             compressor.layer_id, compressor.is_in_indexer, kv_indices
                         )
-                        kv_compressed = (
-                            kv_state[:, 0] * score_state[:, 0].softmax(dim=0)
-                        ).sum(dim=0, keepdim=True)
+                        if get_bool_env_var(
+                            _DEBUG_NAN_ENV
+                        ) and _debug_should_probe_layer(compressor.layer_id):
+                            _debug_log_limited(
+                                f"compressor-native-window-{compressor.layer_id}-{ratio}-{compressor.is_in_indexer}",
+                                "DSV4 NPU compressor decode window: "
+                                f"layer_id={compressor.layer_id}, ratio={ratio}, "
+                                f"from_indexer={compressor.is_in_indexer}, seqlen={seqlen}, "
+                                f"state_loc={_debug_tensor_sample(state_loc_decode[idx : idx + 1])}, "
+                                f"kv_indices={_debug_tensor_sample(kv_indices)}, "
+                                f"page_table_shape={tuple(page_table.shape)}, "
+                                f"page_table_row0={_debug_tensor_sample(page_table[0] if page_table.numel() > 0 else None)}",
+                            )
+                            _debug_probe_attention_tensor(
+                                kv_state,
+                                "compressor-decode-kv-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
+                            _debug_probe_attention_tensor(
+                                score_state,
+                                "compressor-decode-score-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
+                        kv_state = kv_state[:, 0]
+                        score_state = score_state[:, 0]
+                    _debug_probe_attention_tensor(
+                        kv_state,
+                        "compressor-decode-kv-state-window",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
+                    _debug_probe_attention_tensor(
+                        score_state,
+                        "compressor-decode-score-state-window",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
+                    score_weight = score_state.softmax(dim=0)
+                    _debug_probe_attention_tensor(
+                        score_weight,
+                        "compressor-decode-score-softmax",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
+                    kv_compressed = (kv_state * score_weight).sum(dim=0, keepdim=True)
                     _debug_probe_invalid_tensor(
                         kv_compressed,
                         "compressor-decode-kv-compressed",

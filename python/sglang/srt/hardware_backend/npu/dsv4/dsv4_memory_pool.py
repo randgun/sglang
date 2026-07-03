@@ -663,8 +663,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         kv_score = self._get_state_pool(layer_id, from_indexer).kv_score_buffer.kv_score
         last_dim = kv_score.shape[-1]
         half = last_dim // 2
+        loc = loc.reshape(-1).to(torch.int64)
+        if loc.numel() == 0:
+            return
         kv_view = kv.reshape(-1, half).to(kv_score.dtype)
         score_view = score.reshape(-1, half).to(kv_score.dtype)
+        if kv_view.shape[0] != loc.shape[0]:
+            raise RuntimeError(
+                "DSV4 NPU state cache write expects one slot per token, got "
+                f"{kv_view.shape[0]} rows and {loc.shape[0]} slots."
+            )
+        loc = loc.clamp_min(0)
         kv_score[loc, :half] = kv_view
         kv_score[loc, half:] = score_view
 
@@ -676,6 +685,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         kv_score = self._get_state_pool(layer_id, from_indexer).kv_score_buffer.kv_score
         if kv_indices is not None:
+            kv_indices = kv_indices.to(torch.int64)
             kv_score = kv_score[kv_indices]
         last_dim = kv_score.shape[-1]
         half = last_dim // 2
