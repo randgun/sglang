@@ -81,7 +81,7 @@ def _a5_kv_compress_quant_mode() -> int:
 
 
 def _a5_kv_round_scale_flag() -> bool:
-    return get_bool_env_var(_A5_KV_ROUND_SCALE_ENV, True)
+    return get_bool_env_var(_A5_KV_ROUND_SCALE_ENV, "true")
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
