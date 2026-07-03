@@ -236,10 +236,12 @@ class NPUCompressStatePool(CompressStatePool):
             dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
 
-        # Block 0 = kernel skip-sentinel: kv zeroed, score -inf (softmax → 0).
-        # The free list excludes it; only stale state_block_table entries land here.
-        self.kv_score_buffer.kv[:page_size].zero_()
-        self.kv_score_buffer.score[:page_size].fill_(float("-inf"))
+        # Use neutral defaults for every row, not only the block-0 sentinel.
+        # State pages are allocated lazily and can be read before every row has
+        # been populated in overlap windows; zero kv + -inf score makes unwritten
+        # rows contribute zero instead of stale allocator contents.
+        self.kv_score_buffer.kv.zero_()
+        self.kv_score_buffer.score.fill_(float("-inf"))
 
 
 class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
@@ -674,8 +676,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 f"{kv_view.shape[0]} rows and {loc.shape[0]} slots."
             )
         loc = loc.clamp_min(0)
-        kv_score[loc, :half] = kv_view
-        kv_score[loc, half:] = score_view
+        row = torch.cat((kv_view, score_view), dim=-1).contiguous()
+        # Updating the two halves separately with advanced indexing can leave
+        # stale values in the NPU state cache. Scatter the full [kv|score] row in
+        # one op so decode overlap windows never mix fresh score with stale kv.
+        torch_npu.npu_scatter_nd_update_(kv_score, loc.unsqueeze(-1), row)
 
     def get_state_buffer(
         self,
