@@ -427,7 +427,7 @@ def _debug_probe_active_compressed_rows(
                 active_rows_cpu = active_rows.detach().cpu().contiguous()
                 rope_bytes = _A5_KV_ROPE_HEAD_DIM * 2
                 nope_dim = 512 - _A5_KV_ROPE_HEAD_DIM
-                scale_bytes = math.ceil(nope_dim / 128)
+                scale_bytes = nope_dim // _A5_KV_TILE_SIZE
                 decoded_rope = (
                     active_rows_cpu[:, :rope_bytes]
                     .contiguous()
@@ -807,22 +807,29 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     )
                 else:
                     state_loc_decode = state_loc_decode.to(torch.int32)
-                compress_out_loc = torch.zeros(
-                    bs,
-                    dtype=torch.int32,
-                    device=device,
-                )
                 # bundle_loc and cmp_kv are both densely packed in batch order, so
                 # write them densely; indexing by batch slot would misalign them.
+                compress_out_loc = torch.empty(0, dtype=torch.int32, device=device)
                 if out_cache_loc_dsv4 is not None:
                     bundle_loc = (
                         out_cache_loc_dsv4.out_c4_loc
                         if ratio == 4
                         else out_cache_loc_dsv4.out_c128_loc
                     )
-                    n_compress = bundle_loc.numel()
+                    compress_out_loc = bundle_loc.to(torch.int32)
+                if is_graph:
+                    fixed_compress_out_loc = torch.full(
+                        (bs,),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    n_compress = min(compress_out_loc.numel(), bs)
                     if n_compress > 0:
-                        compress_out_loc[:n_compress] = bundle_loc.to(torch.int32)
+                        fixed_compress_out_loc[:n_compress] = compress_out_loc[
+                            :n_compress
+                        ]
+                    compress_out_loc = fixed_compress_out_loc
 
             result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
@@ -1350,6 +1357,28 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         else:
             backend_fm = self.forward_metadata
             loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
+        loc = loc.reshape(-1).to(torch.int32)
+        if loc.numel() == 0:
+            _debug_log_limited(
+                f"compressor-write-skip-empty-{compressor.layer_id}-{compressor.ratio}",
+                "DSV4 NPU compressor write skipped: "
+                f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, empty loc",
+            )
+            return
+
+        if not _is_npu_stream_capturing():
+            valid_loc = loc >= 0
+            if bool((~valid_loc).any().item()):
+                if not bool(valid_loc.any().item()):
+                    _debug_log_limited(
+                        f"compressor-write-skip-invalid-{compressor.layer_id}-{compressor.ratio}",
+                        "DSV4 NPU compressor write skipped: "
+                        f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, "
+                        f"loc={_debug_tensor_sample(loc)}",
+                    )
+                    return
+                kv = kv.reshape(-1, kv.shape[-1])[valid_loc].contiguous()
+                loc = loc[valid_loc].contiguous()
 
         if li_kv_dtype == "float8" and compressor.is_in_indexer:
             index_cache = self.token_to_kv_pool.get_compress_buffer(
@@ -1740,8 +1769,8 @@ class DeepseekV4AscendAttnBackend(
 
         n_tok = bs * tokens_per_bs
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
-        metadata.c4_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
-        metadata.c128_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
+        metadata.c4_loc = torch.full((n_tok,), -1, dtype=torch.int64, device=device)
+        metadata.c128_loc = torch.full((n_tok,), -1, dtype=torch.int64, device=device)
         metadata.c4_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c128_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
 
@@ -1811,8 +1840,8 @@ class DeepseekV4AscendAttnBackend(
             dst.fill_(val)
             dst[: src.shape[0], : src.shape[1]].copy_(src)
 
-        def _copy_1d(dst: torch.Tensor, src: torch.Tensor) -> None:
-            dst.fill_(0)
+        def _copy_1d(dst: torch.Tensor, src: torch.Tensor, fill_value: int = 0) -> None:
+            dst.fill_(fill_value)
             dst[: src.shape[0]].copy_(src)
 
         for key in (
@@ -1825,7 +1854,11 @@ class DeepseekV4AscendAttnBackend(
                 _copy_2d(getattr(fm, key), result[key], 0 if "state" in key else -1)
         for key in ("c4_loc", "c128_loc", "c4_state_loc", "c128_state_loc"):
             if key in result:
-                _copy_1d(getattr(fm, key), result[key])
+                _copy_1d(
+                    getattr(fm, key),
+                    result[key],
+                    -1 if key in ("c4_loc", "c128_loc") else 0,
+                )
 
         for key in (
             "positions_cmp_padding_c4",
