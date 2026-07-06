@@ -55,7 +55,7 @@ def _a5_kv_quant_mode() -> int:
 
 
 def _a5_use_rope_first_qk() -> bool:
-    return get_bool_env_var(_A5_ROPE_FIRST_QK_ENV)
+    return get_bool_env_var(_A5_ROPE_FIRST_QK_ENV, "true")
 
 
 def _a5_to_rope_first_q(q: torch.Tensor) -> torch.Tensor:
