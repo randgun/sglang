@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 import time
 from contextlib import nullcontext
 from typing import (
@@ -164,11 +165,50 @@ def _dsv4_npu_force_torch_hc() -> bool:
     return _is_npu and get_bool_env_var(_DSV4_NPU_FORCE_TORCH_HC_ENV)
 
 
+def _dsv4_npu_model_target_layers() -> Optional[Set[int]]:
+    raw = os.getenv(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV)
+    if raw is None or not raw.strip():
+        return {0}
+
+    layers: Set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part in ("-1", "*", "all"):
+            return None
+        try:
+            layers.add(int(part))
+            continue
+        except ValueError:
+            pass
+        if "-" in part and not part.startswith("-"):
+            start_text, end_text = part.split("-", 1)
+            try:
+                start = int(start_text)
+                end = int(end_text)
+            except ValueError:
+                pass
+            else:
+                step = 1 if end >= start else -1
+                layers.update(range(start, end + step, step))
+                continue
+        _dsv4_npu_model_log_limited(
+            "invalid-debug-model-layer",
+            (
+                "DSV4 NPU invalid debug model layer spec: "
+                f"{raw!r}; fallback to layer 0"
+            ),
+        )
+        return {0}
+    return layers or {0}
+
+
 def _dsv4_npu_should_probe_layer(layer_id: int) -> bool:
-    target_layer = get_int_env_var(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV, 0)
+    target_layers = _dsv4_npu_model_target_layers()
     return (
-        target_layer < 0
-        or layer_id == target_layer
+        target_layers is None
+        or layer_id in target_layers
         or get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV)
     )
 
@@ -188,8 +228,8 @@ def _dsv4_npu_model_probe_full_stats(label: str) -> bool:
     layer_id = _dsv4_npu_model_label_layer_id(label)
     if layer_id is None:
         return True
-    target_layer = get_int_env_var(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV, 0)
-    return target_layer < 0 or layer_id == target_layer
+    target_layers = _dsv4_npu_model_target_layers()
+    return target_layers is None or layer_id in target_layers
 
 
 def _dsv4_npu_is_stream_capturing() -> bool:
@@ -1514,6 +1554,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         force_torch_hc = _dsv4_npu_force_torch_hc()
+        if force_torch_hc:
+            _dsv4_npu_model_log_limited(
+                "force-torch-hc-pre",
+                (
+                    "DSV4 NPU torch HC fallback enabled: "
+                    f"op=pre, layer_id={self.layer_id}, "
+                    f"shape={tuple(x.shape)}, dtype={x.dtype}"
+                ),
+            )
 
         if _is_npu and not force_torch_hc:
             return npu_hc_pre(
@@ -1630,6 +1679,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         force_torch_hc = _dsv4_npu_force_torch_hc()
+        if force_torch_hc:
+            _dsv4_npu_model_log_limited(
+                "force-torch-hc-post",
+                (
+                    "DSV4 NPU torch HC fallback enabled: "
+                    f"op=post, layer_id={self.layer_id}, "
+                    f"x_shape={tuple(x.shape)}, residual_shape={tuple(residual.shape)}"
+                ),
+            )
 
         if _is_npu and not force_torch_hc:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
