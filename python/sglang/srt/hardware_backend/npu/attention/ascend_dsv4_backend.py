@@ -484,6 +484,111 @@ def _debug_probe_active_compressed_rows(
         )
 
 
+def _debug_probe_active_dense_rows(
+    *,
+    forward_batch: ForwardBatch,
+    pool,
+    ori_kv: torch.Tensor,
+    layer_id: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return
+    if not _debug_should_probe_layer(layer_id):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        sample_locs = swa_loc.reshape(-1).to(torch.int64)[:16]
+        flat_bytes = ori_kv.view(torch.uint8).view(-1, ori_kv.shape[-1])
+        in_cache = (sample_locs >= 0) & (sample_locs < flat_bytes.shape[0])
+        _debug_log_limited(
+            f"active-dense-locs-{layer_id}",
+            "DSV4 NPU dense active rows: "
+            f"layer_id={layer_id}, swa_loc={_debug_tensor_sample(sample_locs)}, "
+            f"in_cache={_debug_tensor_sample(in_cache)}",
+        )
+        if not bool(in_cache.any().item()):
+            return
+
+        active_rows = flat_bytes[sample_locs[in_cache]]
+        _debug_probe_attention_tensor(
+            active_rows,
+            "dense-active-row-bytes",
+            layer_id=layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
+
+        active_rows_cpu = active_rows.detach().cpu().contiguous()
+        rope_bytes = _A5_KV_ROPE_HEAD_DIM * 2
+        nope_dim = 512 - _A5_KV_ROPE_HEAD_DIM
+        scale_bytes_64 = nope_dim // _A5_KV_TILE_SIZE
+        scale_bytes_128 = math.ceil(nope_dim / 128)
+
+        rope_first_rope = (
+            active_rows_cpu[:, :rope_bytes]
+            .contiguous()
+            .view(torch.bfloat16)
+            .to(torch.float32)
+        )
+        rope_first_nope = (
+            active_rows_cpu[:, rope_bytes : rope_bytes + nope_dim]
+            .contiguous()
+            .view(ori_kv.dtype)
+            .to(torch.float32)
+        )
+        rope_first_scale64 = active_rows_cpu[
+            :, rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes_64
+        ].to(torch.float32)
+        rope_first_scale128 = active_rows_cpu[
+            :, rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes_128
+        ].to(torch.float32)
+
+        nope_first_nope = (
+            active_rows_cpu[:, :nope_dim]
+            .contiguous()
+            .view(ori_kv.dtype)
+            .to(torch.float32)
+        )
+        nope_first_rope = (
+            active_rows_cpu[:, nope_dim : nope_dim + rope_bytes]
+            .contiguous()
+            .view(torch.bfloat16)
+            .to(torch.float32)
+        )
+        nope_first_scale64 = active_rows_cpu[
+            :, nope_dim + rope_bytes : nope_dim + rope_bytes + scale_bytes_64
+        ].to(torch.float32)
+        nope_first_scale128 = active_rows_cpu[
+            :, nope_dim + rope_bytes : nope_dim + rope_bytes + scale_bytes_128
+        ].to(torch.float32)
+
+        for label, tensor in (
+            ("dense-active-rope-first-rope-bf16-decoded", rope_first_rope),
+            ("dense-active-rope-first-nope-fp8-decoded", rope_first_nope),
+            ("dense-active-rope-first-scale64-bytes", rope_first_scale64),
+            ("dense-active-rope-first-scale128-bytes", rope_first_scale128),
+            ("dense-active-nope-first-rope-bf16-decoded", nope_first_rope),
+            ("dense-active-nope-first-nope-fp8-decoded", nope_first_nope),
+            ("dense-active-nope-first-scale64-bytes", nope_first_scale64),
+            ("dense-active-nope-first-scale128-bytes", nope_first_scale128),
+        ):
+            _debug_probe_attention_tensor(
+                tensor,
+                label,
+                layer_id=layer_id,
+                path="dense",
+                compress_ratio=1,
+            )
+    except Exception as exc:
+        _debug_log_limited(
+            f"active-dense-error-{layer_id}",
+            "DSV4 NPU dense active row probe failed: "
+            f"layer_id={layer_id}, exc={exc}",
+        )
+
+
 def _debug_probe_dense_reference_attention(
     *,
     q: torch.Tensor,
@@ -2300,6 +2405,12 @@ class DeepseekV4AscendAttnBackend(
             layer_id=layer.layer_id,
             path="dense",
             compress_ratio=1,
+        )
+        _debug_probe_active_dense_rows(
+            forward_batch=forward_batch,
+            pool=pool,
+            ori_kv=ori_kv,
+            layer_id=layer.layer_id,
         )
         q_attn = _a5_to_rope_first_q(q)
         _debug_probe_attention_tensor(
