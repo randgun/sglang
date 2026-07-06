@@ -152,11 +152,16 @@ _DSV4_NPU_DEBUG_MODEL_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_LAYER"
 _DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_INVALID_ALL"
 _DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_DSV4_NPU_FORCE_TORCH_HC_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC"
 _dsv4_npu_model_debug_log_counts: dict[str, int] = {}
 
 
 def _dsv4_npu_model_debug_enabled() -> bool:
     return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_ENV)
+
+
+def _dsv4_npu_force_torch_hc() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_FORCE_TORCH_HC_ENV)
 
 
 def _dsv4_npu_should_probe_layer(layer_id: int) -> bool:
@@ -269,6 +274,37 @@ def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
     except Exception:
         logger.exception("DSV4 NPU model tensor probe failed at %s", label)
         raise
+
+
+def _dsv4_hc_split_sinkhorn_torch(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Small reference path for diagnosing Ascend custom MHC kernels."""
+    pre = torch.sigmoid(
+        mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + eps
+    post = 2 * torch.sigmoid(
+        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult]
+    )
+
+    comb_start = 2 * hc_mult
+    comb = (
+        mixes[..., comb_start:].view(*mixes.shape[:-1], hc_mult, hc_mult)
+        * hc_scale[2]
+        + hc_base[comb_start:].view(hc_mult, hc_mult)
+    )
+    comb = torch.softmax(comb, dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    return pre, post, comb
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -1477,7 +1513,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         shape, dtype = x.size(), x.dtype
 
-        if _is_npu:
+        force_torch_hc = _dsv4_npu_force_torch_hc()
+
+        if _is_npu and not force_torch_hc:
             return npu_hc_pre(
                 x,
                 hc_fn,
@@ -1498,7 +1536,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if not force_torch_hc and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -1536,7 +1574,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, False
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if not force_torch_hc and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
                 tf32_hc_prenorm_gemm,
             )
@@ -1552,19 +1590,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
+        elif _is_npu:
+            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            pre, post, comb = _dsv4_hc_split_sinkhorn_torch(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
+            from sglang.srt.layers.mhc import hc_split_sinkhorn
 
-        pre, post, comb = hc_split_sinkhorn(
-            mixes,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-        )
+            pre, post, comb = hc_split_sinkhorn(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
@@ -1581,10 +1629,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        if _is_npu:
+        force_torch_hc = _dsv4_npu_force_torch_hc()
+
+        if _is_npu and not force_torch_hc:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        if not force_torch_hc and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
