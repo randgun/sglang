@@ -273,7 +273,15 @@ def _mxfp4_gmm_scale_dtype_mode() -> str:
 def _maybe_view_mxfp4_scale_as_e8m0(scale: torch.Tensor) -> torch.Tensor:
     if _mxfp4_gmm_scale_dtype_mode() != "f8_view":
         return scale
-    if scale.dtype == torch_npu.float8_e8m0fnu:
+    target_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if not isinstance(target_dtype, torch.dtype):
+        _npu_moe_log_limited(
+            "mxfp4-gmm-f8-view-unsupported",
+            "DSV4 NPU MXFP4 GMM f8_view is unavailable because "
+            "torch.float8_e8m0fnu is not a tensor dtype; fallback to uint8 scale",
+        )
+        return scale
+    if scale.dtype == target_dtype:
         return scale
     if scale.dtype != torch.uint8:
         logger.warning(
@@ -283,10 +291,12 @@ def _maybe_view_mxfp4_scale_as_e8m0(scale: torch.Tensor) -> torch.Tensor:
         )
         return scale
     try:
-        return scale.view(torch_npu.float8_e8m0fnu)
+        return scale.view(target_dtype)
     except Exception:
-        logger.exception(
-            "Failed to reinterpret MXFP4 scale as float8_e8m0fnu; fallback to uint8"
+        _npu_moe_log_limited(
+            "mxfp4-gmm-f8-view-failed",
+            "DSV4 NPU MXFP4 GMM failed to reinterpret scale as "
+            "torch.float8_e8m0fnu; fallback to uint8 scale",
         )
         return scale
 
