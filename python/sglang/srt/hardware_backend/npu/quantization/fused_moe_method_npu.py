@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -26,7 +27,9 @@ _DEBUG_MOE_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_LAYER"
 _DEBUG_MOE_POST_COMBINE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_POST_COMBINE"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_MXFP4_SCALE_LAYOUT_ENV = "SGLANG_DSV4_NPU_MXFP4_SCALE_LAYOUT"
 _debug_log_counts: dict[str, int] = {}
+_scale_layout_logged = False
 
 logger = logging.getLogger(__name__)
 
@@ -374,13 +377,31 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
 
 def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     if scale.dim() == 3:
+        global _scale_layout_logged
         num_experts, n, k32 = scale.shape
         if k32 % 2 != 0:
             raise ValueError(
                 "MXFP4 scale K dimension must be divisible by 2 for "
                 "[E, K/64, N, 2] layout."
             )
-        scale = scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
+        layout = os.getenv(_MXFP4_SCALE_LAYOUT_ENV, "transpose").strip().lower()
+        if layout not in ("transpose", "native", "transpose_contiguous"):
+            logger.warning(
+                "Unknown %s=%r; fallback to transpose",
+                _MXFP4_SCALE_LAYOUT_ENV,
+                layout,
+            )
+            layout = "transpose"
+        if not _scale_layout_logged:
+            logger.warning("DSV4 NPU MXFP4 scale layout: %s", layout)
+            _scale_layout_logged = True
+
+        scale = scale.view(num_experts, n, k32 // 2, 2)
+        if layout == "native":
+            return scale.contiguous()
+        scale = scale.transpose(1, 2)
+        if layout == "transpose_contiguous":
+            return scale.contiguous()
     return scale
 
 
