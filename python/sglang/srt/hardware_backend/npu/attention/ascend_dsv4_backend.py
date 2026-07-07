@@ -22,8 +22,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_A5_KV_TILE_SIZE_DEFAULT = 128
-_A5_KV_TILE_SIZE_ENV = "SGLANG_DSV4_NPU_KV_TILE_SIZE"
+_A5_KV_TILE_SIZE = 64
 _A5_KV_ROPE_HEAD_DIM = 64
 _A5_KV_QUANT_MODE_DEFAULT = 1
 _A5_KV_QUANT_MODE_ENV = "SGLANG_DSV4_NPU_KV_QUANT_MODE"
@@ -53,10 +52,6 @@ def _is_npu_stream_capturing() -> bool:
 
 def _a5_kv_quant_mode() -> int:
     return get_int_env_var(_A5_KV_QUANT_MODE_ENV, _A5_KV_QUANT_MODE_DEFAULT)
-
-
-def _a5_kv_tile_size() -> int:
-    return get_int_env_var(_A5_KV_TILE_SIZE_ENV, _A5_KV_TILE_SIZE_DEFAULT)
 
 
 def _a5_use_rope_first_qk() -> bool:
@@ -433,7 +428,7 @@ def _debug_probe_active_compressed_rows(
                 active_rows_cpu = active_rows.detach().cpu().contiguous()
                 rope_bytes = _A5_KV_ROPE_HEAD_DIM * 2
                 nope_dim = 512 - _A5_KV_ROPE_HEAD_DIM
-                scale_bytes = math.ceil(nope_dim / _a5_kv_tile_size())
+                scale_bytes = nope_dim // _A5_KV_TILE_SIZE
                 decoded_rope = (
                     active_rows_cpu[:, :rope_bytes]
                     .contiguous()
@@ -528,7 +523,7 @@ def _debug_probe_active_dense_rows(
         active_rows_cpu = active_rows.detach().cpu().contiguous()
         rope_bytes = _A5_KV_ROPE_HEAD_DIM * 2
         nope_dim = 512 - _A5_KV_ROPE_HEAD_DIM
-        scale_bytes_64 = math.ceil(nope_dim / 64)
+        scale_bytes_64 = nope_dim // _A5_KV_TILE_SIZE
         scale_bytes_128 = math.ceil(nope_dim / 128)
 
         rope_first_rope = (
@@ -2282,7 +2277,7 @@ class DeepseekV4AscendAttnBackend(
     ) -> dict:
         common = {
             "kv_quant_mode": _a5_kv_quant_mode(),
-            "tile_size": _a5_kv_tile_size(),
+            "tile_size": _A5_KV_TILE_SIZE,
             "rope_head_dim": _A5_KV_ROPE_HEAD_DIM,
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "seqused_kv": actual_seq_lengths_kv,
@@ -2444,7 +2439,7 @@ class DeepseekV4AscendAttnBackend(
         #     swa_kv_cache = swa_kv_cache.to(torch.float32).to(torch.float8_e4m3fn)
         attn_kwargs = dict(
             kv_quant_mode=_a5_kv_quant_mode(),
-            tile_size=_a5_kv_tile_size(),
+            tile_size = _A5_KV_TILE_SIZE,
             rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
@@ -2523,7 +2518,7 @@ class DeepseekV4AscendAttnBackend(
         q_attn = _a5_to_rope_first_q(q)
         attn_kwargs = dict(
             kv_quant_mode=_a5_kv_quant_mode(),
-            tile_size=_a5_kv_tile_size(),
+            tile_size = _A5_KV_TILE_SIZE,
             rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
