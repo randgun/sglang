@@ -576,7 +576,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 "DSV4 A5 KV cache write expects one slot per token, got "
                 f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
             )
-        if not get_bool_env_var(_A5_KV_USE_COMPRESS_EPILOG_ENV, "true"):
+        if not get_bool_env_var(_A5_KV_USE_COMPRESS_EPILOG_ENV):
             self._set_a5_kv_buffer_quant_mode1(buf, slot_mapping, cache_2d)
             _debug_sync_npu(f"kv bf16-scale fallback pack buf_shape={tuple(buf.shape)}")
             return
@@ -598,9 +598,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     ) -> None:
         """Pack BF16 DSV4 KV for KvQuantSparseAttnSharedkv kv_quant_mode=1.
 
-        Legacy fallback used only when SGLANG_DSV4_NPU_USE_KV_COMPRESS_EPILOG=0.
-        The A5 custom epilog path is preferred because KvQuantSparseAttnSharedkv
-        expects E8M0 scale bytes in the packed cache row.
+        Default A5 pack path. The custom epilog remains available for A/B via
+        SGLANG_DSV4_NPU_USE_KV_COMPRESS_EPILOG=1, but current A5 validation
+        shows KvQuantSparseAttnSharedkv consumes this BF16-scale row layout.
         """
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim

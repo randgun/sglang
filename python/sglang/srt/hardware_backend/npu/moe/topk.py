@@ -1,16 +1,130 @@
 from typing import TYPE_CHECKING, Optional
 
+import logging
+
 import torch
 from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
+
+_DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
+_DEBUG_MOE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE"
+_DEBUG_MOE_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_LAYER"
+_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_debug_log_counts: dict[str, int] = {}
+
+logger = logging.getLogger(__name__)
+
+
+def _npu_topk_debug_enabled() -> bool:
+    return get_bool_env_var(_DEBUG_MOE_ENV) or get_bool_env_var(_DEBUG_NAN_ENV)
+
+
+def _npu_topk_should_probe_layer(layer_id: Optional[int]) -> bool:
+    target_layer = get_int_env_var(_DEBUG_MOE_LAYER_ENV, -1)
+    if target_layer < 0:
+        return True
+    return layer_id is not None and int(layer_id) == target_layer
+
+
+def _npu_topk_full_stats(layer_id: Optional[int]) -> bool:
+    return get_bool_env_var(_DEBUG_MOE_ENV) and _npu_topk_should_probe_layer(layer_id)
+
+
+def _npu_topk_is_stream_capturing() -> bool:
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _npu_topk_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _npu_topk_debug_sync(label: str) -> None:
+    if not get_bool_env_var(_DEBUG_SYNC_ENV) or _npu_topk_is_stream_capturing():
+        return
+    torch.npu.synchronize()
+
+
+def _npu_topk_probe_tensor(
+    tensor: Optional[torch.Tensor],
+    label: str,
+    layer_id: Optional[int],
+) -> None:
+    if (
+        tensor is None
+        or not _npu_topk_debug_enabled()
+        or not _npu_topk_should_probe_layer(layer_id)
+        or _npu_topk_is_stream_capturing()
+    ):
+        return
+
+    _npu_topk_debug_sync(label)
+    probe = tensor if tensor.is_floating_point() else tensor.to(torch.float32)
+    finite = torch.isfinite(probe)
+    finite_count = int(finite.sum().item())
+    nan_count = int(torch.isnan(probe).sum().item())
+    inf_count = int(torch.isinf(probe).sum().item())
+    full_stats = _npu_topk_full_stats(layer_id)
+    if not full_stats and nan_count == 0 and inf_count == 0:
+        return
+
+    zero_count = int((probe == 0).sum().item())
+    if finite_count > 0:
+        finite_values = probe[finite].to(torch.float32)
+        min_val = float(finite_values.min().item())
+        max_val = float(finite_values.max().item())
+    else:
+        min_val = float("nan")
+        max_val = float("nan")
+
+    invalid_rows = []
+    if tensor.ndim >= 2 and (nan_count > 0 or inf_count > 0):
+        flat = probe.reshape(-1, probe.shape[-1])
+        invalid_mask = ~torch.isfinite(flat).all(dim=1)
+        invalid_rows = invalid_mask.nonzero(as_tuple=False).flatten()[:8].cpu().tolist()
+
+    layer = -1 if layer_id is None else int(layer_id)
+    prefix = (
+        "DSV4 NPU topk tensor stats: "
+        if full_stats
+        else "DSV4 NPU topk tensor contains invalid values: "
+    )
+    _npu_topk_log_limited(
+        f"{'tensor' if full_stats else 'invalid'}-{layer}-{label}",
+        prefix
+        + f"label={label}, layer_id={layer}, "
+        f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+        f"finite_count={finite_count}, nan_count={nan_count}, "
+        f"inf_count={inf_count}, zero_count={zero_count}, "
+        f"finite_min={min_val}, finite_max={max_val}, "
+        f"invalid_rows={invalid_rows}",
+    )
 
 
 def _mask_padded_topk_rows_npu(
@@ -40,6 +154,8 @@ def fused_topk_npu(
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
+
+    _npu_topk_probe_tensor(router_logits, "topk-router-logits", layer_id)
 
     # Fast path: simple top-k without grouped routing and bias
     if not use_grouped_topk and correction_bias is None:
@@ -121,6 +237,8 @@ def fused_topk_npu(
     topk_weights, topk_ids = _mask_padded_topk_rows_npu(
         topk_weights, topk_ids, num_token_non_padded
     )
+    _npu_topk_probe_tensor(topk_weights, "topk-output-weights", layer_id)
+    _npu_topk_probe_tensor(topk_ids, "topk-output-ids", layer_id)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     if (cap := get_global_experts_capturer()) is not None:
         cap.capture(
