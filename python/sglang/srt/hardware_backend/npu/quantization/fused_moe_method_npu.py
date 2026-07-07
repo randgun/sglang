@@ -301,6 +301,99 @@ def _maybe_view_mxfp4_scale_as_e8m0(scale: torch.Tensor) -> torch.Tensor:
         return scale
 
 
+def _log_mxfp4_loaded_scale(
+    label: str,
+    loaded_weight: torch.Tensor,
+    converted_weight: torch.Tensor,
+) -> None:
+    if not get_bool_env_var(_DEBUG_MOE_ENV):
+        return
+    try:
+        src = loaded_weight
+        if not src.is_floating_point():
+            src = src.to(torch.float32)
+        finite = torch.isfinite(src)
+        if finite.any():
+            finite_src = src[finite].to(torch.float32)
+            src_min = float(finite_src.min().item())
+            src_max = float(finite_src.max().item())
+        else:
+            src_min = float("nan")
+            src_max = float("nan")
+        dst = converted_weight.to(torch.float32)
+        dst_min = float(dst.min().item()) if dst.numel() > 0 else float("nan")
+        dst_max = float(dst.max().item()) if dst.numel() > 0 else float("nan")
+        dst_zero = int((converted_weight == 0).sum().item())
+        _npu_moe_log_limited(
+            f"loaded-scale-{label}",
+            "DSV4 NPU MXFP4 loaded scale conversion: "
+            f"label={label}, src_shape={tuple(loaded_weight.shape)}, "
+            f"src_dtype={loaded_weight.dtype}, src_min={src_min}, src_max={src_max}, "
+            f"dst_dtype={converted_weight.dtype}, dst_min={dst_min}, "
+            f"dst_max={dst_max}, dst_zero_count={dst_zero}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU MXFP4 loaded scale logging failed at %s", label)
+
+
+def _convert_mxfp4_loaded_scale_to_uint8(
+    loaded_weight: torch.Tensor,
+    label: str,
+) -> torch.Tensor:
+    if loaded_weight.dtype == torch.uint8:
+        converted = loaded_weight
+    elif loaded_weight.dtype == torch.int8:
+        converted = loaded_weight.view(torch.uint8)
+    elif loaded_weight.is_floating_point():
+        try:
+            scale = loaded_weight.to(torch.float32)
+        except Exception:
+            converted = loaded_weight.view(torch.uint8)
+        else:
+            if scale.numel() == 0:
+                converted = scale.to(torch.uint8)
+            else:
+                finite = torch.isfinite(scale)
+                finite_values = scale[finite]
+                if finite_values.numel() == 0:
+                    converted = torch.zeros_like(scale, dtype=torch.uint8)
+                else:
+                    max_val = float(finite_values.max().item())
+                    rounded = torch.round(scale)
+                    max_round_err = float(
+                        (scale[finite] - rounded[finite]).abs().max().item()
+                    )
+                    if max_val > 16.0 and max_round_err < 1e-3:
+                        converted = rounded.clamp_(0, 255).to(torch.uint8)
+                    else:
+                        safe_scale = torch.where(
+                            scale > 0,
+                            scale,
+                            torch.ones_like(scale),
+                        )
+                        exponent = torch.round(torch.log2(safe_scale)) + 127
+                        exponent = torch.where(
+                            scale > 0,
+                            exponent,
+                            torch.zeros_like(exponent),
+                        )
+                        converted = exponent.clamp_(0, 255).to(torch.uint8)
+    else:
+        converted = loaded_weight.to(torch.uint8)
+
+    _log_mxfp4_loaded_scale(label, loaded_weight, converted)
+    return converted
+
+
+def _wrap_mxfp4_scale_weight_loader(weight_loader):
+    def mxfp4_scale_weight_loader(param, loaded_weight, *args, **kwargs):
+        label = str(args[0]) if args else "unknown"
+        loaded_weight = _convert_mxfp4_loaded_scale_to_uint8(loaded_weight, label)
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return mxfp4_scale_weight_loader
+
+
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
     """DeepSeek-V4 native FP4 experts on NPU A5 using W4A4 MXFP GMM."""
 
@@ -351,6 +444,10 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
 
         scale_attrs = dict(extra_weight_attrs)
         scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        if "weight_loader" in scale_attrs:
+            scale_attrs["weight_loader"] = _wrap_mxfp4_scale_weight_loader(
+                scale_attrs["weight_loader"]
+            )
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 (
@@ -393,6 +490,8 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.data.view(torch.uint8),
             29,
         ).transpose(1, 2)
+        _npu_moe_probe_tensor(layer.w13_weight_scale, "loaded-w13-weight-scale", layer)
+        _npu_moe_probe_tensor(layer.w2_weight_scale, "loaded-w2-weight-scale", layer)
         layer.w13_weight_scale_inv = torch.nn.Parameter(
             _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale.data),
             requires_grad=False,
