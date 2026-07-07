@@ -375,9 +375,9 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         )
         w13_weight_scale.format_ue8m0 = False
         w2_weight_scale.format_ue8m0 = False
-        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, scale_attrs)
-        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
@@ -394,13 +394,19 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             29,
         ).transpose(1, 2)
         layer.w13_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
+            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale.data),
             requires_grad=False,
         )
         layer.w2_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
+            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale.data),
             requires_grad=False,
         )
+        layer.w13_weight_scale_inv.format_ue8m0 = False
+        layer.w2_weight_scale_inv.format_ue8m0 = False
+        if "w13_weight_scale" in layer._parameters:
+            del layer._parameters["w13_weight_scale"]
+        if "w2_weight_scale" in layer._parameters:
+            del layer._parameters["w2_weight_scale"]
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
