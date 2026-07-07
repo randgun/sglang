@@ -301,6 +301,19 @@ def _maybe_view_mxfp4_scale_as_e8m0(scale: torch.Tensor) -> torch.Tensor:
         return scale
 
 
+def _is_e8m0_float8_dtype(dtype: torch.dtype) -> bool:
+    return "float8_e8m0" in str(dtype).lower()
+
+
+def _mxfp4_scale_stats_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if _is_e8m0_float8_dtype(tensor.dtype):
+        try:
+            return tensor.view(torch.uint8).to(torch.float32)
+        except Exception:
+            pass
+    return tensor.to(torch.float32)
+
+
 def _log_mxfp4_loaded_scale(
     label: str,
     loaded_weight: torch.Tensor,
@@ -309,12 +322,10 @@ def _log_mxfp4_loaded_scale(
     if not get_bool_env_var(_DEBUG_MOE_ENV):
         return
     try:
-        src = loaded_weight
-        if not src.is_floating_point():
-            src = src.to(torch.float32)
+        src = _mxfp4_scale_stats_tensor(loaded_weight)
         finite = torch.isfinite(src)
         if finite.any():
-            finite_src = src[finite].to(torch.float32)
+            finite_src = src[finite]
             src_min = float(finite_src.min().item())
             src_max = float(finite_src.max().item())
         else:
@@ -343,6 +354,8 @@ def _convert_mxfp4_loaded_scale_to_uint8(
     if loaded_weight.dtype == torch.uint8:
         converted = loaded_weight
     elif loaded_weight.dtype == torch.int8:
+        converted = loaded_weight.view(torch.uint8)
+    elif _is_e8m0_float8_dtype(loaded_weight.dtype):
         converted = loaded_weight.view(torch.uint8)
     elif loaded_weight.is_floating_point():
         try:
