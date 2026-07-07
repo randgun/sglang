@@ -152,6 +152,32 @@ def _dsv4_npu_debug_probe_tensor(tensor: torch.Tensor, label: str) -> None:
         raise
 
 
+def _dsv4_npu_debug_probe_logits_topk(tensor: torch.Tensor, label: str) -> None:
+    if (
+        not _dsv4_npu_logits_debug_enabled()
+        or _is_npu_stream_capturing()
+        or tensor.ndim < 2
+        or tensor.shape[-1] == 0
+    ):
+        return
+
+    _dsv4_npu_debug_sync(f"{label}-topk")
+    try:
+        rows = min(int(tensor.shape[0]), 4)
+        k = min(int(tensor.shape[-1]), 10)
+        values, ids = torch.topk(tensor[:rows].to(torch.float32), k=k, dim=-1)
+        _dsv4_npu_debug_log_limited(
+            f"topk-{label}",
+            "DSV4 NPU logits topk: "
+            f"label={label}, rows={rows}, k={k}, "
+            f"ids={ids.detach().cpu().tolist()}, "
+            f"values={values.detach().cpu().tolist()}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU logits topk probe failed at %s", label)
+        raise
+
+
 def get_in_autotune_dummy_run() -> bool:
     return _in_autotune_dummy_run
 
@@ -959,6 +985,7 @@ class LogitsProcessor(nn.Module):
                 )
             _dsv4_npu_debug_probe_tensor(logits, "logits-after-softcap")
 
+        _dsv4_npu_debug_probe_logits_topk(logits, "logits-final")
         return logits
 
     def _compute_lm_head(
