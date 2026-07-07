@@ -2634,6 +2634,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if _is_npu:
                                 name = name.replace("weight_packed", "weight")
                             name = name.replace(weight_name, param_name)
+                            if _is_npu and name not in params_dict:
+                                if name.endswith("_weight_scale_inv"):
+                                    scale_name = name[: -len("_inv")]
+                                elif name.endswith("_weight_scale"):
+                                    scale_name = name + "_inv"
+                                else:
+                                    scale_name = None
+                                if scale_name is not None and scale_name in params_dict:
+                                    name = scale_name
                             if name not in params_dict:
                                 continue
                             param = params_dict[name]
