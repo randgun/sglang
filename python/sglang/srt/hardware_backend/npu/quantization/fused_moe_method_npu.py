@@ -28,8 +28,12 @@ _DEBUG_MOE_POST_COMBINE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_POST_COMBINE"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _MXFP4_SCALE_LAYOUT_ENV = "SGLANG_DSV4_NPU_MXFP4_SCALE_LAYOUT"
+_MXFP4_SCALE_VALUE_MODE_ENV = "SGLANG_DSV4_NPU_MXFP4_SCALE_VALUE_MODE"
+_MXFP4_GMM_SCALE_DTYPE_ENV = "SGLANG_DSV4_NPU_MXFP4_GMM_SCALE_DTYPE"
 _debug_log_counts: dict[str, int] = {}
 _scale_layout_logged = False
+_scale_value_mode_logged = False
+_gmm_scale_dtype_logged = False
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +220,77 @@ def _npu_moe_register_post_combine_probe(
     handle = dispatcher.register_post_combine_hook(_post_combine_hook)
 
 
+def _mxfp4_scale_value_mode() -> str:
+    global _scale_value_mode_logged
+    mode = os.getenv(_MXFP4_SCALE_VALUE_MODE_ENV, "raw").strip().lower()
+    if mode not in ("raw", "invert_e8m0"):
+        logger.warning(
+            "Unknown %s=%r; fallback to raw",
+            _MXFP4_SCALE_VALUE_MODE_ENV,
+            mode,
+        )
+        mode = "raw"
+    if not _scale_value_mode_logged:
+        logger.warning("DSV4 NPU MXFP4 scale value mode: %s", mode)
+        _scale_value_mode_logged = True
+    return mode
+
+
+def _maybe_transform_mxfp4_scale_values(scale: torch.Tensor) -> torch.Tensor:
+    mode = _mxfp4_scale_value_mode()
+    if mode == "raw":
+        return scale
+    if scale.dtype != torch.uint8:
+        logger.warning(
+            "Skip %s=%s for non-uint8 scale dtype=%s",
+            _MXFP4_SCALE_VALUE_MODE_ENV,
+            mode,
+            scale.dtype,
+        )
+        return scale
+
+    # E8M0 inverse scales are exponent bytes. This is an A/B switch for checking
+    # whether the loaded FP4 expert scale direction is inverted for A5 GMM.
+    return (254 - scale.to(torch.int16)).clamp_(0, 255).to(torch.uint8)
+
+
+def _mxfp4_gmm_scale_dtype_mode() -> str:
+    global _gmm_scale_dtype_logged
+    mode = os.getenv(_MXFP4_GMM_SCALE_DTYPE_ENV, "uint8").strip().lower()
+    if mode not in ("uint8", "f8_view"):
+        logger.warning(
+            "Unknown %s=%r; fallback to uint8",
+            _MXFP4_GMM_SCALE_DTYPE_ENV,
+            mode,
+        )
+        mode = "uint8"
+    if not _gmm_scale_dtype_logged:
+        logger.warning("DSV4 NPU MXFP4 GMM scale dtype mode: %s", mode)
+        _gmm_scale_dtype_logged = True
+    return mode
+
+
+def _maybe_view_mxfp4_scale_as_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    if _mxfp4_gmm_scale_dtype_mode() != "f8_view":
+        return scale
+    if scale.dtype == torch_npu.float8_e8m0fnu:
+        return scale
+    if scale.dtype != torch.uint8:
+        logger.warning(
+            "Skip %s=f8_view for non-uint8 scale dtype=%s",
+            _MXFP4_GMM_SCALE_DTYPE_ENV,
+            scale.dtype,
+        )
+        return scale
+    try:
+        return scale.view(torch_npu.float8_e8m0fnu)
+    except Exception:
+        logger.exception(
+            "Failed to reinterpret MXFP4 scale as float8_e8m0fnu; fallback to uint8"
+        )
+        return scale
+
+
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
     """DeepSeek-V4 native FP4 experts on NPU A5 using W4A4 MXFP GMM."""
 
@@ -396,6 +471,7 @@ def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
             logger.warning("DSV4 NPU MXFP4 scale layout: %s", layout)
             _scale_layout_logged = True
 
+        scale = _maybe_transform_mxfp4_scale_values(scale)
         scale = scale.view(num_experts, n, k32 // 2, 2)
         if layout == "native":
             return scale.contiguous()
@@ -704,12 +780,19 @@ def w4a4_mxfp_gmm_npu(
             _npu_moe_probe_tensor(x, f"{debug_label}-prequant-input", debug_layer)
             _npu_moe_probe_tensor(x_scale, f"{debug_label}-prequant-scale", debug_layer)
 
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(
+            weight_scale, f"{debug_label}-weight-scale-raw", debug_layer
+        )
+    gmm_weight_scale = _maybe_view_mxfp4_scale_as_e8m0(weight_scale)
+    gmm_x_scale = _maybe_view_mxfp4_scale_as_e8m0(x_scale)
+
     output = torch.ops.npu.npu_grouped_matmul(
         [x],
         [weight],
-        scale=[weight_scale],
+        scale=[gmm_weight_scale],
         scale_dtype=torch_npu.float8_e8m0fnu,
-        per_token_scale=[x_scale],
+        per_token_scale=[gmm_x_scale],
         split_item=2,
         group_type=0,
         group_list=group_list,
