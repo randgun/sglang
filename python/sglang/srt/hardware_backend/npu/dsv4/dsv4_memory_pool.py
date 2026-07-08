@@ -623,16 +623,20 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         k_nope_grouped = k_nope.view(-1, scale_dim, _A5_KV_QUANT_GROUP_SIZE)
         scale = k_nope_grouped.abs().amax(dim=-1).clamp(min=1e-4) / _A5_FP8_E4M3FN_MAX
-        scale_log2_ceil = torch.ceil(torch.log2(scale))
-        scale_pow2 = torch.exp2(scale_log2_ceil)
         k_nope_fp8 = (
-            (k_nope_grouped / scale_pow2.unsqueeze(-1))
+            (k_nope_grouped / scale.unsqueeze(-1))
             .clamp(min=-_A5_FP8_E4M3FN_MAX, max=_A5_FP8_E4M3FN_MAX)
             .reshape(-1, nope_dim)
             .to(torch.float8_e4m3fn)
             .contiguous()
         )
-        scale_e8m0 = (scale_log2_ceil + 127).clamp_(0, 255).to(torch.uint8)
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is None:
+            raise RuntimeError(
+                "DSV4 A5 KV quant-mode1 pack requires torch.float8_e8m0fnu "
+                "for nope_quant_scale."
+            )
+        scale_e8m0 = scale.to(e8m0_dtype).contiguous()
 
         rows = torch.zeros(
             cache_valid.shape[0],
