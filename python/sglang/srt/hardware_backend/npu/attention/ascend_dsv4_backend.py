@@ -29,6 +29,7 @@ _A5_KV_QUANT_MODE_ENV = "SGLANG_DSV4_NPU_KV_QUANT_MODE"
 _A5_ROPE_FIRST_QK_ENV = "SGLANG_DSV4_NPU_ROPE_FIRST_QK"
 _FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
 _DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
+_DEBUG_ATTN_ENV = "SGLANG_DSV4_NPU_DEBUG_ATTN"
 _DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
 _DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
@@ -84,6 +85,18 @@ def _debug_log_limited(key: str, message: str) -> None:
 def _debug_should_probe_layer(layer_id: int) -> bool:
     target_layer = get_int_env_var(_DEBUG_LAYER_ENV, -1)
     return target_layer < 0 or layer_id == target_layer
+
+
+def _debug_attention_enabled() -> bool:
+    return get_bool_env_var(_DEBUG_NAN_ENV) or get_bool_env_var(_DEBUG_ATTN_ENV)
+
+
+def _debug_should_probe_attention(layer_id: int) -> bool:
+    return (
+        _debug_attention_enabled()
+        and _debug_should_probe_layer(layer_id)
+        and not _is_npu_stream_capturing()
+    )
 
 
 def _debug_sync_npu(label: str) -> None:
@@ -150,11 +163,7 @@ def _debug_probe_attention_tensor(
     path: str,
     compress_ratio: int,
 ) -> None:
-    if not get_bool_env_var(_DEBUG_NAN_ENV):
-        return
-    if not _debug_should_probe_layer(layer_id):
-        return
-    if _is_npu_stream_capturing():
+    if not _debug_should_probe_attention(layer_id):
         return
     _debug_sync_npu(f"{path} attention probe {label} layer_id={layer_id}")
     try:
@@ -272,7 +281,9 @@ def _debug_probe_cache_metadata(
     path: str,
     compress_ratio: int,
 ) -> None:
-    if not get_bool_env_var(_DEBUG_CACHE_META_ENV):
+    if not (
+        get_bool_env_var(_DEBUG_CACHE_META_ENV) or _debug_attention_enabled()
+    ):
         return
     if not _debug_should_probe_layer(layer_id):
         return
@@ -315,7 +326,11 @@ def _debug_probe_compressed_cache_metadata(
     compress_ratio: int,
     topk: Optional[torch.Tensor],
 ) -> None:
-    if not get_bool_env_var(_DEBUG_CACHE_META_ENV):
+    if not (
+        get_bool_env_var(_DEBUG_CACHE_META_ENV) or _debug_attention_enabled()
+    ):
+        return
+    if not _debug_should_probe_layer(layer_id):
         return
     if _is_npu_stream_capturing():
         return
@@ -359,13 +374,9 @@ def _debug_probe_active_compressed_rows(
     layer_id: int,
     compress_ratio: int,
 ) -> None:
-    if not get_bool_env_var(_DEBUG_NAN_ENV):
-        return
-    if not _debug_should_probe_layer(layer_id):
+    if not _debug_should_probe_attention(layer_id):
         return
     if topk is None or topk.numel() == 0 or cmp_block_table.numel() == 0:
-        return
-    if _is_npu_stream_capturing():
         return
     try:
         page_size = int(cmp_kv.shape[1])
@@ -491,11 +502,7 @@ def _debug_probe_active_dense_rows(
     ori_kv: torch.Tensor,
     layer_id: int,
 ) -> None:
-    if not get_bool_env_var(_DEBUG_NAN_ENV):
-        return
-    if not _debug_should_probe_layer(layer_id):
-        return
-    if _is_npu_stream_capturing():
+    if not _debug_should_probe_attention(layer_id):
         return
     try:
         swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
@@ -2556,7 +2563,7 @@ class DeepseekV4AscendAttnBackend(
             path="compressed",
             compress_ratio=compress_ratio,
         )
-        if invalid:
+        if invalid or _debug_should_probe_attention(layer.layer_id):
             _debug_probe_compressed_cache_metadata(
                 forward_batch=forward_batch,
                 fm=fm,
