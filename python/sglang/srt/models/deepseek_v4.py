@@ -151,6 +151,7 @@ _MHC_POST_MULT_VALUE = 2.0
 _DSV4_NPU_DEBUG_MODEL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL"
 _DSV4_NPU_DEBUG_MODEL_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_LAYER"
 _DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_INVALID_ALL"
+_DSV4_NPU_DEBUG_MODEL_SUMMARY_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_SUMMARY"
 _DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _DSV4_NPU_FORCE_TORCH_HC_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC"
@@ -160,6 +161,10 @@ _dsv4_npu_model_debug_log_counts: dict[str, int] = {}
 
 def _dsv4_npu_model_debug_enabled() -> bool:
     return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_ENV)
+
+
+def _dsv4_npu_model_summary_enabled() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_SUMMARY_ENV)
 
 
 def _dsv4_npu_force_torch_hc() -> bool:
@@ -318,6 +323,54 @@ def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
         )
     except Exception:
         logger.exception("DSV4 NPU model tensor probe failed at %s", label)
+        raise
+
+
+def _dsv4_npu_model_probe_summary(tensor: torch.Tensor, label: str) -> None:
+    if not _dsv4_npu_model_summary_enabled() or _dsv4_npu_is_stream_capturing():
+        return
+
+    if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("DSV4 NPU model summary sync failed after %s", label)
+            raise
+
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+            abs_mean = float(finite_values.abs().mean().item())
+            abs_max = float(finite_values.abs().max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+            abs_mean = float("nan")
+            abs_max = float("nan")
+
+        _dsv4_npu_model_log_limited(
+            f"summary-{label}",
+            (
+                "DSV4 NPU model layer summary: "
+                f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                f"finite_count={finite_count}, nan_count={nan_count}, "
+                f"inf_count={inf_count}, zero_count={zero_count}, "
+                f"finite_min={min_val}, finite_max={max_val}, "
+                f"finite_abs_mean={abs_mean}, finite_abs_max={abs_max}"
+            ),
+        )
+    except Exception:
+        logger.exception("DSV4 NPU model summary probe failed at %s", label)
         raise
 
 
@@ -2205,6 +2258,10 @@ class DeepseekV4Model(nn.Module):
                         hidden_states,
                         f"model-layer-{i}-out",
                     )
+                _dsv4_npu_model_probe_summary(
+                    hidden_states,
+                    f"model-layer-{i}-out",
+                )
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
@@ -2233,6 +2290,7 @@ class DeepseekV4Model(nn.Module):
         _dsv4_npu_model_probe_tensor(hidden_states, "model-after-hc-head")
         hidden_states = self.norm(hidden_states)
         _dsv4_npu_model_probe_tensor(hidden_states, "model-after-final-norm")
+        _dsv4_npu_model_probe_summary(hidden_states, "model-after-final-norm")
 
         return hidden_states, pre_hc_head
 
