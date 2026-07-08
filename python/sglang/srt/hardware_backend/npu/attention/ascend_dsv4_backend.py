@@ -722,6 +722,121 @@ def _debug_probe_dense_reference_attention(
         )
 
 
+def _debug_compare_compressed_with_dense_kernel(
+    *,
+    q: torch.Tensor,
+    q_attn: torch.Tensor,
+    ori_kv: torch.Tensor,
+    compressed_out: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    debug_kv: Optional[torch.Tensor],
+    layer: RadixAttention,
+    fm,
+    ori_win_left: int,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if compress_ratio != 128:
+        return
+    if not get_bool_env_var(_DEBUG_REF_ATTN_ENV):
+        return
+    if layer.layer_id != get_int_env_var(_DEBUG_REF_ATTN_LAYER_ENV, 0):
+        return
+    if _is_npu_stream_capturing():
+        return
+    key = f"dense-kernel-compare-{path}-{layer.layer_id}-{compress_ratio}"
+    if _debug_log_counts.get(key, 0) >= get_int_env_var(_DEBUG_MAX_PRINTS_ENV, 20):
+        return
+    try:
+        metadata = fm.kernel_metadata.get("c1a_metadata")
+        if metadata is None:
+            _debug_log_limited(
+                f"{key}-missing-metadata",
+                "DSV4 NPU dense kernel compare skipped: missing c1a_metadata "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}",
+            )
+            return
+        dense_kwargs = dict(
+            kv_quant_mode=_a5_kv_quant_mode(),
+            tile_size=_A5_KV_TILE_SIZE,
+            rope_head_dim=_A5_KV_ROPE_HEAD_DIM,
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_kv=fm.actual_seq_lengths_kv,
+            ori_mask_mode=4,
+            ori_win_left=ori_win_left,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q_attn,
+            ori_kv=ori_kv,
+            ori_block_table=fm.swa_page_table,
+            sinks=attn_sink,
+            metadata=metadata,
+            softmax_scale=layer.scaling,
+            cmp_ratio=1,
+        )
+        dense_out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(
+            **dense_kwargs
+        )
+        dense_out = _a5_from_rope_first_out(dense_out)
+        _debug_sync_npu(
+            f"dense kernel compare layer_id={layer.layer_id} ratio={compress_ratio}"
+        )
+        if compressed_out.shape == dense_out.shape:
+            diff = (compressed_out.to(torch.float32) - dense_out.to(torch.float32)).abs()
+            diff_finite = diff[torch.isfinite(diff)]
+            if diff_finite.numel() > 0:
+                max_abs_diff = float(diff_finite.max().item())
+                mean_abs_diff = float(diff_finite.mean().item())
+            else:
+                max_abs_diff = float("nan")
+                mean_abs_diff = float("nan")
+            dense_f = dense_out.to(torch.float32)
+            compressed_f = compressed_out.to(torch.float32)
+            _debug_log_limited(
+                key,
+                "DSV4 NPU compressed-vs-dense kernel diff: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, shape={tuple(compressed_out.shape)}, "
+                f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
+                f"compressed_abs_mean={float(compressed_f.abs().mean().item())}, "
+                f"dense_abs_mean={float(dense_f.abs().mean().item())}",
+            )
+        else:
+            _debug_log_limited(
+                key,
+                "DSV4 NPU compressed-vs-dense kernel diff skipped: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, "
+                f"compressed_shape={tuple(compressed_out.shape)}, "
+                f"dense_shape={tuple(dense_out.shape)}",
+            )
+        _debug_probe_attention_tensor(
+            dense_out,
+            "dense-kernel-out",
+            layer_id=layer.layer_id,
+            path=path,
+            compress_ratio=compress_ratio,
+        )
+        _debug_probe_dense_reference_attention(
+            q=q,
+            kv=debug_kv,
+            out=dense_out,
+            attn_sink=attn_sink,
+            layer=layer,
+            path=f"{path}-dense-kernel",
+            compress_ratio=1,
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"{key}-error",
+            "DSV4 NPU dense kernel compare failed: "
+            f"path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}, "
+            f"exc={exc}",
+        )
+
+
 def _debug_log_c4_topk(
     topk: torch.Tensor,
     forward_batch,
@@ -2632,9 +2747,23 @@ class DeepseekV4AscendAttnBackend(
         _debug_sync_npu(
             f"compressed attention layer_id={layer.layer_id} ratio={compress_ratio}"
         )
+        debug_kv = getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id)
+        _debug_compare_compressed_with_dense_kernel(
+            q=q,
+            q_attn=q_attn,
+            ori_kv=ori_kv,
+            compressed_out=out,
+            attn_sink=attn_sink,
+            debug_kv=debug_kv,
+            layer=layer,
+            fm=fm,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            path="compressed",
+            compress_ratio=compress_ratio,
+        )
         _debug_probe_dense_reference_attention(
             q=q,
-            kv=getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id),
+            kv=debug_kv,
             out=out,
             attn_sink=attn_sink,
             layer=layer,
