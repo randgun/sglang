@@ -578,7 +578,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if not get_bool_env_var(_A5_KV_USE_COMPRESS_EPILOG_ENV):
             self._set_a5_kv_buffer_quant_mode1(buf, slot_mapping, cache_2d)
-            _debug_sync_npu(f"kv bf16-scale fallback pack buf_shape={tuple(buf.shape)}")
+            _debug_sync_npu(f"kv e8m0-scale fallback pack buf_shape={tuple(buf.shape)}")
             return
         torch.ops.custom.kv_compress_epilog(
             buf.view(-1, buf.shape[-1]),
@@ -600,14 +600,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         Default A5 pack path. The custom epilog remains available for A/B via
         SGLANG_DSV4_NPU_USE_KV_COMPRESS_EPILOG=1, but current A5 validation
-        shows KvQuantSparseAttnSharedkv consumes this BF16-scale row layout.
+        shows KvQuantSparseAttnSharedkv consumes this rope/nope/e8m0-scale row
+        layout.
         """
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
         scale_dim = math.ceil(nope_dim / _A5_KV_QUANT_GROUP_SIZE)
         packed_dim = buf.shape[-1]
         rope_bytes = rope_dim * 2
-        scale_bytes = scale_dim * 2
+        scale_bytes = scale_dim
         data_bytes = rope_bytes + nope_dim + scale_bytes
         if data_bytes > packed_dim:
             raise RuntimeError(
@@ -629,7 +630,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             .to(torch.float8_e4m3fn)
             .contiguous()
         )
-        scale_bf16 = scale.to(torch.bfloat16).contiguous()
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is None:
+            raise RuntimeError(
+                "DSV4 A5 KV quant-mode1 pack requires torch.float8_e8m0fnu "
+                "for nope_quant_scale."
+            )
+        scale_e8m0 = scale.to(e8m0_dtype).contiguous()
 
         rows = torch.zeros(
             cache_valid.shape[0],
@@ -644,7 +651,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         rows[
             :,
             rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes,
-        ] = scale_bf16.view(torch.uint8).view(-1, scale_bytes)
+        ] = scale_e8m0.view(torch.uint8).view(-1, scale_bytes)
 
         buf_u8 = buf.view(torch.uint8).view(-1, packed_dim)
         torch_npu.npu_scatter_nd_update_(buf_u8, slots.unsqueeze(-1), rows)
