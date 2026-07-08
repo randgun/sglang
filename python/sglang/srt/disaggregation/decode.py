@@ -101,6 +101,29 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+def _is_dsv4_decode_scheduler(scheduler: Scheduler) -> bool:
+    if not _is_npu:
+        return False
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return False
+    try:
+        token_to_kv_pool = allocator.get_kvcache()
+    except AttributeError:
+        return False
+    return isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+
+
+def _should_commit_before_decode_queue_for_dsv4_mtp(scheduler: Scheduler) -> bool:
+    return (
+        _is_dsv4_decode_scheduler(scheduler)
+        and not scheduler.spec_algorithm.is_none()
+        and scheduler.enable_overlap
+        and bool(getattr(scheduler, "last_batch", None))
+        and len(getattr(scheduler, "result_queue", ())) > 0
+    )
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -1880,6 +1903,10 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            processed_last_before_decode_queue = False
+            if _should_commit_before_decode_queue_for_dsv4_mtp(self):
+                pop_and_process()
+                processed_last_before_decode_queue = True
             self.process_decode_queue()
             if self._engine_paused:
                 continue
@@ -1892,8 +1919,13 @@ class SchedulerDisaggregationDecodeMixin:
             # overlap + spec + grammar is unsupported (would desync DP ranks).
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
-            if disable_overlap_for_batch and self.last_batch:
+            if (
+                disable_overlap_for_batch
+                and self.last_batch
+                and not processed_last_before_decode_queue
+            ):
                 pop_and_process()
+                processed_last_before_decode_queue = True
 
             # Launch the current batch
             if batch:
@@ -1904,7 +1936,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not processed_last_before_decode_queue
+                ):
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
