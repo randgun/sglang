@@ -607,6 +607,7 @@ def _debug_probe_dense_reference_attention(
     q: torch.Tensor,
     kv: Optional[torch.Tensor],
     out: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
     layer: RadixAttention,
     path: str,
     compress_ratio: int,
@@ -647,7 +648,34 @@ def _debug_probe_dense_reference_attention(
             diagonal=1,
         )
         scores = scores.masked_fill(causal.unsqueeze(1), float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
+        sink_used = False
+        sink_shape = tuple(attn_sink.shape) if attn_sink is not None else None
+        sink_min = float("nan")
+        sink_max = float("nan")
+        if attn_sink is not None:
+            sink = attn_sink.to(torch.float32).reshape(-1)
+            if sink.numel() >= q.shape[1]:
+                sink = sink[: q.shape[1]]
+                sink_finite = sink[torch.isfinite(sink)]
+                if sink_finite.numel() > 0:
+                    sink_min = float(sink_finite.min().item())
+                    sink_max = float(sink_finite.max().item())
+                sink_scores = sink.view(1, q.shape[1], 1).expand(q.shape[0], -1, 1)
+                probs = torch.softmax(
+                    torch.cat((scores, sink_scores), dim=-1), dim=-1
+                )[..., : scores.shape[-1]]
+                sink_used = True
+            else:
+                _debug_log_limited(
+                    f"ref-attn-sink-shape-{path}-{layer.layer_id}-{compress_ratio}",
+                    "DSV4 NPU reference attention sink skipped: "
+                    f"path={path}, layer_id={layer.layer_id}, "
+                    f"compress_ratio={compress_ratio}, q_shape={tuple(q.shape)}, "
+                    f"sink_shape={sink_shape}",
+                )
+                probs = torch.softmax(scores, dim=-1)
+        else:
+            probs = torch.softmax(scores, dim=-1)
         ref = torch.einsum("ths,sd->thd", probs, kv_f).to(q.dtype)
         _debug_probe_attention_tensor(
             ref,
@@ -672,6 +700,8 @@ def _debug_probe_dense_reference_attention(
                 "DSV4 NPU reference attention diff: "
                 f"path={path}, layer_id={layer.layer_id}, "
                 f"compress_ratio={compress_ratio}, shape={tuple(out.shape)}, "
+                f"sink_used={sink_used}, sink_shape={sink_shape}, "
+                f"sink_min={sink_min}, sink_max={sink_max}, "
                 f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
                 f"out_abs_mean={float(out_f.abs().mean().item())}, "
                 f"ref_abs_mean={float(ref_f.abs().mean().item())}",
@@ -2513,6 +2543,7 @@ class DeepseekV4AscendAttnBackend(
             q=q,
             kv=getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id),
             out=out,
+            attn_sink=attn_sink,
             layer=layer,
             path="dense",
             compress_ratio=1,
@@ -2605,6 +2636,7 @@ class DeepseekV4AscendAttnBackend(
             q=q,
             kv=getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id),
             out=out,
+            attn_sink=attn_sink,
             layer=layer,
             path="compressed",
             compress_ratio=compress_ratio,
