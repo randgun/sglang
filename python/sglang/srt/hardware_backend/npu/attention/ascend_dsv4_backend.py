@@ -39,6 +39,7 @@ _DEBUG_CACHE_META_ENV = "SGLANG_DSV4_NPU_DEBUG_CACHE_META"
 _DEBUG_REF_ATTN_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN"
 _DEBUG_REF_ATTN_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN_LAYER"
 _FUSED_COMPRESSOR_ENV = "SGLANG_DSV4_NPU_FUSED_COMPRESSOR"
+_FUSED_COMPRESSOR_R128_ENV = "SGLANG_DSV4_NPU_FUSED_COMPRESSOR_R128"
 _debug_log_counts: dict[str, int] = {}
 
 
@@ -1001,16 +1002,24 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
+        ratio = compressor.ratio
         if not forward_batch.forward_mode.is_decode() or not get_bool_env_var(
             _FUSED_COMPRESSOR_ENV, "true"
         ):
+            return self._forward_compress_native(compressor, x, forward_batch)
+        if ratio == 128 and not get_bool_env_var(_FUSED_COMPRESSOR_R128_ENV):
+            _debug_log_limited(
+                f"fused-compressor-r128-disabled-{compressor.layer_id}",
+                "DSV4 NPU fused compressor r128 disabled; "
+                f"layer_id={compressor.layer_id}, using native fallback. "
+                f"Set {_FUSED_COMPRESSOR_R128_ENV}=1 to force fused r128.",
+            )
             return self._forward_compress_native(compressor, x, forward_batch)
 
         from sglang.srt.layers.deepseek_v4_rope import (
             get_fused_compressor_rope_cos_sin,
         )
 
-        ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
         device = x.device
         self._ensure_compressor_hadamard(compressor, device)
