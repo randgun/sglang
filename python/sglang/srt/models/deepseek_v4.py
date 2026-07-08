@@ -154,6 +154,7 @@ _DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_INVALID_ALL
 _DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _DSV4_NPU_FORCE_TORCH_HC_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC"
+_DSV4_NPU_FORCE_TORCH_HC_HEAD_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC_HEAD"
 _dsv4_npu_model_debug_log_counts: dict[str, int] = {}
 
 
@@ -163,6 +164,10 @@ def _dsv4_npu_model_debug_enabled() -> bool:
 
 def _dsv4_npu_force_torch_hc() -> bool:
     return _is_npu and get_bool_env_var(_DSV4_NPU_FORCE_TORCH_HC_ENV)
+
+
+def _dsv4_npu_force_torch_hc_head() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_FORCE_TORCH_HC_HEAD_ENV)
 
 
 def _dsv4_npu_model_target_layers() -> Optional[Set[int]]:
@@ -2096,7 +2101,17 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        if x.numel() > 0:
+        force_torch_hc_head = _dsv4_npu_force_torch_hc_head()
+        if force_torch_hc_head:
+            _dsv4_npu_model_log_limited(
+                "force-torch-hc-head",
+                (
+                    "DSV4 NPU torch HC head fallback enabled: "
+                    f"shape={tuple(x.shape)}, dtype={x.dtype}"
+                ),
+            )
+
+        if x.numel() > 0 and not force_torch_hc_head:
             from sglang.srt.layers.mhc_head import fused_hc_head
 
             return fused_hc_head(
