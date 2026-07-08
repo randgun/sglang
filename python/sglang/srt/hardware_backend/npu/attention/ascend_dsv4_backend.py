@@ -185,9 +185,13 @@ def _debug_probe_attention_tensor(
             finite_values = probe[finite].to(torch.float32)
             min_val = float(finite_values.min().item())
             max_val = float(finite_values.max().item())
+            abs_mean = float(finite_values.abs().mean().item())
+            abs_max = float(finite_values.abs().max().item())
         else:
             min_val = float("nan")
             max_val = float("nan")
+            abs_mean = float("nan")
+            abs_max = float("nan")
         _debug_log_limited(
             f"tensor-{path}-{layer_id}-{compress_ratio}-{label}",
             "DSV4 NPU attention tensor stats: "
@@ -195,7 +199,8 @@ def _debug_probe_attention_tensor(
             f"compress_ratio={compress_ratio}, shape={tuple(tensor.shape)}, "
             f"dtype={tensor.dtype}, finite_count={finite_count}, "
             f"nan_count={nan_count}, inf_count={inf_count}, "
-            f"zero_count={zero_count}, finite_min={min_val}, finite_max={max_val}",
+            f"zero_count={zero_count}, finite_min={min_val}, finite_max={max_val}, "
+            f"finite_abs_mean={abs_mean}, finite_abs_max={abs_max}",
         )
     except Exception as exc:
         _debug_log_limited(
@@ -601,6 +606,7 @@ def _debug_probe_dense_reference_attention(
     *,
     q: torch.Tensor,
     kv: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
     layer: RadixAttention,
     path: str,
     compress_ratio: int,
@@ -645,11 +651,39 @@ def _debug_probe_dense_reference_attention(
         ref = torch.einsum("ths,sd->thd", probs, kv_f).to(q.dtype)
         _debug_probe_attention_tensor(
             ref,
-            "dense-ref-out",
+            "ref-out",
             layer_id=layer.layer_id,
             path=path,
             compress_ratio=compress_ratio,
         )
+        if out is not None and out.shape == ref.shape:
+            diff = (out.to(torch.float32) - ref.to(torch.float32)).abs()
+            diff_finite = diff[torch.isfinite(diff)]
+            if diff_finite.numel() > 0:
+                max_abs_diff = float(diff_finite.max().item())
+                mean_abs_diff = float(diff_finite.mean().item())
+            else:
+                max_abs_diff = float("nan")
+                mean_abs_diff = float("nan")
+            out_f = out.to(torch.float32)
+            ref_f = ref.to(torch.float32)
+            _debug_log_limited(
+                f"ref-attn-diff-{path}-{layer.layer_id}-{compress_ratio}",
+                "DSV4 NPU reference attention diff: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, shape={tuple(out.shape)}, "
+                f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
+                f"out_abs_mean={float(out_f.abs().mean().item())}, "
+                f"ref_abs_mean={float(ref_f.abs().mean().item())}",
+            )
+        elif out is not None:
+            _debug_log_limited(
+                f"ref-attn-diff-shape-{path}-{layer.layer_id}-{compress_ratio}",
+                "DSV4 NPU reference attention diff skipped: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, out_shape={tuple(out.shape)}, "
+                f"ref_shape={tuple(ref.shape)}",
+            )
     except Exception as exc:
         _debug_log_limited(
             f"ref-attn-error-{path}-{layer.layer_id}-{compress_ratio}",
@@ -2478,6 +2512,7 @@ class DeepseekV4AscendAttnBackend(
         _debug_probe_dense_reference_attention(
             q=q,
             kv=getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id),
+            out=out,
             layer=layer,
             path="dense",
             compress_ratio=1,
@@ -2565,6 +2600,14 @@ class DeepseekV4AscendAttnBackend(
         out = _a5_from_rope_first_out(out)
         _debug_sync_npu(
             f"compressed attention layer_id={layer.layer_id} ratio={compress_ratio}"
+        )
+        _debug_probe_dense_reference_attention(
+            q=q,
+            kv=getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id),
+            out=out,
+            layer=layer,
+            path="compressed",
+            compress_ratio=compress_ratio,
         )
         invalid = _debug_probe_attention_output(
             out,
