@@ -156,6 +156,7 @@ _DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
 _DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
 _DSV4_NPU_FORCE_TORCH_HC_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC"
 _DSV4_NPU_FORCE_TORCH_HC_HEAD_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC_HEAD"
+_DSV4_NPU_DEBUG_HC_HEAD_REF_ENV = "SGLANG_DSV4_NPU_DEBUG_HC_HEAD_REF"
 _dsv4_npu_model_debug_log_counts: dict[str, int] = {}
 
 
@@ -173,6 +174,10 @@ def _dsv4_npu_force_torch_hc() -> bool:
 
 def _dsv4_npu_force_torch_hc_head() -> bool:
     return _is_npu and get_bool_env_var(_DSV4_NPU_FORCE_TORCH_HC_HEAD_ENV)
+
+
+def _dsv4_npu_debug_hc_head_ref() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_HC_HEAD_REF_ENV)
 
 
 def _dsv4_npu_model_target_layers() -> Optional[Set[int]]:
@@ -2155,6 +2160,7 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         force_torch_hc_head = _dsv4_npu_force_torch_hc_head()
+        debug_hc_head_ref = _dsv4_npu_debug_hc_head_ref()
         if force_torch_hc_head:
             _dsv4_npu_model_log_limited(
                 "force-torch-hc-head",
@@ -2167,7 +2173,7 @@ class DeepseekV4Model(nn.Module):
         if x.numel() > 0 and not force_torch_hc_head:
             from sglang.srt.layers.mhc_head import fused_hc_head
 
-            return fused_hc_head(
+            fused = fused_hc_head(
                 x.contiguous(),
                 hc_fn,
                 hc_scale,
@@ -2175,13 +2181,72 @@ class DeepseekV4Model(nn.Module):
                 norm_eps=self.norm_eps,
                 hc_eps=self.hc_eps,
             )
+            if debug_hc_head_ref and not _dsv4_npu_is_stream_capturing():
+                self._debug_hc_head_ref(fused, x, hc_fn, hc_scale, hc_base)
+            return fused
+        return self._hc_head_torch(x, hc_fn, hc_scale, hc_base)
+
+    def _hc_head_torch(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ):
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
+        flat = x.flatten(1).float()
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(flat, hc_fn) * rsqrt
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+        y = torch.sum(pre.unsqueeze(-1) * flat.reshape(shape), dim=1)
         return y.to(dtype)
+
+    def _debug_hc_head_ref(
+        self,
+        fused: torch.Tensor,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> None:
+        if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+            torch.npu.synchronize()
+
+        ref = self._hc_head_torch(x, hc_fn, hc_scale, hc_base)
+
+        if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+            torch.npu.synchronize()
+
+        diff = (fused.float() - ref.float()).abs()
+        finite = torch.isfinite(diff)
+        finite_count = int(finite.sum().item())
+        if finite_count > 0:
+            finite_diff = diff[finite]
+            max_abs_diff = float(finite_diff.max().item())
+            mean_abs_diff = float(finite_diff.mean().item())
+            topk = min(8, finite_diff.numel())
+            top_values, top_indices = torch.topk(finite_diff.flatten(), k=topk)
+            top_values_list = [float(v) for v in top_values.cpu().tolist()]
+            top_indices_list = [int(v) for v in top_indices.cpu().tolist()]
+        else:
+            max_abs_diff = float("nan")
+            mean_abs_diff = float("nan")
+            top_values_list = []
+            top_indices_list = []
+
+        _dsv4_npu_model_log_limited(
+            "hc-head-ref-diff",
+            (
+                "DSV4 NPU hc_head fused ref diff: "
+                f"shape={tuple(fused.shape)}, dtype={fused.dtype}, "
+                f"finite_count={finite_count}, "
+                f"nan_count={int(torch.isnan(diff).sum().item())}, "
+                f"inf_count={int(torch.isinf(diff).sum().item())}, "
+                f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
+                f"top_abs_diff_values={top_values_list}, "
+                f"top_abs_diff_flat_indices={top_indices_list}"
+            ),
+        )
 
     def forward(
         self,
