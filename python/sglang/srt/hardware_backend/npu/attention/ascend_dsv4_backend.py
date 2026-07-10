@@ -12,6 +12,8 @@ from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -19,6 +21,885 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+_A5_KV_TILE_SIZE = 64
+_A5_KV_ROPE_HEAD_DIM = 64
+_A5_KV_QUANT_MODE_DEFAULT = 1
+_A5_KV_QUANT_MODE_ENV = "SGLANG_DSV4_NPU_KV_QUANT_MODE"
+_A5_ROPE_FIRST_QK_ENV = "SGLANG_DSV4_NPU_ROPE_FIRST_QK"
+_FORCE_BF16_INDEXER_ENV = "SGLANG_DSV4_NPU_FORCE_BF16_INDEXER"
+_DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
+_DEBUG_ATTN_ENV = "SGLANG_DSV4_NPU_DEBUG_ATTN"
+_DEBUG_TOPK_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK"
+_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_DEBUG_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_LAYER"
+_DEBUG_TOPK_SAMPLE_COLS_ENV = "SGLANG_DSV4_NPU_DEBUG_TOPK_SAMPLE_COLS"
+_DEBUG_CACHE_META_ENV = "SGLANG_DSV4_NPU_DEBUG_CACHE_META"
+_DEBUG_REF_ATTN_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN"
+_DEBUG_REF_ATTN_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_REF_ATTN_LAYER"
+_FUSED_COMPRESSOR_ENV = "SGLANG_DSV4_NPU_FUSED_COMPRESSOR"
+_FUSED_COMPRESSOR_R128_ENV = "SGLANG_DSV4_NPU_FUSED_COMPRESSOR_R128"
+_debug_log_counts: dict[str, int] = {}
+
+
+def _is_npu_stream_capturing() -> bool:
+    if get_is_capture_mode():
+        return True
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _a5_kv_quant_mode() -> int:
+    return get_int_env_var(_A5_KV_QUANT_MODE_ENV, _A5_KV_QUANT_MODE_DEFAULT)
+
+
+def _a5_use_rope_first_qk() -> bool:
+    return get_bool_env_var(_A5_ROPE_FIRST_QK_ENV, "true")
+
+
+def _a5_to_rope_first_q(q: torch.Tensor) -> torch.Tensor:
+    if not _a5_use_rope_first_qk():
+        return q
+    rope_dim = _A5_KV_ROPE_HEAD_DIM
+    return torch.cat([q[..., -rope_dim:], q[..., :-rope_dim]], dim=-1).contiguous()
+
+
+def _a5_from_rope_first_out(out: torch.Tensor) -> torch.Tensor:
+    if not _a5_use_rope_first_qk():
+        return out
+    rope_dim = _A5_KV_ROPE_HEAD_DIM
+    return torch.cat([out[..., rope_dim:], out[..., :rope_dim]], dim=-1).contiguous()
+
+
+def _debug_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _debug_should_probe_layer(layer_id: int) -> bool:
+    target_layer = get_int_env_var(_DEBUG_LAYER_ENV, -1)
+    return target_layer < 0 or layer_id == target_layer
+
+
+def _debug_attention_enabled() -> bool:
+    return get_bool_env_var(_DEBUG_NAN_ENV) or get_bool_env_var(_DEBUG_ATTN_ENV)
+
+
+def _debug_should_probe_attention(layer_id: int) -> bool:
+    return (
+        _debug_attention_enabled()
+        and _debug_should_probe_layer(layer_id)
+        and not _is_npu_stream_capturing()
+    )
+
+
+def _debug_sync_npu(label: str) -> None:
+    if not get_bool_env_var(_DEBUG_SYNC_ENV):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU debug sync failed after %s", label)
+        raise
+
+
+def _debug_probe_attention_output(
+    out: torch.Tensor,
+    *,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> bool:
+    if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return False
+    if not _debug_should_probe_layer(layer_id):
+        return False
+    if _is_npu_stream_capturing():
+        return False
+    try:
+        nan_count = int(torch.isnan(out).sum().item())
+        inf_count = int(torch.isinf(out).sum().item())
+        if nan_count == 0 and inf_count == 0:
+            return False
+        finite = torch.isfinite(out)
+        finite_count = int(finite.sum().item())
+        if finite_count > 0:
+            finite_values = out[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+        _debug_log_limited(
+            f"nan-{path}-{layer_id}-{compress_ratio}",
+            "DSV4 NPU attention produced invalid values: "
+            f"path={path}, layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"shape={tuple(out.shape)}, dtype={out.dtype}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, "
+            f"finite_min={min_val}, finite_max={max_val}",
+        )
+        return True
+    except Exception as exc:
+        _debug_log_limited(
+            f"nan-probe-error-{path}",
+            f"DSV4 NPU attention NaN probe failed for {path}: {exc}",
+        )
+        return False
+
+
+def _debug_probe_attention_tensor(
+    tensor: torch.Tensor,
+    label: str,
+    *,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if not _debug_should_probe_attention(layer_id):
+        return
+    _debug_sync_npu(f"{path} attention probe {label} layer_id={layer_id}")
+    try:
+        probe = tensor
+        if (
+            probe.dtype == torch.float8_e4m3fn
+            or probe.dtype == getattr(torch, "float8_e4m3fnuz", None)
+        ):
+            probe = probe.to(torch.float32)
+        elif not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+            abs_mean = float(finite_values.abs().mean().item())
+            abs_max = float(finite_values.abs().max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+            abs_mean = float("nan")
+            abs_max = float("nan")
+        _debug_log_limited(
+            f"tensor-{path}-{layer_id}-{compress_ratio}-{label}",
+            "DSV4 NPU attention tensor stats: "
+            f"label={label}, path={path}, layer_id={layer_id}, "
+            f"compress_ratio={compress_ratio}, shape={tuple(tensor.shape)}, "
+            f"dtype={tensor.dtype}, finite_count={finite_count}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, "
+            f"zero_count={zero_count}, finite_min={min_val}, finite_max={max_val}, "
+            f"finite_abs_mean={abs_mean}, finite_abs_max={abs_max}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"tensor-probe-error-{path}-{label}",
+            f"DSV4 NPU attention tensor probe failed for {path}/{label}: {exc}",
+        )
+
+
+def _debug_probe_invalid_tensor(
+    tensor: torch.Tensor,
+    label: str,
+    *,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> bool:
+    if not get_bool_env_var(_DEBUG_NAN_ENV):
+        return False
+    if not _debug_should_probe_layer(layer_id):
+        return False
+    if _is_npu_stream_capturing():
+        return False
+    _debug_sync_npu(f"{path} invalid probe {label} layer_id={layer_id}")
+    try:
+        probe = tensor
+        if (
+            probe.dtype == torch.float8_e4m3fn
+            or probe.dtype == getattr(torch, "float8_e4m3fnuz", None)
+        ):
+            probe = probe.to(torch.float32)
+        elif not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        if nan_count == 0 and inf_count == 0:
+            return False
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+        _debug_log_limited(
+            f"invalid-{path}-{layer_id}-{compress_ratio}-{label}",
+            "DSV4 NPU tensor contains invalid values: "
+            f"label={label}, path={path}, layer_id={layer_id}, "
+            f"compress_ratio={compress_ratio}, shape={tuple(tensor.shape)}, "
+            f"dtype={tensor.dtype}, finite_count={finite_count}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, "
+            f"zero_count={zero_count}, finite_min={min_val}, finite_max={max_val}",
+        )
+        return True
+    except Exception as exc:
+        _debug_log_limited(
+            f"invalid-probe-error-{path}-{label}",
+            f"DSV4 NPU invalid tensor probe failed for {path}/{label}: {exc}",
+        )
+        return False
+
+
+def _debug_tensor_sample(tensor: Optional[torch.Tensor], limit: int = 16):
+    if tensor is None:
+        return None
+    if _is_npu_stream_capturing():
+        return "<capturing>"
+    try:
+        flat = tensor.detach().reshape(-1)[:limit]
+        return flat.cpu().tolist()
+    except Exception as exc:
+        return f"<sample failed: {exc}>"
+
+
+def _debug_probe_cache_metadata(
+    *,
+    forward_batch: ForwardBatch,
+    fm,
+    pool,
+    ori_kv: torch.Tensor,
+    layer_id: int,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if not (
+        get_bool_env_var(_DEBUG_CACHE_META_ENV) or _debug_attention_enabled()
+    ):
+        return
+    if not _debug_should_probe_layer(layer_id):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        out_cache_loc = forward_batch.out_cache_loc
+        swa_loc = pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int64)
+        page_size = int(ori_kv.shape[1])
+        swa_pages = swa_loc // page_size
+        swa_offsets = swa_loc % page_size
+        page_table = getattr(fm, "swa_page_table", None)
+        seq_lens = getattr(fm, "actual_seq_lengths_kv", None)
+        _debug_log_limited(
+            f"cache-meta-{path}-{layer_id}-{compress_ratio}",
+            "DSV4 NPU cache metadata: "
+            f"path={path}, layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"page_size={page_size}, out_cache_loc={_debug_tensor_sample(out_cache_loc)}, "
+            f"swa_loc={_debug_tensor_sample(swa_loc)}, "
+            f"swa_pages={_debug_tensor_sample(swa_pages)}, "
+            f"swa_offsets={_debug_tensor_sample(swa_offsets)}, "
+            f"actual_seq_lengths_kv={_debug_tensor_sample(seq_lens)}, "
+            f"swa_page_table_row0={_debug_tensor_sample(page_table[0] if page_table is not None and page_table.shape[0] > 0 else None)}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"cache-meta-error-{path}-{layer_id}-{compress_ratio}",
+            "DSV4 NPU cache metadata probe failed: "
+            f"path={path}, layer_id={layer_id}, compress_ratio={compress_ratio}, exc={exc}",
+        )
+
+
+def _debug_probe_compressed_cache_metadata(
+    *,
+    forward_batch: ForwardBatch,
+    fm,
+    cmp_kv: torch.Tensor,
+    cmp_block_table: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    topk: Optional[torch.Tensor],
+) -> None:
+    if not (
+        get_bool_env_var(_DEBUG_CACHE_META_ENV) or _debug_attention_enabled()
+    ):
+        return
+    if not _debug_should_probe_layer(layer_id):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        page_size = int(cmp_kv.shape[1])
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        cmp_loc = getattr(fm, f"c{compress_ratio}_loc", None)
+        if cmp_loc is not None:
+            cmp_loc_i64 = cmp_loc.to(torch.int64)
+            cmp_pages = cmp_loc_i64 // page_size
+            cmp_offsets = cmp_loc_i64 % page_size
+        else:
+            cmp_pages = None
+            cmp_offsets = None
+        _debug_log_limited(
+            f"cache-meta-compressed-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed cache metadata: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"page_size={page_size}, cmp_kv_shape={tuple(cmp_kv.shape)}, "
+            f"seq_lens={_debug_tensor_sample(seq_lens)}, "
+            f"actual_seq_lengths_kv={_debug_tensor_sample(getattr(fm, 'actual_seq_lengths_kv', None))}, "
+            f"cmp_loc={_debug_tensor_sample(cmp_loc)}, "
+            f"cmp_pages={_debug_tensor_sample(cmp_pages)}, "
+            f"cmp_offsets={_debug_tensor_sample(cmp_offsets)}, "
+            f"cmp_block_table_row0={_debug_tensor_sample(cmp_block_table[0] if cmp_block_table.shape[0] > 0 else None)}, "
+            f"topk_row0={_debug_tensor_sample(topk[0] if topk is not None and topk.shape[0] > 0 else None)}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"cache-meta-compressed-error-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed cache metadata probe failed: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, exc={exc}",
+        )
+
+
+def _debug_probe_active_compressed_rows(
+    *,
+    cmp_kv: torch.Tensor,
+    cmp_block_table: torch.Tensor,
+    topk: Optional[torch.Tensor],
+    layer_id: int,
+    compress_ratio: int,
+) -> None:
+    if not _debug_should_probe_attention(layer_id):
+        return
+    if topk is None or topk.numel() == 0 or cmp_block_table.numel() == 0:
+        return
+    try:
+        page_size = int(cmp_kv.shape[1])
+        valid_topk = topk.reshape(-1)
+        valid_topk = valid_topk[valid_topk >= 0].unique()
+        if valid_topk.numel() == 0:
+            _debug_log_limited(
+                f"active-cmp-empty-{layer_id}-{compress_ratio}",
+                "DSV4 NPU compressed active row probe skipped: "
+                f"layer_id={layer_id}, compress_ratio={compress_ratio}, no valid topk",
+            )
+            return
+
+        sample_logical = valid_topk[:16].to(torch.int64)
+        block_ids = sample_logical // page_size
+        offsets = sample_logical % page_size
+        table_width = cmp_block_table.shape[1]
+        in_table = block_ids < table_width
+        pages = torch.full_like(block_ids, -1)
+        if bool(in_table.any().item()):
+            pages[in_table] = cmp_block_table[0, block_ids[in_table]].to(torch.int64)
+        active_locs = pages * page_size + offsets
+        if (
+            cmp_kv.dtype == torch.float8_e4m3fn
+            or cmp_kv.dtype == getattr(torch, "float8_e4m3fnuz", None)
+        ):
+            flat_kv = cmp_kv.view(torch.uint8).view(-1, cmp_kv.shape[-1])
+            is_fp8_cache = True
+            active_label = "compressed-active-cmp-row-bytes"
+        else:
+            flat_kv = cmp_kv.flatten(0, 1)
+            is_fp8_cache = False
+            active_label = "compressed-active-cmp-rows"
+        in_cache = (pages >= 0) & (active_locs >= 0) & (active_locs < flat_kv.shape[0])
+        _debug_log_limited(
+            f"active-cmp-locs-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed active rows: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, "
+            f"logical={sample_logical.detach().cpu().tolist()}, "
+            f"pages={pages.detach().cpu().tolist()}, "
+            f"offsets={offsets.detach().cpu().tolist()}, "
+            f"active_locs={active_locs.detach().cpu().tolist()}, "
+            f"in_cache={in_cache.detach().cpu().tolist()}",
+        )
+        if bool(in_cache.any().item()):
+            active_locs_in_cache = active_locs[in_cache]
+            active_rows = flat_kv[active_locs_in_cache]
+            _debug_probe_attention_tensor(
+                active_rows,
+                active_label,
+                layer_id=layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            if is_fp8_cache:
+                # Indexing DT_FLOAT8_E4M3FN tensors is not supported by the NPU
+                # index kernel. Gather bytes first, then decode the tiny sample
+                # on CPU according to the packed A5 row layout:
+                # rope bf16 bytes, nope fp8 bytes, E8M0 scale bytes, padding.
+                active_rows_cpu = active_rows.detach().cpu().contiguous()
+                rope_bytes = _A5_KV_ROPE_HEAD_DIM * 2
+                nope_dim = 512 - _A5_KV_ROPE_HEAD_DIM
+                scale_bytes = nope_dim // _A5_KV_TILE_SIZE
+                decoded_rope = (
+                    active_rows_cpu[:, :rope_bytes]
+                    .contiguous()
+                    .view(torch.bfloat16)
+                    .to(torch.float32)
+                )
+                decoded_nope = (
+                    active_rows_cpu[:, rope_bytes : rope_bytes + nope_dim]
+                    .contiguous()
+                    .view(cmp_kv.dtype)
+                    .to(torch.float32)
+                )
+                scale_raw = active_rows_cpu[
+                    :,
+                    rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes,
+                ].to(torch.float32)
+                padding_raw = active_rows_cpu[
+                    :, rope_bytes + nope_dim + scale_bytes :
+                ].to(torch.float32)
+                _debug_probe_attention_tensor(
+                    decoded_rope,
+                    "compressed-active-cmp-rope-bf16-decoded",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+                _debug_probe_attention_tensor(
+                    decoded_nope,
+                    "compressed-active-cmp-nope-fp8-decoded",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+                _debug_probe_attention_tensor(
+                    scale_raw,
+                    "compressed-active-cmp-scale-e8m0-bytes",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+                _debug_probe_attention_tensor(
+                    padding_raw,
+                    "compressed-active-cmp-padding-bytes",
+                    layer_id=layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+    except Exception as exc:
+        _debug_log_limited(
+            f"active-cmp-error-{layer_id}-{compress_ratio}",
+            "DSV4 NPU compressed active row probe failed: "
+            f"layer_id={layer_id}, compress_ratio={compress_ratio}, exc={exc}",
+        )
+
+
+def _debug_probe_active_dense_rows(
+    *,
+    forward_batch: ForwardBatch,
+    pool,
+    ori_kv: torch.Tensor,
+    layer_id: int,
+) -> None:
+    if not _debug_should_probe_attention(layer_id):
+        return
+    try:
+        swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        sample_locs = swa_loc.reshape(-1).to(torch.int64)[:16]
+        flat_bytes = ori_kv.view(torch.uint8).view(-1, ori_kv.shape[-1])
+        in_cache = (sample_locs >= 0) & (sample_locs < flat_bytes.shape[0])
+        _debug_log_limited(
+            f"active-dense-locs-{layer_id}",
+            "DSV4 NPU dense active rows: "
+            f"layer_id={layer_id}, swa_loc={_debug_tensor_sample(sample_locs)}, "
+            f"in_cache={_debug_tensor_sample(in_cache)}",
+        )
+        if not bool(in_cache.any().item()):
+            return
+
+        active_rows = flat_bytes[sample_locs[in_cache]]
+        _debug_probe_attention_tensor(
+            active_rows,
+            "dense-active-row-bytes",
+            layer_id=layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
+
+        active_rows_cpu = active_rows.detach().cpu().contiguous()
+        rope_bytes = _A5_KV_ROPE_HEAD_DIM * 2
+        nope_dim = 512 - _A5_KV_ROPE_HEAD_DIM
+        scale_bytes_64 = nope_dim // _A5_KV_TILE_SIZE
+        scale_bytes_128 = math.ceil(nope_dim / 128)
+
+        rope_first_rope = (
+            active_rows_cpu[:, :rope_bytes]
+            .contiguous()
+            .view(torch.bfloat16)
+            .to(torch.float32)
+        )
+        rope_first_nope = (
+            active_rows_cpu[:, rope_bytes : rope_bytes + nope_dim]
+            .contiguous()
+            .view(ori_kv.dtype)
+            .to(torch.float32)
+        )
+        rope_first_scale64 = active_rows_cpu[
+            :, rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes_64
+        ].to(torch.float32)
+        rope_first_scale128 = active_rows_cpu[
+            :, rope_bytes + nope_dim : rope_bytes + nope_dim + scale_bytes_128
+        ].to(torch.float32)
+
+        nope_first_nope = (
+            active_rows_cpu[:, :nope_dim]
+            .contiguous()
+            .view(ori_kv.dtype)
+            .to(torch.float32)
+        )
+        nope_first_rope = (
+            active_rows_cpu[:, nope_dim : nope_dim + rope_bytes]
+            .contiguous()
+            .view(torch.bfloat16)
+            .to(torch.float32)
+        )
+        nope_first_scale64 = active_rows_cpu[
+            :, nope_dim + rope_bytes : nope_dim + rope_bytes + scale_bytes_64
+        ].to(torch.float32)
+        nope_first_scale128 = active_rows_cpu[
+            :, nope_dim + rope_bytes : nope_dim + rope_bytes + scale_bytes_128
+        ].to(torch.float32)
+
+        for label, tensor in (
+            ("dense-active-rope-first-rope-bf16-decoded", rope_first_rope),
+            ("dense-active-rope-first-nope-fp8-decoded", rope_first_nope),
+            ("dense-active-rope-first-scale64-bytes", rope_first_scale64),
+            ("dense-active-rope-first-scale128-bytes", rope_first_scale128),
+            ("dense-active-nope-first-rope-bf16-decoded", nope_first_rope),
+            ("dense-active-nope-first-nope-fp8-decoded", nope_first_nope),
+            ("dense-active-nope-first-scale64-bytes", nope_first_scale64),
+            ("dense-active-nope-first-scale128-bytes", nope_first_scale128),
+        ):
+            _debug_probe_attention_tensor(
+                tensor,
+                label,
+                layer_id=layer_id,
+                path="dense",
+                compress_ratio=1,
+            )
+    except Exception as exc:
+        _debug_log_limited(
+            f"active-dense-error-{layer_id}",
+            "DSV4 NPU dense active row probe failed: "
+            f"layer_id={layer_id}, exc={exc}",
+        )
+
+
+def _debug_probe_dense_reference_attention(
+    *,
+    q: torch.Tensor,
+    kv: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    layer: RadixAttention,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_REF_ATTN_ENV):
+        return
+    if layer.layer_id != get_int_env_var(_DEBUG_REF_ATTN_LAYER_ENV, 0):
+        return
+    if _is_npu_stream_capturing():
+        return
+    if kv is None:
+        _debug_log_limited(
+            f"ref-attn-missing-{path}-{layer.layer_id}-{compress_ratio}",
+            "DSV4 NPU reference attention skipped: missing saved BF16 KV "
+            f"for path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}",
+        )
+        return
+    try:
+        kv_2d = kv.reshape(-1, kv.shape[-1])
+        if q.shape[0] != kv_2d.shape[0] or q.shape[0] > 128:
+            _debug_log_limited(
+                f"ref-attn-shape-{path}-{layer.layer_id}-{compress_ratio}",
+                "DSV4 NPU reference attention skipped: "
+                f"path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}, "
+                f"q_shape={tuple(q.shape)}, kv_shape={tuple(kv.shape)}",
+            )
+            return
+        q_f = q.to(torch.float32)
+        kv_f = kv_2d.to(torch.float32)
+        scores = torch.einsum("thd,sd->ths", q_f, kv_f) * layer.scaling
+        causal = torch.triu(
+            torch.ones(
+                q.shape[0],
+                q.shape[0],
+                dtype=torch.bool,
+                device=q.device,
+            ),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal.unsqueeze(1), float("-inf"))
+        sink_used = False
+        sink_shape = tuple(attn_sink.shape) if attn_sink is not None else None
+        sink_min = float("nan")
+        sink_max = float("nan")
+        if attn_sink is not None:
+            sink = attn_sink.to(torch.float32).reshape(-1)
+            if sink.numel() >= q.shape[1]:
+                sink = sink[: q.shape[1]]
+                sink_finite = sink[torch.isfinite(sink)]
+                if sink_finite.numel() > 0:
+                    sink_min = float(sink_finite.min().item())
+                    sink_max = float(sink_finite.max().item())
+                sink_scores = sink.view(1, q.shape[1], 1).expand(q.shape[0], -1, 1)
+                probs = torch.softmax(
+                    torch.cat((scores, sink_scores), dim=-1), dim=-1
+                )[..., : scores.shape[-1]]
+                sink_used = True
+            else:
+                _debug_log_limited(
+                    f"ref-attn-sink-shape-{path}-{layer.layer_id}-{compress_ratio}",
+                    "DSV4 NPU reference attention sink skipped: "
+                    f"path={path}, layer_id={layer.layer_id}, "
+                    f"compress_ratio={compress_ratio}, q_shape={tuple(q.shape)}, "
+                    f"sink_shape={sink_shape}",
+                )
+                probs = torch.softmax(scores, dim=-1)
+        else:
+            probs = torch.softmax(scores, dim=-1)
+        ref = torch.einsum("ths,sd->thd", probs, kv_f).to(q.dtype)
+        _debug_probe_attention_tensor(
+            ref,
+            "ref-out",
+            layer_id=layer.layer_id,
+            path=path,
+            compress_ratio=compress_ratio,
+        )
+        if out is not None and out.shape == ref.shape:
+            diff = (out.to(torch.float32) - ref.to(torch.float32)).abs()
+            diff_finite = diff[torch.isfinite(diff)]
+            if diff_finite.numel() > 0:
+                max_abs_diff = float(diff_finite.max().item())
+                mean_abs_diff = float(diff_finite.mean().item())
+            else:
+                max_abs_diff = float("nan")
+                mean_abs_diff = float("nan")
+            out_f = out.to(torch.float32)
+            ref_f = ref.to(torch.float32)
+            _debug_log_limited(
+                f"ref-attn-diff-{path}-{layer.layer_id}-{compress_ratio}",
+                "DSV4 NPU reference attention diff: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, shape={tuple(out.shape)}, "
+                f"sink_used={sink_used}, sink_shape={sink_shape}, "
+                f"sink_min={sink_min}, sink_max={sink_max}, "
+                f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
+                f"out_abs_mean={float(out_f.abs().mean().item())}, "
+                f"ref_abs_mean={float(ref_f.abs().mean().item())}",
+            )
+        elif out is not None:
+            _debug_log_limited(
+                f"ref-attn-diff-shape-{path}-{layer.layer_id}-{compress_ratio}",
+                "DSV4 NPU reference attention diff skipped: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, out_shape={tuple(out.shape)}, "
+                f"ref_shape={tuple(ref.shape)}",
+            )
+    except Exception as exc:
+        _debug_log_limited(
+            f"ref-attn-error-{path}-{layer.layer_id}-{compress_ratio}",
+            "DSV4 NPU reference attention probe failed: "
+            f"path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}, exc={exc}",
+        )
+
+
+def _debug_compare_compressed_with_dense_kernel(
+    *,
+    q: torch.Tensor,
+    q_attn: torch.Tensor,
+    ori_kv: torch.Tensor,
+    compressed_out: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    debug_kv: Optional[torch.Tensor],
+    layer: RadixAttention,
+    fm,
+    ori_win_left: int,
+    path: str,
+    compress_ratio: int,
+) -> None:
+    if compress_ratio != 128:
+        return
+    if not get_bool_env_var(_DEBUG_REF_ATTN_ENV):
+        return
+    if layer.layer_id != get_int_env_var(_DEBUG_REF_ATTN_LAYER_ENV, 0):
+        return
+    if _is_npu_stream_capturing():
+        return
+    key = f"dense-kernel-compare-{path}-{layer.layer_id}-{compress_ratio}"
+    if _debug_log_counts.get(key, 0) >= get_int_env_var(_DEBUG_MAX_PRINTS_ENV, 20):
+        return
+    try:
+        metadata = fm.kernel_metadata.get("c1a_metadata")
+        if metadata is None:
+            _debug_log_limited(
+                f"{key}-missing-metadata",
+                "DSV4 NPU dense kernel compare skipped: missing c1a_metadata "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}",
+            )
+            return
+        dense_kwargs = dict(
+            kv_quant_mode=_a5_kv_quant_mode(),
+            tile_size=_A5_KV_TILE_SIZE,
+            rope_head_dim=_A5_KV_ROPE_HEAD_DIM,
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_kv=fm.actual_seq_lengths_kv,
+            ori_mask_mode=4,
+            ori_win_left=ori_win_left,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q_attn,
+            ori_kv=ori_kv,
+            ori_block_table=fm.swa_page_table,
+            sinks=attn_sink,
+            metadata=metadata,
+            softmax_scale=layer.scaling,
+            cmp_ratio=1,
+        )
+        dense_out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(
+            **dense_kwargs
+        )
+        dense_out = _a5_from_rope_first_out(dense_out)
+        _debug_sync_npu(
+            f"dense kernel compare layer_id={layer.layer_id} ratio={compress_ratio}"
+        )
+        if compressed_out.shape == dense_out.shape:
+            diff = (compressed_out.to(torch.float32) - dense_out.to(torch.float32)).abs()
+            diff_finite = diff[torch.isfinite(diff)]
+            if diff_finite.numel() > 0:
+                max_abs_diff = float(diff_finite.max().item())
+                mean_abs_diff = float(diff_finite.mean().item())
+            else:
+                max_abs_diff = float("nan")
+                mean_abs_diff = float("nan")
+            dense_f = dense_out.to(torch.float32)
+            compressed_f = compressed_out.to(torch.float32)
+            _debug_log_limited(
+                key,
+                "DSV4 NPU compressed-vs-dense kernel diff: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, shape={tuple(compressed_out.shape)}, "
+                f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
+                f"compressed_abs_mean={float(compressed_f.abs().mean().item())}, "
+                f"dense_abs_mean={float(dense_f.abs().mean().item())}",
+            )
+        else:
+            _debug_log_limited(
+                key,
+                "DSV4 NPU compressed-vs-dense kernel diff skipped: "
+                f"path={path}, layer_id={layer.layer_id}, "
+                f"compress_ratio={compress_ratio}, "
+                f"compressed_shape={tuple(compressed_out.shape)}, "
+                f"dense_shape={tuple(dense_out.shape)}",
+            )
+        _debug_probe_attention_tensor(
+            dense_out,
+            "dense-kernel-out",
+            layer_id=layer.layer_id,
+            path=path,
+            compress_ratio=compress_ratio,
+        )
+        _debug_probe_dense_reference_attention(
+            q=q,
+            kv=debug_kv,
+            out=dense_out,
+            attn_sink=attn_sink,
+            layer=layer,
+            path=f"{path}-dense-kernel",
+            compress_ratio=1,
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"{key}-error",
+            "DSV4 NPU dense kernel compare failed: "
+            f"path={path}, layer_id={layer.layer_id}, compress_ratio={compress_ratio}, "
+            f"exc={exc}",
+        )
+
+
+def _debug_log_c4_topk(
+    topk: torch.Tensor,
+    forward_batch,
+    *,
+    layer_id: int,
+    index_topk: int,
+) -> None:
+    if not get_bool_env_var(_DEBUG_TOPK_ENV):
+        return
+    if not _debug_should_probe_layer(layer_id):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        valid = topk >= 0
+        invalid_lt_neg1 = int((topk < -1).sum().item())
+        all_neg1_rows = int((topk == -1).all(dim=-1).sum().item())
+        valid_count = int(valid.sum().item())
+        if valid_count > 0:
+            valid_topk = topk[valid]
+            min_valid = int(valid_topk.min().item())
+            max_valid = int(valid_topk.max().item())
+            unique_valid = int(valid_topk.unique().numel())
+        else:
+            min_valid = -1
+            max_valid = -1
+            unique_valid = 0
+
+        seq_lens = forward_batch.seq_lens.to(device=topk.device, dtype=torch.int32)
+        row_limits = None
+        if topk.shape[0] == seq_lens.numel():
+            row_limits = seq_lens // 4
+        else:
+            total_tokens = int(seq_lens.sum().item())
+            if topk.shape[0] == total_tokens:
+                row_limits = torch.repeat_interleave(seq_lens // 4, seq_lens)
+        if row_limits is not None:
+            row_limits = row_limits.view(-1, 1)
+            over_seq_limit = int(((topk >= row_limits) & valid).sum().item())
+            max_limit = int(row_limits.max().item()) if row_limits.numel() > 0 else 0
+        else:
+            over_seq_limit = -1
+            max_limit = -1
+
+        sample_cols = get_int_env_var(_DEBUG_TOPK_SAMPLE_COLS_ENV, 16)
+        sample_rows = (
+            topk[: min(4, topk.shape[0]), :sample_cols].detach().cpu().tolist()
+        )
+        _debug_log_limited(
+            f"topk-{layer_id}",
+            "DSV4 NPU C4 topk stats: "
+            f"layer_id={layer_id}, shape={tuple(topk.shape)}, index_topk={index_topk}, "
+            f"invalid_lt_neg1={invalid_lt_neg1}, over_seq_limit={over_seq_limit}, "
+            f"all_neg1_rows={all_neg1_rows}, valid_count={valid_count}, "
+            f"min_valid={min_valid}, max_valid={max_valid}, "
+            f"max_seq_limit={max_limit}, unique_valid={unique_valid}, "
+            f"sample_rows={sample_rows}",
+        )
+    except Exception as exc:
+        _debug_log_limited(
+            f"topk-probe-error-{layer_id}",
+            f"DSV4 NPU C4 topk probe failed for layer_id={layer_id}: {exc}",
+        )
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -219,22 +1100,29 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     )
                 else:
                     state_loc_decode = state_loc_decode.to(torch.int32)
-                compress_out_loc = torch.zeros(
-                    bs,
-                    dtype=torch.int32,
-                    device=device,
-                )
                 # bundle_loc and cmp_kv are both densely packed in batch order, so
                 # write them densely; indexing by batch slot would misalign them.
+                compress_out_loc = torch.empty(0, dtype=torch.int32, device=device)
                 if out_cache_loc_dsv4 is not None:
                     bundle_loc = (
                         out_cache_loc_dsv4.out_c4_loc
                         if ratio == 4
                         else out_cache_loc_dsv4.out_c128_loc
                     )
-                    n_compress = bundle_loc.numel()
+                    compress_out_loc = bundle_loc.to(torch.int32)
+                if is_graph:
+                    fixed_compress_out_loc = torch.full(
+                        (bs,),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    n_compress = min(compress_out_loc.numel(), bs)
                     if n_compress > 0:
-                        compress_out_loc[:n_compress] = bundle_loc.to(torch.int32)
+                        fixed_compress_out_loc[:n_compress] = compress_out_loc[
+                            :n_compress
+                        ]
+                    compress_out_loc = fixed_compress_out_loc
 
             result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
@@ -293,14 +1181,24 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        if not forward_batch.forward_mode.is_decode():
+        ratio = compressor.ratio
+        if not forward_batch.forward_mode.is_decode() or not get_bool_env_var(
+            _FUSED_COMPRESSOR_ENV, "true"
+        ):
+            return self._forward_compress_native(compressor, x, forward_batch)
+        if ratio == 128 and not get_bool_env_var(_FUSED_COMPRESSOR_R128_ENV):
+            _debug_log_limited(
+                f"fused-compressor-r128-disabled-{compressor.layer_id}",
+                "DSV4 NPU fused compressor r128 disabled; "
+                f"layer_id={compressor.layer_id}, using native fallback. "
+                f"Set {_FUSED_COMPRESSOR_R128_ENV}=1 to force fused r128.",
+            )
             return self._forward_compress_native(compressor, x, forward_batch)
 
         from sglang.srt.layers.deepseek_v4_rope import (
             get_fused_compressor_rope_cos_sin,
         )
 
-        ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
         device = x.device
         self._ensure_compressor_hadamard(compressor, device)
@@ -324,6 +1222,27 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         state_cache = pool.get_state_cache(
             compressor.layer_id, compressor.is_in_indexer
         )
+        if get_bool_env_var(_DEBUG_CACHE_META_ENV) and not _is_npu_stream_capturing():
+            try:
+                loc = getattr(fm, f"c{ratio}_loc", None)
+                state_loc = getattr(fm, f"c{ratio}_state_loc", None)
+                _debug_log_limited(
+                    f"fused-compressor-meta-{compressor.layer_id}-{ratio}",
+                    "DSV4 NPU fused compressor metadata: "
+                    f"layer_id={compressor.layer_id}, ratio={ratio}, "
+                    f"x_shape={tuple(x.shape)}, positions_cmp={_debug_tensor_sample(positions_cmp)}, "
+                    f"loc={_debug_tensor_sample(loc)}, state_loc={_debug_tensor_sample(state_loc)}, "
+                    f"start_pos={_debug_tensor_sample(start_pos)}, seqused={_debug_tensor_sample(seqused)}, "
+                    f"cu_seqlens={_debug_tensor_sample(cu_seqlens)}, "
+                    f"page_table_shape={tuple(page_table.shape)}, "
+                    f"page_table_row0={_debug_tensor_sample(page_table[0] if page_table.numel() > 0 else None)}",
+                )
+            except Exception as exc:
+                _debug_log_limited(
+                    f"fused-compressor-meta-error-{compressor.layer_id}-{ratio}",
+                    "DSV4 NPU fused compressor metadata probe failed: "
+                    f"layer_id={compressor.layer_id}, ratio={ratio}, exc={exc}",
+                )
 
         cos, sin = get_fused_compressor_rope_cos_sin(
             compressor.freqs_cis, positions_cmp, dtype=torch.float32
@@ -349,6 +1268,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             rotary_mode=2,
             cache_mode=1,
         )
+        _debug_probe_attention_tensor(
+            cmp_kv,
+            "fused-compressor-out",
+            layer_id=compressor.layer_id,
+            path=f"compressor-r{ratio}",
+            compress_ratio=ratio,
+        )
 
         # prefill output may be padded; trim to loc length
         loc = getattr(fm, f"c{ratio}_loc", None)
@@ -358,6 +1284,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if self.graph_mode or cmp_kv.shape[0] > 0:
             if compressor.rotate:
                 cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
+                _debug_probe_attention_tensor(
+                    cmp_kv,
+                    "fused-compressor-after-hadamard",
+                    layer_id=compressor.layer_id,
+                    path=f"compressor-r{ratio}",
+                    compress_ratio=ratio,
+                )
             self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
 
     def _forward_compress_native(
@@ -383,13 +1316,50 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         device = x.device
         self._ensure_compressor_hadamard(compressor, device)
         dtype = x.dtype
+        probe_kind = "indexer" if compressor.is_in_indexer else "attn"
+        probe_path = f"compressor-native-r{ratio}-{probe_kind}"
+        _debug_probe_attention_tensor(
+            x,
+            "compressor-input-x",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
         x_f32 = x.float()
         # wkv + wgate are fused into one wkv_gate.weight [2*coff*head_dim, hidden_size]
         # (kv concatenated before wgate); split along the output dim to recover each.
         coff = 1 + int(overlap)
         W = compressor.wkv_gate.weight.float()
+        _debug_probe_attention_tensor(
+            W[: coff * d],
+            "compressor-weight-kv",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
+        _debug_probe_attention_tensor(
+            W[coff * d :],
+            "compressor-weight-score",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
         kv_full = F.linear(x_f32, W[: coff * d])  # [T, coff*d]
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
+        _debug_probe_attention_tensor(
+            kv_full,
+            "compressor-kv-full",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
+        _debug_probe_attention_tensor(
+            score_full,
+            "compressor-score-full",
+            layer_id=compressor.layer_id,
+            path=probe_path,
+            compress_ratio=ratio,
+        )
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
         is_prefill = forward_batch.forward_mode.is_prefill()
@@ -516,6 +1486,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     kv_compressed = (kv * score.softmax(dim=1)).sum(
                         dim=1
                     )  # [n_chunks, d]
+                    _debug_probe_invalid_tensor(
+                        kv_compressed,
+                        "compressor-prefill-kv-compressed",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
                     n_compressed_this_req = kv_compressed.shape[0]
                     kv_out_list.append(kv_compressed)
                     kv_out_positions.append(pos_compressed)
@@ -548,6 +1525,20 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     state_loc_decode = backend_fm.c4_state_loc
                 else:
                     state_loc_decode = backend_fm.c128_state_loc
+                _debug_probe_attention_tensor(
+                    kv,
+                    "compressor-decode-write-kv",
+                    layer_id=compressor.layer_id,
+                    path=probe_path,
+                    compress_ratio=ratio,
+                )
+                _debug_probe_attention_tensor(
+                    score,
+                    "compressor-decode-write-score",
+                    layer_id=compressor.layer_id,
+                    path=probe_path,
+                    compress_ratio=ratio,
+                )
                 token_to_kv_pool.set_state_buffer(
                     compressor.layer_id,
                     state_loc_decode[idx : idx + 1],
@@ -563,6 +1554,33 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         kv_state, score_state = token_to_kv_pool.get_state_buffer(
                             compressor.layer_id, compressor.is_in_indexer, kv_indices
                         )
+                        if get_bool_env_var(
+                            _DEBUG_NAN_ENV
+                        ) and _debug_should_probe_layer(compressor.layer_id):
+                            _debug_log_limited(
+                                f"compressor-native-window-{compressor.layer_id}-{ratio}-{compressor.is_in_indexer}",
+                                "DSV4 NPU compressor decode window: "
+                                f"layer_id={compressor.layer_id}, ratio={ratio}, "
+                                f"from_indexer={compressor.is_in_indexer}, seqlen={seqlen}, "
+                                f"state_loc={_debug_tensor_sample(state_loc_decode[idx : idx + 1])}, "
+                                f"kv_indices={_debug_tensor_sample(kv_indices)}, "
+                                f"page_table_shape={tuple(page_table.shape)}, "
+                                f"page_table_row0={_debug_tensor_sample(page_table[0] if page_table.numel() > 0 else None)}",
+                            )
+                            _debug_probe_attention_tensor(
+                                kv_state,
+                                "compressor-decode-kv-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
+                            _debug_probe_attention_tensor(
+                                score_state,
+                                "compressor-decode-score-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
                         # kv_state / score_state: [2*r, 1, coff*d] → [2*r, d]
                         kv_state = kv_state.squeeze(1)
                         score_state = score_state.squeeze(1)
@@ -573,9 +1591,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                             [score_state[:ratio, :d], score_state[ratio:, d:]],
                             dim=0,
                         )
-                        kv_compressed = (kv_state * score_state.softmax(dim=0)).sum(
-                            dim=0, keepdim=True
-                        )
                     else:
                         kv_indices = _get_kv_indices(
                             forward_batch, ratio, page_table, idx, seqlen
@@ -583,9 +1598,65 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         kv_state, score_state = token_to_kv_pool.get_state_buffer(
                             compressor.layer_id, compressor.is_in_indexer, kv_indices
                         )
-                        kv_compressed = (
-                            kv_state[:, 0] * score_state[:, 0].softmax(dim=0)
-                        ).sum(dim=0, keepdim=True)
+                        if get_bool_env_var(
+                            _DEBUG_NAN_ENV
+                        ) and _debug_should_probe_layer(compressor.layer_id):
+                            _debug_log_limited(
+                                f"compressor-native-window-{compressor.layer_id}-{ratio}-{compressor.is_in_indexer}",
+                                "DSV4 NPU compressor decode window: "
+                                f"layer_id={compressor.layer_id}, ratio={ratio}, "
+                                f"from_indexer={compressor.is_in_indexer}, seqlen={seqlen}, "
+                                f"state_loc={_debug_tensor_sample(state_loc_decode[idx : idx + 1])}, "
+                                f"kv_indices={_debug_tensor_sample(kv_indices)}, "
+                                f"page_table_shape={tuple(page_table.shape)}, "
+                                f"page_table_row0={_debug_tensor_sample(page_table[0] if page_table.numel() > 0 else None)}",
+                            )
+                            _debug_probe_attention_tensor(
+                                kv_state,
+                                "compressor-decode-kv-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
+                            _debug_probe_attention_tensor(
+                                score_state,
+                                "compressor-decode-score-state-raw",
+                                layer_id=compressor.layer_id,
+                                path=probe_path,
+                                compress_ratio=ratio,
+                            )
+                        kv_state = kv_state[:, 0]
+                        score_state = score_state[:, 0]
+                    _debug_probe_attention_tensor(
+                        kv_state,
+                        "compressor-decode-kv-state-window",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
+                    _debug_probe_attention_tensor(
+                        score_state,
+                        "compressor-decode-score-state-window",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
+                    score_weight = score_state.softmax(dim=0)
+                    _debug_probe_attention_tensor(
+                        score_weight,
+                        "compressor-decode-score-softmax",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
+                    kv_compressed = (kv_state * score_weight).sum(dim=0, keepdim=True)
+                    _debug_probe_invalid_tensor(
+                        kv_compressed,
+                        "compressor-decode-kv-compressed",
+                        layer_id=compressor.layer_id,
+                        path=probe_path,
+                        compress_ratio=ratio,
+                    )
                     kv_out_list.append(kv_compressed)
                     kv_out_positions.append(pos_req)
                     # Decode: 1 compressed token at compressed_seq_pos = seqlen//ratio - 1
@@ -602,6 +1673,20 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             kv_state_cat = torch.cat(kv_state_to_be_cached, dim=0).unsqueeze(1)
             score_state_cat = torch.cat(score_state_to_be_cached, dim=0).unsqueeze(1)
             state_loc_cat = torch.cat(state_loc_list, dim=0)
+            _debug_probe_attention_tensor(
+                kv_state_cat,
+                "compressor-state-write-kv",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
+            _debug_probe_attention_tensor(
+                score_state_cat,
+                "compressor-state-write-score",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             token_to_kv_pool.set_state_buffer(
                 compressor.layer_id,
                 state_loc_cat,
@@ -615,7 +1700,21 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if kv_out_list:
             kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
             pos_out = torch.cat(kv_out_positions, dim=0)
+            _debug_probe_invalid_tensor(
+                kv_out,
+                "compressor-kv-out-before-norm",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             kv_out = compressor.norm(kv_out)
+            _debug_probe_invalid_tensor(
+                kv_out,
+                "compressor-kv-out-after-norm",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             # npu_rotary_mul wants cos/sin in repeat_interleave(2) layout, reshaped
             # to (T, 1, 1, rope_dim); cos=real, sin=imag of the complex freqs_cis.
             rope_dim = compressor.rope_head_dim
@@ -645,8 +1744,22 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 rope_view, cos, sin, rotary_mode="interleave"
             )
             rope_slice.copy_(rope_rot.view_as(rope_slice))
+            _debug_probe_invalid_tensor(
+                kv_out,
+                "compressor-kv-out-after-rope",
+                layer_id=compressor.layer_id,
+                path=probe_path,
+                compress_ratio=ratio,
+            )
             if compressor.rotate:
                 kv_out = _apply_hadamard(kv_out, compressor.hadamard_matrix)
+                _debug_probe_invalid_tensor(
+                    kv_out,
+                    "compressor-kv-out-after-hadamard",
+                    layer_id=compressor.layer_id,
+                    path=probe_path,
+                    compress_ratio=ratio,
+                )
             # c{N}_kv_pool slot per compressed token. DSV4NPUReqToTokenPool's
             # token-level slot id table is indexed directly by compressed-seq
             # position (elements already are c-pool slot ids; no page indirection).
@@ -693,17 +1806,80 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
     ) -> None:
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
+        if override_loc is not None:
+            loc = override_loc
+        else:
+            backend_fm = self.forward_metadata
+            loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
+        loc = loc.reshape(-1).to(torch.int32)
+        if loc.numel() == 0:
+            _debug_log_limited(
+                f"compressor-write-skip-empty-{compressor.layer_id}-{compressor.ratio}",
+                "DSV4 NPU compressor write skipped: "
+                f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, empty loc",
+            )
+            return
+
+        if not _is_npu_stream_capturing():
+            valid_loc = loc >= 0
+            if bool((~valid_loc).any().item()):
+                if not bool(valid_loc.any().item()):
+                    _debug_log_limited(
+                        f"compressor-write-skip-invalid-{compressor.layer_id}-{compressor.ratio}",
+                        "DSV4 NPU compressor write skipped: "
+                        f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, "
+                        f"loc={_debug_tensor_sample(loc)}",
+                    )
+                    return
+                kv = kv.reshape(-1, kv.shape[-1])[valid_loc].contiguous()
+                loc = loc[valid_loc].contiguous()
+
+        if li_kv_dtype == "float8" and compressor.is_in_indexer:
+            index_cache = self.token_to_kv_pool.get_compress_buffer(
+                compressor.layer_id, True
+            )
+            scale_cache = self.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                compressor.layer_id, True
+            )
+            torch.ops.custom.indexer_compress_epilog(
+                indexer_compress_cache=index_cache,
+                indexer_compress_scale=scale_cache,
+                x=kv,
+                slot_mapping=loc.to(torch.int32),
+            )
+            _debug_sync_npu(f"indexer_compress_epilog layer_id={compressor.layer_id}")
+            return
+
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
             import torch_npu
 
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
 
-        if override_loc is not None:
-            loc = override_loc
-        else:
-            backend_fm = self.forward_metadata
-            loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
+        _debug_probe_attention_tensor(
+            kv,
+            "compressor-epilog-kv",
+            layer_id=compressor.layer_id,
+            path=f"compressor-r{compressor.ratio}",
+            compress_ratio=compressor.ratio,
+        )
+        if get_bool_env_var(_DEBUG_CACHE_META_ENV) and not _is_npu_stream_capturing():
+            try:
+                _debug_log_limited(
+                    f"compressor-write-{compressor.layer_id}-{compressor.ratio}-{compressor.is_in_indexer}",
+                    "DSV4 NPU compressor write metadata: "
+                    f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, "
+                    f"from_indexer={compressor.is_in_indexer}, "
+                    f"loc={_debug_tensor_sample(loc)}, kv_shape={tuple(kv.shape)}, "
+                    f"kv_dtype={kv.dtype}, kv_scale_shape={tuple(kv_scale.shape) if kv_scale is not None else None}, "
+                    f"kv_scale_dtype={kv_scale.dtype if kv_scale is not None else None}",
+                )
+            except Exception as exc:
+                _debug_log_limited(
+                    f"compressor-write-error-{compressor.layer_id}-{compressor.ratio}",
+                    "DSV4 NPU compressor write metadata probe failed: "
+                    f"layer_id={compressor.layer_id}, ratio={compressor.ratio}, exc={exc}",
+                )
         self.token_to_kv_pool.set_compress_buffer(
             compressor.layer_id,
             loc,
@@ -750,7 +1926,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
             c4_indexer.compressor(x, forward_batch)
 
         li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
-        if li_kv_dtype == "int8":
+        if li_kv_dtype in ("int8", "float8"):
             # Empty/idle rank (T=0) must skip the indexer kernel; test is_idle
             # rather than .item() since a host sync is illegal during capture.
             if bs == 0 or forward_batch.forward_mode.is_idle():
@@ -832,7 +2008,9 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        c4_indexer.compressor.li_kv_dtype = "int8"
+        c4_indexer.compressor.li_kv_dtype = (
+            "bf16" if get_bool_env_var(_FORCE_BF16_INDEXER_ENV) else "float8"
+        )
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
             c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
@@ -864,20 +2042,31 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     ) -> torch.Tensor:
         import torch_npu
 
-        q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
+        if k.dtype == torch.float8_e4m3fn:
+            q_quant, q_scale = torch_npu.npu_dynamic_block_quant(
+                q.view(-1, q.shape[-1]), dst_type=k.dtype
+            )
+            q_quant = q_quant.view(-1, c4_indexer.n_heads, c4_indexer.head_dim)
+            q_scale = q_scale.view(-1, c4_indexer.n_heads)
+        else:
+            q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
+            q_scale = q_scale.to(torch.float16)
+
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
         kwargs = dict(
-            query=q_int8,
+            query=q_quant,
             key=k,
-            key_dequant_scale=k_scale.squeeze(-2),
+            key_dequant_scale=k_scale.squeeze(-2).to(q_scale.dtype),
             actual_seq_lengths_query=fm.actual_seq_lengths_q,
             actual_seq_lengths_key=fm.actual_seq_lengths_kv,
             block_table=fm.c4_page_table,
             layout_query="TND",
             layout_key="PA_BSND",
-            weights=weights.to(torch.float16),
-            query_dequant_scale=q_scale.to(torch.float16),
+            weights=weights.to(
+                torch.float32 if q_scale.dtype == torch.float32 else torch.float16
+            ),
+            query_dequant_scale=q_scale,
             cmp_ratio=4,
             query_quant_mode=0,
             key_quant_mode=0,
@@ -904,6 +2093,13 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
             return
         topk_idxs = self.forward_c4_indexer_npu(
             c4_indexer, x, q_lora, forward_batch, skip_compressor=skip_compressor
+        )
+        _debug_sync_npu(f"c4_indexer layer_id={c4_indexer.layer_id}")
+        _debug_log_c4_topk(
+            topk_idxs,
+            forward_batch,
+            layer_id=c4_indexer.layer_id,
+            index_topk=self._dsv4_index_topk,
         )
         self.forward_metadata.c4_topk_indices = topk_idxs
 
@@ -1027,8 +2223,8 @@ class DeepseekV4AscendAttnBackend(
 
         n_tok = bs * tokens_per_bs
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
-        metadata.c4_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
-        metadata.c128_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
+        metadata.c4_loc = torch.full((n_tok,), -1, dtype=torch.int64, device=device)
+        metadata.c128_loc = torch.full((n_tok,), -1, dtype=torch.int64, device=device)
         metadata.c4_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c128_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
 
@@ -1098,8 +2294,8 @@ class DeepseekV4AscendAttnBackend(
             dst.fill_(val)
             dst[: src.shape[0], : src.shape[1]].copy_(src)
 
-        def _copy_1d(dst: torch.Tensor, src: torch.Tensor) -> None:
-            dst.fill_(0)
+        def _copy_1d(dst: torch.Tensor, src: torch.Tensor, fill_value: int = 0) -> None:
+            dst.fill_(fill_value)
             dst[: src.shape[0]].copy_(src)
 
         for key in (
@@ -1112,7 +2308,11 @@ class DeepseekV4AscendAttnBackend(
                 _copy_2d(getattr(fm, key), result[key], 0 if "state" in key else -1)
         for key in ("c4_loc", "c128_loc", "c4_state_loc", "c128_state_loc"):
             if key in result:
-                _copy_1d(getattr(fm, key), result[key])
+                _copy_1d(
+                    getattr(fm, key),
+                    result[key],
+                    -1 if key in ("c4_loc", "c128_loc") else 0,
+                )
 
         for key in (
             "positions_cmp_padding_c4",
@@ -1271,6 +2471,9 @@ class DeepseekV4AscendAttnBackend(
         is_nextn: bool,
     ) -> dict:
         common = {
+            "kv_quant_mode": _a5_kv_quant_mode(),
+            "tile_size": _A5_KV_TILE_SIZE,
+            "rope_head_dim": _A5_KV_ROPE_HEAD_DIM,
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "seqused_kv": actual_seq_lengths_kv,
             "cmp_ratio": 1,
@@ -1291,7 +2494,7 @@ class DeepseekV4AscendAttnBackend(
         }
         c1a_kwargs = base_kwargs | common
         kernel_metadata = {
-            "c1a_metadata": torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+            "c1a_metadata": torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(
                 **c1a_kwargs
             )
         }
@@ -1304,7 +2507,7 @@ class DeepseekV4AscendAttnBackend(
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
             kernel_metadata["c4a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
+                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(**c4a_kwargs)
             )
 
             if actual_seq_lengths_q_pa is not None:
@@ -1334,7 +2537,7 @@ class DeepseekV4AscendAttnBackend(
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
+                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(**c128a_kwargs)
             )
 
         return kernel_metadata
@@ -1379,8 +2582,60 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
-
+        _debug_probe_cache_metadata(
+            forward_batch=forward_batch,
+            fm=fm,
+            pool=pool,
+            ori_kv=ori_kv,
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
+        _debug_probe_attention_tensor(
+            q, "dense-q", layer_id=layer.layer_id, path="dense", compress_ratio=1
+        )
+        _debug_probe_attention_tensor(
+            ori_kv,
+            "dense-ori-kv",
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
+        _debug_probe_active_dense_rows(
+            forward_batch=forward_batch,
+            pool=pool,
+            ori_kv=ori_kv,
+            layer_id=layer.layer_id,
+        )
+        q_attn = _a5_to_rope_first_q(q)
+        _debug_probe_attention_tensor(
+            q_attn,
+            "dense-q-attn",
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
+        # swa_kv_cache = torch.empty((ori_kv.shape[0],640), dtype=torch.float8_e4m3fn, device=ori_kv.device)
+        # if ori_kv.shape[-1] != 640:
+        #     ori_kv = ori_kv.view(-1, ori_kv.shape[-1])
+        #     print("OKKKKKKKKKKKKKKKKKKKK")
+        #     slot_mapping = pool.translate_loc_from_full_to_swa(
+        #         forward_batch.out_cache_loc
+        #     )
+        #     print(slot_mapping.shape)
+        #     print(ori_kv.shape)
+        #     torch.ops.custom.kv_compress_epilog(
+        #         kv_compress_cache = swa_kv_cache,                # Tensor(a!) – 要被修改的 KV 缓存
+        #         x = ori_kv,                # x – 通常与第一个参数相同
+        #         slot_mapping = slot_mapping
+        #     )
+        # if swa_kv_cache.dtype != torch.float8_e4m3fn:
+        #     print("SHITTTTTTTTTTTTTTTTT")
+        #     swa_kv_cache = swa_kv_cache.to(torch.float32).to(torch.float8_e4m3fn)
         attn_kwargs = dict(
+            kv_quant_mode=_a5_kv_quant_mode(),
+            tile_size = _A5_KV_TILE_SIZE,
+            rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1388,14 +2643,36 @@ class DeepseekV4AscendAttnBackend(
             ori_win_right=0,
             layout_q="TND",
             layout_kv="PA_ND",
-            q=q,
+            q=q_attn,
             ori_kv=ori_kv,
             ori_block_table=fm.swa_page_table,
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
+            cmp_ratio=1,
         )
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        out = _a5_from_rope_first_out(out)
+        _debug_sync_npu(f"dense attention layer_id={layer.layer_id}")
+        _debug_probe_dense_reference_attention(
+            q=q,
+            kv=getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id),
+            out=out,
+            attn_sink=attn_sink,
+            layer=layer,
+            path="dense",
+            compress_ratio=1,
+        )
+        _debug_probe_attention_tensor(
+            out,
+            "dense-out",
+            layer_id=layer.layer_id,
+            path="dense",
+            compress_ratio=1,
+        )
+        _debug_probe_attention_output(
+            out, layer_id=layer.layer_id, path="dense", compress_ratio=1
+        )
         return out
 
     def _forward_compressed(
@@ -1424,7 +2701,8 @@ class DeepseekV4AscendAttnBackend(
             )
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
-
+        # if ori_kv.dtype != torch.float8_e4m3fn:
+        #     ori_kv = ori_kv.to(torch.float32).to(torch.float8_e4m3fn)
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
@@ -1434,7 +2712,11 @@ class DeepseekV4AscendAttnBackend(
             "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
+        q_attn = _a5_to_rope_first_q(q)
         attn_kwargs = dict(
+            kv_quant_mode=_a5_kv_quant_mode(),
+            tile_size = _A5_KV_TILE_SIZE,
+            rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1442,7 +2724,7 @@ class DeepseekV4AscendAttnBackend(
             ori_win_right=0,
             layout_q="TND",
             layout_kv="PA_ND",
-            q=q,
+            q=q_attn,
             ori_kv=ori_kv,
             ori_block_table=fm.swa_page_table,
             sinks=attn_sink,
@@ -1454,17 +2736,121 @@ class DeepseekV4AscendAttnBackend(
             cmp_block_table=cmp_block_table,
         )
         # c4 attends via indexer topk; c128 reads the full compressed history
+        topk = None
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
+        out = _a5_from_rope_first_out(out)
+        _debug_sync_npu(
+            f"compressed attention layer_id={layer.layer_id} ratio={compress_ratio}"
+        )
+        debug_kv = getattr(self, "_debug_last_swa_kv_by_layer", {}).get(layer.layer_id)
+        _debug_compare_compressed_with_dense_kernel(
+            q=q,
+            q_attn=q_attn,
+            ori_kv=ori_kv,
+            compressed_out=out,
+            attn_sink=attn_sink,
+            debug_kv=debug_kv,
+            layer=layer,
+            fm=fm,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            path="compressed",
+            compress_ratio=compress_ratio,
+        )
+        _debug_probe_dense_reference_attention(
+            q=q,
+            kv=debug_kv,
+            out=out,
+            attn_sink=attn_sink,
+            layer=layer,
+            path="compressed",
+            compress_ratio=compress_ratio,
+        )
+        invalid = _debug_probe_attention_output(
+            out,
+            layer_id=layer.layer_id,
+            path="compressed",
+            compress_ratio=compress_ratio,
+        )
+        if invalid or _debug_should_probe_attention(layer.layer_id):
+            _debug_probe_compressed_cache_metadata(
+                forward_batch=forward_batch,
+                fm=fm,
+                cmp_kv=cmp_kv,
+                cmp_block_table=cmp_block_table,
+                layer_id=layer.layer_id,
+                compress_ratio=compress_ratio,
+                topk=topk,
+            )
+            _debug_probe_attention_tensor(
+                q,
+                "compressed-q",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                q_attn,
+                "compressed-q-attn",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                ori_kv,
+                "compressed-ori-kv",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                cmp_kv,
+                "compressed-cmp-kv",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            _debug_probe_attention_tensor(
+                cmp_block_table,
+                "compressed-cmp-block-table",
+                layer_id=layer.layer_id,
+                path="compressed",
+                compress_ratio=compress_ratio,
+            )
+            if topk is not None:
+                _debug_log_c4_topk(
+                    topk,
+                    forward_batch,
+                    layer_id=layer.layer_id,
+                    index_topk=self._dsv4_index_topk,
+                )
+                _debug_probe_attention_tensor(
+                    topk,
+                    "compressed-topk",
+                    layer_id=layer.layer_id,
+                    path="compressed",
+                    compress_ratio=compress_ratio,
+                )
+                _debug_probe_active_compressed_rows(
+                    cmp_kv=cmp_kv,
+                    cmp_block_table=cmp_block_table,
+                    topk=topk,
+                    layer_id=layer.layer_id,
+                    compress_ratio=compress_ratio,
+                )
         return out
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
         swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        if get_bool_env_var(_DEBUG_REF_ATTN_ENV):
+            if not hasattr(self, "_debug_last_swa_kv_by_layer"):
+                self._debug_last_swa_kv_by_layer = {}
+            self._debug_last_swa_kv_by_layer[layer_id] = swa_k.detach()
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,

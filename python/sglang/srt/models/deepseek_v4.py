@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 import time
 from contextlib import nullcontext
 from typing import (
@@ -97,10 +98,8 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.runner import (
-    compile_in_capture_mode,
-    get_is_capture_mode,
-)
+from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -136,6 +135,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import get_int_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -148,6 +148,309 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+_DSV4_NPU_DEBUG_MODEL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL"
+_DSV4_NPU_DEBUG_MODEL_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_LAYER"
+_DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_INVALID_ALL"
+_DSV4_NPU_DEBUG_MODEL_SUMMARY_ENV = "SGLANG_DSV4_NPU_DEBUG_MODEL_SUMMARY"
+_DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_DSV4_NPU_FORCE_TORCH_HC_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC"
+_DSV4_NPU_FORCE_TORCH_HC_HEAD_ENV = "SGLANG_DSV4_NPU_FORCE_TORCH_HC_HEAD"
+_DSV4_NPU_DEBUG_HC_HEAD_REF_ENV = "SGLANG_DSV4_NPU_DEBUG_HC_HEAD_REF"
+_dsv4_npu_model_debug_log_counts: dict[str, int] = {}
+
+
+def _dsv4_npu_model_debug_enabled() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_ENV)
+
+
+def _dsv4_npu_model_summary_enabled() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_SUMMARY_ENV)
+
+
+def _dsv4_npu_force_torch_hc() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_FORCE_TORCH_HC_ENV)
+
+
+def _dsv4_npu_force_torch_hc_head() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_FORCE_TORCH_HC_HEAD_ENV)
+
+
+def _dsv4_npu_debug_hc_head_ref() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_HC_HEAD_REF_ENV)
+
+
+def _dsv4_npu_model_target_layers() -> Optional[Set[int]]:
+    raw = os.getenv(_DSV4_NPU_DEBUG_MODEL_LAYER_ENV)
+    if raw is None or not raw.strip():
+        return {0}
+
+    layers: Set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part in ("-1", "*", "all"):
+            return None
+        try:
+            layers.add(int(part))
+            continue
+        except ValueError:
+            pass
+        if "-" in part and not part.startswith("-"):
+            start_text, end_text = part.split("-", 1)
+            try:
+                start = int(start_text)
+                end = int(end_text)
+            except ValueError:
+                pass
+            else:
+                step = 1 if end >= start else -1
+                layers.update(range(start, end + step, step))
+                continue
+        _dsv4_npu_model_log_limited(
+            "invalid-debug-model-layer",
+            (
+                "DSV4 NPU invalid debug model layer spec: "
+                f"{raw!r}; fallback to layer 0"
+            ),
+        )
+        return {0}
+    return layers or {0}
+
+
+def _dsv4_npu_should_probe_layer(layer_id: int) -> bool:
+    target_layers = _dsv4_npu_model_target_layers()
+    return (
+        target_layers is None
+        or layer_id in target_layers
+        or get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV)
+    )
+
+
+def _dsv4_npu_model_label_layer_id(label: str) -> Optional[int]:
+    for prefix in ("mqa-layer-", "model-layer-", "layer-"):
+        if label.startswith(prefix):
+            layer_text = label[len(prefix) :].split("-", 1)[0]
+            try:
+                return int(layer_text)
+            except ValueError:
+                return None
+    return None
+
+
+def _dsv4_npu_model_probe_full_stats(label: str) -> bool:
+    layer_id = _dsv4_npu_model_label_layer_id(label)
+    if layer_id is None:
+        return True
+    target_layers = _dsv4_npu_model_target_layers()
+    return target_layers is None or layer_id in target_layers
+
+
+def _dsv4_npu_is_stream_capturing() -> bool:
+    if get_is_capture_mode():
+        return True
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _dsv4_npu_model_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DSV4_NPU_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _dsv4_npu_model_debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _dsv4_npu_model_debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _dsv4_npu_model_debug_sync(label: str) -> None:
+    if not (
+        (_dsv4_npu_model_debug_enabled() or _dsv4_npu_model_summary_enabled())
+        and get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV)
+    ):
+        return
+    if _dsv4_npu_is_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU model debug sync failed after %s", label)
+        raise
+
+
+def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
+    if not (
+        _dsv4_npu_model_debug_enabled() or _dsv4_npu_model_summary_enabled()
+    ) or _dsv4_npu_is_stream_capturing():
+        return
+
+    _dsv4_npu_model_debug_sync(label)
+    try:
+        full_stats = _dsv4_npu_model_probe_full_stats(label)
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        if (
+            not full_stats
+            and get_bool_env_var(_DSV4_NPU_DEBUG_MODEL_INVALID_ALL_ENV)
+            and nan_count == 0
+            and inf_count == 0
+        ):
+            return
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+            mean_val = float(finite_values.mean().item())
+            abs_mean = float(finite_values.abs().mean().item())
+            rms = float(torch.sqrt(torch.mean(finite_values.square())).item())
+            abs_max = float(finite_values.abs().max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+            mean_val = float("nan")
+            abs_mean = float("nan")
+            rms = float("nan")
+            abs_max = float("nan")
+
+        flat = probe.flatten()
+        sample_indices: list[int] = []
+        if flat.numel() > 0:
+            sample_indices.extend(range(min(8, flat.numel())))
+            sample_indices.extend([flat.numel() // 2, flat.numel() - 1])
+            sample_indices = sorted(set(sample_indices))
+        sample_values = (
+            [float(v) for v in flat[sample_indices].to(torch.float32).cpu().tolist()]
+            if sample_indices
+            else []
+        )
+
+        message_prefix = (
+            "DSV4 NPU model tensor stats: "
+            if full_stats
+            else "DSV4 NPU model tensor contains invalid values: "
+        )
+        message = (
+            message_prefix
+            + f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_count={finite_count}, nan_count={nan_count}, "
+            f"inf_count={inf_count}, zero_count={zero_count}, "
+            f"finite_min={min_val}, finite_max={max_val}, "
+            f"finite_mean={mean_val}, finite_abs_mean={abs_mean}, "
+            f"finite_rms={rms}, finite_abs_max={abs_max}, "
+            f"sample_indices={sample_indices}, sample_values={sample_values}"
+        )
+        _dsv4_npu_model_log_limited(
+            f"{'tensor' if full_stats else 'invalid'}-{label}",
+            message,
+        )
+    except Exception:
+        logger.exception("DSV4 NPU model tensor probe failed at %s", label)
+        raise
+
+
+def _dsv4_npu_model_probe_summary(tensor: torch.Tensor, label: str) -> None:
+    if not _dsv4_npu_model_summary_enabled() or _dsv4_npu_is_stream_capturing():
+        return
+
+    if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("DSV4 NPU model summary sync failed after %s", label)
+            raise
+
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+            mean_val = float(finite_values.mean().item())
+            abs_mean = float(finite_values.abs().mean().item())
+            abs_max = float(finite_values.abs().max().item())
+            rms = float(torch.sqrt(torch.mean(finite_values.square())).item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+            mean_val = float("nan")
+            abs_mean = float("nan")
+            abs_max = float("nan")
+            rms = float("nan")
+
+        flat = probe.flatten()
+        sample_indices: list[int] = []
+        if flat.numel() > 0:
+            sample_indices.extend(range(min(8, flat.numel())))
+            sample_indices.extend([flat.numel() // 2, flat.numel() - 1])
+            sample_indices = sorted(set(sample_indices))
+        sample_values = (
+            [float(v) for v in flat[sample_indices].to(torch.float32).cpu().tolist()]
+            if sample_indices
+            else []
+        )
+
+        _dsv4_npu_model_log_limited(
+            f"summary-{label}",
+            (
+                "DSV4 NPU model layer summary: "
+                f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                f"finite_count={finite_count}, nan_count={nan_count}, "
+                f"inf_count={inf_count}, zero_count={zero_count}, "
+                f"finite_min={min_val}, finite_max={max_val}, "
+                f"finite_mean={mean_val}, finite_abs_mean={abs_mean}, "
+                f"finite_rms={rms}, finite_abs_max={abs_max}, "
+                f"sample_indices={sample_indices}, sample_values={sample_values}"
+            ),
+        )
+    except Exception:
+        logger.exception("DSV4 NPU model summary probe failed at %s", label)
+        raise
+
+
+def _dsv4_hc_split_sinkhorn_torch(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Small reference path for diagnosing Ascend custom MHC kernels."""
+    pre = torch.sigmoid(
+        mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + eps
+    post = 2 * torch.sigmoid(
+        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult]
+    )
+
+    comb_start = 2 * hc_mult
+    comb = (
+        mixes[..., comb_start:].view(*mixes.shape[:-1], hc_mult, hc_mult)
+        * hc_scale[2]
+        + hc_base[comb_start:].view(hc_mult, hc_mult)
+    )
+    comb = torch.softmax(comb, dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    return pre, post, comb
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -832,16 +1135,33 @@ class MQALayer(nn.Module):
                 )
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
+            probe_npu_layer = _dsv4_npu_should_probe_layer(self.layer_id)
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    q_lora, f"mqa-layer-{self.layer_id}-q-lora-after-norm"
+                )
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    q, f"mqa-layer-{self.layer_id}-q-before-rope"
+                )
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
             else:
                 kv, _ = self.wkv(x)
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    kv, f"mqa-layer-{self.layer_id}-kv-before-norm"
+                )
             kv = self.kv_norm(kv)
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    kv, f"mqa-layer-{self.layer_id}-kv-after-norm"
+                )
 
             v4_rope_inplace_npu(
                 q[..., -self.qk_rope_head_dim :],
@@ -849,6 +1169,13 @@ class MQALayer(nn.Module):
                 self.freqs_cis,
                 positions,
             )
+            if probe_npu_layer:
+                _dsv4_npu_model_probe_tensor(
+                    q, f"mqa-layer-{self.layer_id}-q-after-rope"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    kv, f"mqa-layer-{self.layer_id}-kv-after-rope-before-store"
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
@@ -994,6 +1321,11 @@ class MQALayer(nn.Module):
                 q_out,
                 x_quant=x_quant,
             )
+        debug_this_layer = _dsv4_npu_should_probe_layer(self.layer_id)
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(q, f"mqa-layer-{self.layer_id}-q")
+            if kv is not None:
+                _dsv4_npu_model_probe_tensor(kv, f"mqa-layer-{self.layer_id}-kv")
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
@@ -1043,6 +1375,10 @@ class MQALayer(nn.Module):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-attn-core"
+            )
         if _is_npu:
             v4_rope_inplace_npu(
                 o[..., -self.qk_rope_head_dim :],
@@ -1059,8 +1395,16 @@ class MQALayer(nn.Module):
                 positions=positions,
                 inverse=True,
             )
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-inverse-rope"
+            )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-group-view"
+            )
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
@@ -1084,10 +1428,22 @@ class MQALayer(nn.Module):
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-wo-a"
+            )
 
         o, _ = self.wo_b(o.flatten(1))
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                o, f"mqa-layer-{self.layer_id}-after-wo-b"
+            )
         if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
             o = attn_tp_all_reduce(o)
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    o, f"mqa-layer-{self.layer_id}-after-attn-tp-all-reduce"
+                )
 
         return o
 
@@ -1303,7 +1659,18 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         shape, dtype = x.size(), x.dtype
 
-        if _is_npu:
+        force_torch_hc = _dsv4_npu_force_torch_hc()
+        if force_torch_hc:
+            _dsv4_npu_model_log_limited(
+                "force-torch-hc-pre",
+                (
+                    "DSV4 NPU torch HC fallback enabled: "
+                    f"op=pre, layer_id={self.layer_id}, "
+                    f"shape={tuple(x.shape)}, dtype={x.dtype}"
+                ),
+            )
+
+        if _is_npu and not force_torch_hc:
             return npu_hc_pre(
                 x,
                 hc_fn,
@@ -1324,7 +1691,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if not force_torch_hc and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -1362,7 +1729,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, False
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if not force_torch_hc and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
                 tf32_hc_prenorm_gemm,
             )
@@ -1378,19 +1745,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
+        elif _is_npu:
+            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            pre, post, comb = _dsv4_hc_split_sinkhorn_torch(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
+            from sglang.srt.layers.mhc import hc_split_sinkhorn
 
-        pre, post, comb = hc_split_sinkhorn(
-            mixes,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-        )
+            pre, post, comb = hc_split_sinkhorn(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
@@ -1407,10 +1784,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        if _is_npu:
+        force_torch_hc = _dsv4_npu_force_torch_hc()
+        if force_torch_hc:
+            _dsv4_npu_model_log_limited(
+                "force-torch-hc-post",
+                (
+                    "DSV4 NPU torch HC fallback enabled: "
+                    f"op=post, layer_id={self.layer_id}, "
+                    f"x_shape={tuple(x.shape)}, residual_shape={tuple(residual.shape)}"
+                ),
+            )
+
+        if _is_npu and not force_torch_hc:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        if not force_torch_hc and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
@@ -1452,6 +1840,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+        debug_this_layer = _dsv4_npu_should_probe_layer(self.layer_id)
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = mhc_fused_post_pre(
@@ -1474,6 +1863,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ),
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    residual, f"layer-{self.layer_id}-attn-fused-residual"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    post, f"layer-{self.layer_id}-attn-fused-post"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    comb, f"layer-{self.layer_id}-attn-fused-comb"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-attn-fused-pre"
+                )
             x_quant = None
         else:
             residual = hidden_states
@@ -1485,6 +1887,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm=self.input_layernorm,
                 forward_batch=forward_batch,
             )
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    residual, f"layer-{self.layer_id}-attn-residual"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-attn-hc-pre"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    post, f"layer-{self.layer_id}-attn-post"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    comb, f"layer-{self.layer_id}-attn-comb"
+                )
             if not norm_fused:
                 if _use_aiter and _is_gfx95_supported:
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
@@ -1495,6 +1910,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
                     x_quant = None
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states, f"layer-{self.layer_id}-after-input-norm"
+                    )
             else:
                 x_quant = None
 
@@ -1504,6 +1923,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             x_quant=x_quant,
         )
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                hidden_states, f"layer-{self.layer_id}-after-self-attn"
+            )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1523,6 +1946,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        residual, f"layer-{self.layer_id}-ffn-fused-residual"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states, f"layer-{self.layer_id}-after-ffn-fused-pre"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        post, f"layer-{self.layer_id}-ffn-fused-post"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        comb, f"layer-{self.layer_id}-ffn-fused-comb"
+                    )
             else:
                 residual, post, comb, hidden_states = mhc_fused_post_pre(
                     hidden_states,
@@ -1545,8 +1981,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_eps=self.post_attention_layernorm.variance_epsilon,
                 )
                 norm_fused = True
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        residual, f"layer-{self.layer_id}-ffn-fallback-residual"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        post, f"layer-{self.layer_id}-ffn-fallback-post"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        comb, f"layer-{self.layer_id}-ffn-fallback-comb"
+                    )
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states, f"layer-{self.layer_id}-after-ffn-fallback-pre"
+                    )
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-attn-hc-post"
+                )
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
@@ -1556,8 +2009,26 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm=self.post_attention_layernorm,
                 forward_batch=forward_batch,
             )
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    residual, f"layer-{self.layer_id}-ffn-residual"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-ffn-hc-pre"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    post, f"layer-{self.layer_id}-ffn-post"
+                )
+                _dsv4_npu_model_probe_tensor(
+                    comb, f"layer-{self.layer_id}-ffn-comb"
+                )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
+                if debug_this_layer:
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states,
+                        f"layer-{self.layer_id}-after-post-attn-norm",
+                    )
 
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1614,6 +2085,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             # reduce via reduce_scatterv at the combine below (else double-reduce).
             use_reduce_scatter=_use_cp or _use_gatherv_pair,
         )
+        if debug_this_layer:
+            _dsv4_npu_model_probe_tensor(
+                hidden_states, f"layer-{self.layer_id}-after-mlp"
+            )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -1641,6 +2116,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if debug_this_layer:
+                _dsv4_npu_model_probe_tensor(
+                    hidden_states, f"layer-{self.layer_id}-after-ffn-hc-post"
+                )
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
@@ -1723,10 +2202,21 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        if x.numel() > 0:
+        force_torch_hc_head = _dsv4_npu_force_torch_hc_head()
+        debug_hc_head_ref = _dsv4_npu_debug_hc_head_ref()
+        if force_torch_hc_head:
+            _dsv4_npu_model_log_limited(
+                "force-torch-hc-head",
+                (
+                    "DSV4 NPU torch HC head fallback enabled: "
+                    f"shape={tuple(x.shape)}, dtype={x.dtype}"
+                ),
+            )
+
+        if x.numel() > 0 and not force_torch_hc_head:
             from sglang.srt.layers.mhc_head import fused_hc_head
 
-            return fused_hc_head(
+            fused = fused_hc_head(
                 x.contiguous(),
                 hc_fn,
                 hc_scale,
@@ -1734,13 +2224,72 @@ class DeepseekV4Model(nn.Module):
                 norm_eps=self.norm_eps,
                 hc_eps=self.hc_eps,
             )
+            if debug_hc_head_ref and not _dsv4_npu_is_stream_capturing():
+                self._debug_hc_head_ref(fused, x, hc_fn, hc_scale, hc_base)
+            return fused
+        return self._hc_head_torch(x, hc_fn, hc_scale, hc_base)
+
+    def _hc_head_torch(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ):
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
+        flat = x.flatten(1).float()
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(flat, hc_fn) * rsqrt
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+        y = torch.sum(pre.unsqueeze(-1) * flat.reshape(shape), dim=1)
         return y.to(dtype)
+
+    def _debug_hc_head_ref(
+        self,
+        fused: torch.Tensor,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> None:
+        if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+            torch.npu.synchronize()
+
+        ref = self._hc_head_torch(x, hc_fn, hc_scale, hc_base)
+
+        if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+            torch.npu.synchronize()
+
+        diff = (fused.float() - ref.float()).abs()
+        finite = torch.isfinite(diff)
+        finite_count = int(finite.sum().item())
+        if finite_count > 0:
+            finite_diff = diff[finite]
+            max_abs_diff = float(finite_diff.max().item())
+            mean_abs_diff = float(finite_diff.mean().item())
+            topk = min(8, finite_diff.numel())
+            top_values, top_indices = torch.topk(finite_diff.flatten(), k=topk)
+            top_values_list = [float(v) for v in top_values.cpu().tolist()]
+            top_indices_list = [int(v) for v in top_indices.cpu().tolist()]
+        else:
+            max_abs_diff = float("nan")
+            mean_abs_diff = float("nan")
+            top_values_list = []
+            top_indices_list = []
+
+        _dsv4_npu_model_log_limited(
+            "hc-head-ref-diff",
+            (
+                "DSV4 NPU hc_head fused ref diff: "
+                f"shape={tuple(fused.shape)}, dtype={fused.dtype}, "
+                f"finite_count={finite_count}, "
+                f"nan_count={int(torch.isnan(diff).sum().item())}, "
+                f"inf_count={int(torch.isinf(diff).sum().item())}, "
+                f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
+                f"top_abs_diff_values={top_values_list}, "
+                f"top_abs_diff_flat_indices={top_indices_list}"
+            ),
+        )
 
     def forward(
         self,
@@ -1752,7 +2301,11 @@ class DeepseekV4Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-embed")
+            _dsv4_npu_model_probe_summary(hidden_states, "model-after-embed")
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-mhc-repeat")
+            _dsv4_npu_model_probe_summary(hidden_states, "model-after-mhc-repeat")
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -1761,6 +2314,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-pp-input")
+            _dsv4_npu_model_probe_summary(hidden_states, "model-after-pp-input")
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -1809,10 +2364,20 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+                if _dsv4_npu_should_probe_layer(i):
+                    _dsv4_npu_model_probe_tensor(
+                        hidden_states,
+                        f"model-layer-{i}-out",
+                    )
+                _dsv4_npu_model_probe_summary(
+                    hidden_states,
+                    f"model-layer-{i}-out",
+                )
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
             )
+            _dsv4_npu_model_probe_tensor(hidden_states, "model-after-final-hc-post")
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
@@ -1828,11 +2393,17 @@ class DeepseekV4Model(nn.Module):
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
         pre_hc_head = hidden_states.flatten(1)
+        _dsv4_npu_model_probe_tensor(pre_hc_head, "model-pre-hc-head")
+        _dsv4_npu_model_probe_summary(pre_hc_head, "model-pre-hc-head")
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
+        _dsv4_npu_model_probe_tensor(hidden_states, "model-after-hc-head")
+        _dsv4_npu_model_probe_summary(hidden_states, "model-after-hc-head")
         hidden_states = self.norm(hidden_states)
+        _dsv4_npu_model_probe_tensor(hidden_states, "model-after-final-norm")
+        _dsv4_npu_model_probe_summary(hidden_states, "model-after-final-norm")
 
         return hidden_states, pre_hc_head
 
@@ -2249,6 +2820,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if _is_npu:
                                 name = name.replace("weight_packed", "weight")
                             name = name.replace(weight_name, param_name)
+                            if _is_npu and name not in params_dict:
+                                if name.endswith("_weight_scale_inv"):
+                                    scale_name = name[: -len("_inv")]
+                                elif name.endswith("_weight_scale"):
+                                    scale_name = name + "_inv"
+                                else:
+                                    scale_name = None
+                                if scale_name is not None and scale_name in params_dict:
+                                    name = scale_name
                             if name not in params_dict:
                                 continue
                             param = params_dict[name]

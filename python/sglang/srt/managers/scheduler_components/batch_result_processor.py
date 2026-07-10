@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -56,6 +57,72 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+_DSV4_NPU_DEBUG_SAMPLER_ENV = "SGLANG_DSV4_NPU_DEBUG_SAMPLER"
+_DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_dsv4_npu_debug_log_counts = {}
+
+
+def _dsv4_npu_scheduler_debug_enabled() -> bool:
+    return is_npu() and get_bool_env_var(_DSV4_NPU_DEBUG_SAMPLER_ENV)
+
+
+def _dsv4_npu_stream_capturing() -> bool:
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _dsv4_npu_debug_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DSV4_NPU_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _dsv4_npu_debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _dsv4_npu_debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _dsv4_npu_debug_probe_next_token_ids(
+    token_ids: torch.Tensor,
+    label: str,
+) -> None:
+    if not _dsv4_npu_scheduler_debug_enabled() or _dsv4_npu_stream_capturing():
+        return
+
+    try:
+        if get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV):
+            torch.npu.synchronize()
+
+        token_ids_i64 = token_ids.to(torch.int64)
+        if token_ids_i64.numel() > 0:
+            min_id = int(token_ids_i64.min().item())
+            max_id = int(token_ids_i64.max().item())
+            neg_count = int((token_ids_i64 < 0).sum().item())
+            sample = token_ids_i64[:16].detach().cpu().tolist()
+        else:
+            min_id = -1
+            max_id = -1
+            neg_count = 0
+            sample = []
+
+        _dsv4_npu_debug_log_limited(
+            f"scheduler-token-ids-{label}",
+            "DSV4 NPU scheduler next_token_ids stats: "
+            f"label={label}, shape={tuple(token_ids.shape)}, "
+            f"dtype={token_ids.dtype}, neg_count={neg_count}, "
+            f"min_id={min_id}, max_id={max_id}, sample={sample}",
+        )
+    except Exception:
+        logger.exception(
+            "DSV4 NPU scheduler next_token_ids probe failed before host copy: "
+            "label=%s, shape=%s, dtype=%s",
+            label,
+            tuple(token_ids.shape),
+            token_ids.dtype,
+        )
+        raise
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -703,6 +770,10 @@ class SchedulerBatchResultProcessor:
         elif isinstance(next_token_ids, list):
             pass  # MLX path: already a list[int], skip torch round-trip
         else:
+            _dsv4_npu_debug_probe_next_token_ids(
+                next_token_ids,
+                "decode-before-host-copy",
+            )
             next_token_ids = next_token_ids.tolist()
 
         if batch.return_logprob:

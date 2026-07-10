@@ -53,8 +53,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
+    get_bool_env_var,
+    get_int_env_var,
     is_cpu,
     is_npu,
     is_pin_memory_available,
@@ -65,6 +68,11 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_DSV4_NPU_DEBUG_LOGITS_ENV = "SGLANG_DSV4_NPU_DEBUG_LOGITS"
+_DSV4_NPU_DEBUG_LM_HEAD_REF_ENV = "SGLANG_DSV4_NPU_DEBUG_LM_HEAD_REF"
+_DSV4_NPU_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DSV4_NPU_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_dsv4_npu_debug_log_counts: Dict[str, int] = {}
 
 # When set, LogitsProcessor.forward returns an empty output and skips the
 # LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
@@ -72,6 +80,191 @@ _is_cpu = is_cpu()
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
 _in_autotune_dummy_run = False
+
+
+def _dsv4_npu_logits_debug_enabled() -> bool:
+    return _is_npu and get_bool_env_var(_DSV4_NPU_DEBUG_LOGITS_ENV)
+
+
+def _is_npu_stream_capturing() -> bool:
+    if get_is_capture_mode():
+        return True
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _dsv4_npu_debug_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DSV4_NPU_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _dsv4_npu_debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _dsv4_npu_debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _dsv4_npu_debug_sync(label: str) -> None:
+    if not (
+        _dsv4_npu_logits_debug_enabled() and get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV)
+    ):
+        return
+    if _is_npu_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU logits debug sync failed after %s", label)
+        raise
+
+
+def _dsv4_npu_debug_probe_tensor(tensor: torch.Tensor, label: str) -> None:
+    if not _dsv4_npu_logits_debug_enabled() or _is_npu_stream_capturing():
+        return
+
+    _dsv4_npu_debug_sync(label)
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+
+        _dsv4_npu_debug_log_limited(
+            f"tensor-{label}",
+            "DSV4 NPU logits tensor stats: "
+            f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_count={finite_count}, nan_count={nan_count}, "
+            f"inf_count={inf_count}, zero_count={zero_count}, "
+            f"finite_min={min_val}, finite_max={max_val}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU logits tensor probe failed at %s", label)
+        raise
+
+
+def _dsv4_npu_debug_probe_logits_topk(tensor: torch.Tensor, label: str) -> None:
+    if (
+        not _dsv4_npu_logits_debug_enabled()
+        or _is_npu_stream_capturing()
+        or tensor.ndim < 2
+        or tensor.shape[-1] == 0
+    ):
+        return
+
+    _dsv4_npu_debug_sync(f"{label}-topk")
+    try:
+        rows = min(int(tensor.shape[0]), 4)
+        k = min(int(tensor.shape[-1]), 10)
+        values, ids = torch.topk(tensor[:rows].to(torch.float32), k=k, dim=-1)
+        _dsv4_npu_debug_log_limited(
+            f"topk-{label}",
+            "DSV4 NPU logits topk: "
+            f"label={label}, rows={rows}, k={k}, "
+            f"ids={ids.detach().cpu().tolist()}, "
+            f"values={values.detach().cpu().tolist()}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU logits topk probe failed at %s", label)
+        raise
+
+
+def _dsv4_npu_local_vocab_ids(lm_head: VocabParallelEmbedding, ids: torch.Tensor):
+    shard_indices = getattr(lm_head, "shard_indices", None)
+    if shard_indices is None:
+        return ids.detach().cpu().tolist()
+
+    local_ids = ids.detach().cpu().tolist()
+    global_ids = []
+    org_count = shard_indices.num_org_elements
+    org_padded_count = shard_indices.num_org_elements_padded
+    added_count = shard_indices.num_added_elements
+    for row in local_ids:
+        mapped_row = []
+        for idx in row:
+            if idx < org_count:
+                mapped_row.append(shard_indices.org_vocab_start_index + idx)
+            elif idx < org_padded_count:
+                mapped_row.append(-1)
+            elif idx < org_padded_count + added_count:
+                mapped_row.append(
+                    shard_indices.added_vocab_start_index + idx - org_padded_count
+                )
+            else:
+                mapped_row.append(-1)
+        global_ids.append(mapped_row)
+    return global_ids
+
+
+def _dsv4_npu_debug_probe_lm_head_ref(
+    hidden_states: torch.Tensor,
+    lm_head: VocabParallelEmbedding,
+    logits: torch.Tensor,
+    embedding_bias: Optional[torch.Tensor] = None,
+) -> None:
+    if (
+        not _dsv4_npu_logits_debug_enabled()
+        or not get_bool_env_var(_DSV4_NPU_DEBUG_LM_HEAD_REF_ENV)
+        or _is_npu_stream_capturing()
+        or hidden_states.shape[0] == 0
+        or not hasattr(lm_head, "weight")
+    ):
+        return
+
+    _dsv4_npu_debug_sync("lm-head-ref")
+    try:
+        rows = min(int(hidden_states.shape[0]), 1)
+        hidden_cpu = hidden_states[:rows].detach().cpu().to(torch.float32)
+        weight_cpu = lm_head.weight.detach().cpu().to(torch.float32)
+        ref = torch.matmul(hidden_cpu, weight_cpu.T)
+        if embedding_bias is not None:
+            ref = ref + embedding_bias.detach().cpu().to(torch.float32)
+
+        npu_logits = logits[:rows].detach().cpu().to(torch.float32)
+        diff = (ref - npu_logits).abs()
+        max_abs_diff = float(diff.max().item()) if diff.numel() else 0.0
+        mean_abs_diff = float(diff.mean().item()) if diff.numel() else 0.0
+        k = min(int(ref.shape[-1]), 10)
+        ref_values, ref_ids = torch.topk(ref, k=k, dim=-1)
+        npu_values, npu_ids = torch.topk(npu_logits, k=k, dim=-1)
+        shard_indices = getattr(lm_head, "shard_indices", None)
+        shard_info = ""
+        if shard_indices is not None:
+            shard_info = (
+                f", org_vocab_range=({shard_indices.org_vocab_start_index},"
+                f"{shard_indices.org_vocab_end_index}), "
+                f"added_vocab_range=({shard_indices.added_vocab_start_index},"
+                f"{shard_indices.added_vocab_end_index}), "
+                f"num_org_padding={shard_indices.num_org_vocab_padding}, "
+                f"num_added_padding={shard_indices.num_added_vocab_padding}"
+            )
+
+        _dsv4_npu_debug_log_limited(
+            "lm-head-ref",
+            "DSV4 NPU lm_head local ref: "
+            f"rows={rows}, local_vocab={logits.shape[-1]}, "
+            f"max_abs_diff={max_abs_diff}, mean_abs_diff={mean_abs_diff}, "
+            f"npu_local_ids={npu_ids.tolist()}, "
+            f"npu_global_ids={_dsv4_npu_local_vocab_ids(lm_head, npu_ids)}, "
+            f"npu_values={npu_values.tolist()}, "
+            f"ref_local_ids={ref_ids.tolist()}, "
+            f"ref_global_ids={_dsv4_npu_local_vocab_ids(lm_head, ref_ids)}, "
+            f"ref_values={ref_values.tolist()}"
+            f"{shard_info}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU lm_head ref probe failed")
+        raise
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -433,6 +626,7 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
     ):
+        _dsv4_npu_debug_probe_tensor(hidden_states, "logits-prune-input")
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
         token_to_seq_idx = []
@@ -574,6 +768,7 @@ class LogitsProcessor(nn.Module):
                 pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
 
+        _dsv4_npu_debug_probe_tensor(pruned_states, "logits-pruned-states")
         return (
             pruned_states,
             pruned_states_before_norm,
@@ -846,23 +1041,32 @@ class LogitsProcessor(nn.Module):
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
+        _dsv4_npu_debug_probe_tensor(hidden_states, "logits-hidden-states")
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        _dsv4_npu_debug_probe_tensor(logits, "logits-after-lm-head")
+        _dsv4_npu_debug_probe_lm_head_ref(
+            hidden_states, lm_head, logits, embedding_bias
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+            _dsv4_npu_debug_probe_tensor(logits, "logits-after-logit-scale")
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = tensor_model_parallel_all_gather(logits)
+            _dsv4_npu_debug_probe_tensor(logits, "logits-after-tp-gather")
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
         )
+        _dsv4_npu_debug_probe_tensor(logits, "logits-after-dp-scatter")
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
+        _dsv4_npu_debug_probe_tensor(logits, "logits-after-copy-buffer")
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -871,7 +1075,9 @@ class LogitsProcessor(nn.Module):
                 logits = self.final_logit_softcapping * torch.tanh(
                     logits / self.final_logit_softcapping
                 )
+            _dsv4_npu_debug_probe_tensor(logits, "logits-after-softcap")
 
+        _dsv4_npu_debug_probe_logits_topk(logits, "logits-final")
         return logits
 
     def _compute_lm_head(

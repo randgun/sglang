@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -7,6 +9,7 @@ import torch_npu
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -18,6 +21,391 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 MXFP4_BLOCK_SIZE = 32
+_DEBUG_NAN_ENV = "SGLANG_DSV4_NPU_DEBUG_NAN"
+_DEBUG_MOE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE"
+_DEBUG_MOE_LAYER_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_LAYER"
+_DEBUG_MOE_POST_COMBINE_ENV = "SGLANG_DSV4_NPU_DEBUG_MOE_POST_COMBINE"
+_DEBUG_SYNC_ENV = "SGLANG_DSV4_NPU_DEBUG_SYNC"
+_DEBUG_MAX_PRINTS_ENV = "SGLANG_DSV4_NPU_DEBUG_MAX_PRINTS"
+_DEBUG_MXFP4_LOAD_ENV = "SGLANG_DSV4_NPU_DEBUG_MXFP4_LOAD"
+_MXFP4_SCALE_LAYOUT_ENV = "SGLANG_DSV4_NPU_MXFP4_SCALE_LAYOUT"
+_MXFP4_SCALE_VALUE_MODE_ENV = "SGLANG_DSV4_NPU_MXFP4_SCALE_VALUE_MODE"
+_MXFP4_GMM_SCALE_DTYPE_ENV = "SGLANG_DSV4_NPU_MXFP4_GMM_SCALE_DTYPE"
+_debug_log_counts: dict[str, int] = {}
+_scale_layout_logged = False
+_scale_value_mode_logged = False
+_gmm_scale_dtype_logged = False
+
+logger = logging.getLogger(__name__)
+
+
+def _npu_moe_debug_enabled() -> bool:
+    return get_bool_env_var(_DEBUG_MOE_ENV) or get_bool_env_var(_DEBUG_NAN_ENV)
+
+
+def _npu_moe_layer_id(layer: torch.nn.Module) -> int:
+    return int(getattr(layer, "layer_id", -1))
+
+
+def _npu_moe_should_probe_layer(layer: torch.nn.Module) -> bool:
+    target_layer = get_int_env_var(_DEBUG_MOE_LAYER_ENV, -1)
+    return target_layer < 0 or _npu_moe_layer_id(layer) == target_layer
+
+
+def _npu_moe_full_stats(layer: torch.nn.Module) -> bool:
+    if not get_bool_env_var(_DEBUG_MOE_ENV):
+        return False
+    target_layer = get_int_env_var(_DEBUG_MOE_LAYER_ENV, -1)
+    return target_layer < 0 or _npu_moe_layer_id(layer) == target_layer
+
+
+def _npu_moe_is_stream_capturing() -> bool:
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _npu_moe_log_limited(key: str, message: str) -> None:
+    max_prints = get_int_env_var(_DEBUG_MAX_PRINTS_ENV, 20)
+    count = _debug_log_counts.get(key, 0)
+    if count >= max_prints:
+        return
+    _debug_log_counts[key] = count + 1
+    logger.warning(message)
+
+
+def _npu_moe_debug_sync(label: str) -> None:
+    if not get_bool_env_var(_DEBUG_SYNC_ENV) or _npu_moe_is_stream_capturing():
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception("DSV4 NPU MoE debug sync failed after %s", label)
+        raise
+
+
+def _npu_moe_probe_tensor(
+    tensor: Optional[torch.Tensor],
+    label: str,
+    layer: torch.nn.Module,
+) -> None:
+    if (
+        tensor is None
+        or not _npu_moe_debug_enabled()
+        or not _npu_moe_should_probe_layer(layer)
+        or _npu_moe_is_stream_capturing()
+    ):
+        return
+
+    _npu_moe_debug_sync(label)
+    try:
+        probe = tensor
+        if not probe.is_floating_point():
+            probe = probe.to(torch.float32)
+        finite = torch.isfinite(probe)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(probe).sum().item())
+        inf_count = int(torch.isinf(probe).sum().item())
+        full_stats = _npu_moe_full_stats(layer)
+        if not full_stats and nan_count == 0 and inf_count == 0:
+            return
+
+        zero_count = int((probe == 0).sum().item())
+        if finite_count > 0:
+            finite_values = probe[finite].to(torch.float32)
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+
+        invalid_rows = []
+        if tensor.ndim >= 2 and (nan_count > 0 or inf_count > 0):
+            flat = probe.reshape(-1, probe.shape[-1])
+            invalid_mask = ~torch.isfinite(flat).all(dim=1)
+            invalid_rows = (
+                invalid_mask.nonzero(as_tuple=False).flatten()[:8].cpu().tolist()
+            )
+
+        prefix = (
+            "DSV4 NPU MoE tensor stats: "
+            if full_stats
+            else "DSV4 NPU MoE tensor contains invalid values: "
+        )
+        message = (
+            prefix
+            + f"label={label}, layer_id={_npu_moe_layer_id(layer)}, "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_count={finite_count}, nan_count={nan_count}, "
+            f"inf_count={inf_count}, zero_count={zero_count}, "
+            f"finite_min={min_val}, finite_max={max_val}, "
+            f"invalid_rows={invalid_rows}"
+        )
+        _npu_moe_log_limited(
+            f"{'tensor' if full_stats else 'invalid'}-{_npu_moe_layer_id(layer)}-{label}",
+            message,
+        )
+    except Exception:
+        logger.exception("DSV4 NPU MoE tensor probe failed at %s", label)
+        raise
+
+
+def _npu_moe_probe_group_list(
+    group_list: Optional[torch.Tensor],
+    label: str,
+    layer: torch.nn.Module,
+) -> None:
+    if (
+        group_list is None
+        or not get_bool_env_var(_DEBUG_MOE_ENV)
+        or not _npu_moe_should_probe_layer(layer)
+        or _npu_moe_is_stream_capturing()
+    ):
+        return
+
+    _npu_moe_debug_sync(label)
+    try:
+        cpu_list = group_list.detach().to(torch.int64).cpu()
+        sample = cpu_list[:16].tolist()
+        if cpu_list.numel() > 0:
+            min_val = int(cpu_list.min().item())
+            max_val = int(cpu_list.max().item())
+            total = int(cpu_list.sum().item())
+        else:
+            min_val = max_val = total = 0
+        _npu_moe_log_limited(
+            f"group-{_npu_moe_layer_id(layer)}-{label}",
+            "DSV4 NPU MoE group list stats: "
+            f"label={label}, layer_id={_npu_moe_layer_id(layer)}, "
+            f"shape={tuple(group_list.shape)}, dtype={group_list.dtype}, "
+            f"min={min_val}, max={max_val}, sum={total}, sample={sample}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU MoE group list probe failed at %s", label)
+        raise
+
+
+def _npu_moe_register_post_combine_probe(
+    layer: torch.nn.Module,
+    label: str,
+) -> None:
+    if (
+        not _npu_moe_debug_enabled()
+        or not get_bool_env_var(_DEBUG_MOE_POST_COMBINE_ENV)
+        or not _npu_moe_should_probe_layer(layer)
+        or _npu_moe_is_stream_capturing()
+    ):
+        return
+    dispatcher = getattr(layer, "dispatcher", None)
+    if dispatcher is None or not hasattr(dispatcher, "register_post_combine_hook"):
+        return
+
+    handle = None
+
+    def _post_combine_hook(_dispatcher, hidden_states: torch.Tensor):
+        _npu_moe_probe_tensor(hidden_states, label, layer)
+        if handle is not None:
+            handle.remove()
+        return None
+
+    handle = dispatcher.register_post_combine_hook(_post_combine_hook)
+
+
+def _mxfp4_scale_value_mode() -> str:
+    global _scale_value_mode_logged
+    mode = os.getenv(_MXFP4_SCALE_VALUE_MODE_ENV, "raw").strip().lower()
+    if mode not in ("raw", "invert_e8m0"):
+        logger.warning(
+            "Unknown %s=%r; fallback to raw",
+            _MXFP4_SCALE_VALUE_MODE_ENV,
+            mode,
+        )
+        mode = "raw"
+    if not _scale_value_mode_logged:
+        logger.warning("DSV4 NPU MXFP4 scale value mode: %s", mode)
+        _scale_value_mode_logged = True
+    return mode
+
+
+def _maybe_transform_mxfp4_scale_values(scale: torch.Tensor) -> torch.Tensor:
+    mode = _mxfp4_scale_value_mode()
+    if mode == "raw":
+        return scale
+    if scale.dtype != torch.uint8:
+        logger.warning(
+            "Skip %s=%s for non-uint8 scale dtype=%s",
+            _MXFP4_SCALE_VALUE_MODE_ENV,
+            mode,
+            scale.dtype,
+        )
+        return scale
+
+    # E8M0 inverse scales are exponent bytes. This is an A/B switch for checking
+    # whether the loaded FP4 expert scale direction is inverted for A5 GMM.
+    return (254 - scale.to(torch.int16)).clamp_(0, 255).to(torch.uint8)
+
+
+def _mxfp4_gmm_scale_dtype_mode() -> str:
+    global _gmm_scale_dtype_logged
+    mode = os.getenv(_MXFP4_GMM_SCALE_DTYPE_ENV, "uint8").strip().lower()
+    if mode not in ("uint8", "f8_view"):
+        logger.warning(
+            "Unknown %s=%r; fallback to uint8",
+            _MXFP4_GMM_SCALE_DTYPE_ENV,
+            mode,
+        )
+        mode = "uint8"
+    if not _gmm_scale_dtype_logged:
+        logger.warning("DSV4 NPU MXFP4 GMM scale dtype mode: %s", mode)
+        _gmm_scale_dtype_logged = True
+    return mode
+
+
+def _maybe_view_mxfp4_scale_as_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    if _mxfp4_gmm_scale_dtype_mode() != "f8_view":
+        return scale
+    target_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if not isinstance(target_dtype, torch.dtype):
+        _npu_moe_log_limited(
+            "mxfp4-gmm-f8-view-unsupported",
+            "DSV4 NPU MXFP4 GMM f8_view is unavailable because "
+            "torch.float8_e8m0fnu is not a tensor dtype; fallback to uint8 scale",
+        )
+        return scale
+    if scale.dtype == target_dtype:
+        return scale
+    if scale.dtype != torch.uint8:
+        logger.warning(
+            "Skip %s=f8_view for non-uint8 scale dtype=%s",
+            _MXFP4_GMM_SCALE_DTYPE_ENV,
+            scale.dtype,
+        )
+        return scale
+    try:
+        return scale.view(target_dtype)
+    except Exception:
+        _npu_moe_log_limited(
+            "mxfp4-gmm-f8-view-failed",
+            "DSV4 NPU MXFP4 GMM failed to reinterpret scale as "
+            "torch.float8_e8m0fnu; fallback to uint8 scale",
+        )
+        return scale
+
+
+def _is_e8m0_float8_dtype(dtype: torch.dtype) -> bool:
+    return "float8_e8m0" in str(dtype).lower()
+
+
+def _mxfp4_scale_stats_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if _is_e8m0_float8_dtype(tensor.dtype):
+        try:
+            return tensor.view(torch.uint8).to(torch.float32)
+        except Exception:
+            pass
+    return tensor.to(torch.float32)
+
+
+def _log_mxfp4_loaded_scale(
+    label: str,
+    loaded_weight: torch.Tensor,
+    converted_weight: torch.Tensor,
+) -> None:
+    if not get_bool_env_var(_DEBUG_MXFP4_LOAD_ENV):
+        return
+    try:
+        src = _mxfp4_scale_stats_tensor(loaded_weight)
+        finite = torch.isfinite(src)
+        if finite.any():
+            finite_src = src[finite]
+            src_min = float(finite_src.min().item())
+            src_max = float(finite_src.max().item())
+        else:
+            src_min = float("nan")
+            src_max = float("nan")
+        dst = converted_weight.to(torch.float32)
+        dst_min = float(dst.min().item()) if dst.numel() > 0 else float("nan")
+        dst_max = float(dst.max().item()) if dst.numel() > 0 else float("nan")
+        dst_zero = int((converted_weight == 0).sum().item())
+        _npu_moe_log_limited(
+            f"loaded-scale-{label}",
+            "DSV4 NPU MXFP4 loaded scale conversion: "
+            f"label={label}, src_shape={tuple(loaded_weight.shape)}, "
+            f"src_dtype={loaded_weight.dtype}, src_min={src_min}, src_max={src_max}, "
+            f"dst_dtype={converted_weight.dtype}, dst_min={dst_min}, "
+            f"dst_max={dst_max}, dst_zero_count={dst_zero}",
+        )
+    except Exception:
+        logger.exception("DSV4 NPU MXFP4 loaded scale logging failed at %s", label)
+
+
+def _convert_mxfp4_loaded_scale_to_uint8(
+    loaded_weight: torch.Tensor,
+    label: str,
+) -> torch.Tensor:
+    if loaded_weight.dtype == torch.uint8:
+        converted = loaded_weight
+    elif loaded_weight.dtype == torch.int8:
+        converted = loaded_weight.view(torch.uint8)
+    elif _is_e8m0_float8_dtype(loaded_weight.dtype):
+        converted = loaded_weight.view(torch.uint8)
+    elif loaded_weight.is_floating_point():
+        try:
+            scale = loaded_weight.to(torch.float32)
+        except Exception:
+            converted = loaded_weight.view(torch.uint8)
+        else:
+            if scale.numel() == 0:
+                converted = scale.to(torch.uint8)
+            else:
+                finite = torch.isfinite(scale)
+                finite_values = scale[finite]
+                if finite_values.numel() == 0:
+                    converted = torch.zeros_like(scale, dtype=torch.uint8)
+                else:
+                    max_val = float(finite_values.max().item())
+                    rounded = torch.round(scale)
+                    max_round_err = float(
+                        (scale[finite] - rounded[finite]).abs().max().item()
+                    )
+                    if max_val > 16.0 and max_round_err < 1e-3:
+                        converted = rounded.clamp_(0, 255).to(torch.uint8)
+                    else:
+                        safe_scale = torch.where(
+                            scale > 0,
+                            scale,
+                            torch.ones_like(scale),
+                        )
+                        exponent = torch.round(torch.log2(safe_scale)) + 127
+                        exponent = torch.where(
+                            scale > 0,
+                            exponent,
+                            torch.zeros_like(exponent),
+                        )
+                        converted = exponent.clamp_(0, 255).to(torch.uint8)
+    else:
+        converted = loaded_weight.to(torch.uint8)
+
+    _log_mxfp4_loaded_scale(label, loaded_weight, converted)
+    return converted
+
+
+def _wrap_mxfp4_scale_weight_loader(weight_loader):
+    def mxfp4_scale_weight_loader(param, loaded_weight, *args, **kwargs):
+        label = str(args[0]) if args else "unknown"
+        loaded_weight = _convert_mxfp4_loaded_scale_to_uint8(loaded_weight, label)
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return mxfp4_scale_weight_loader
 
 
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
@@ -70,6 +458,10 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
 
         scale_attrs = dict(extra_weight_attrs)
         scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        if "weight_loader" in scale_attrs:
+            scale_attrs["weight_loader"] = _wrap_mxfp4_scale_weight_loader(
+                scale_attrs["weight_loader"]
+            )
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 (
@@ -94,9 +486,9 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         )
         w13_weight_scale.format_ue8m0 = False
         w2_weight_scale.format_ue8m0 = False
-        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, scale_attrs)
-        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
@@ -112,14 +504,22 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.data.view(torch.uint8),
             29,
         ).transpose(1, 2)
+        _npu_moe_probe_tensor(layer.w13_weight_scale, "loaded-w13-weight-scale", layer)
+        _npu_moe_probe_tensor(layer.w2_weight_scale, "loaded-w2-weight-scale", layer)
         layer.w13_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
+            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale.data),
             requires_grad=False,
         )
         layer.w2_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
+            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale.data),
             requires_grad=False,
         )
+        layer.w13_weight_scale_inv.format_ue8m0 = False
+        layer.w2_weight_scale_inv.format_ue8m0 = False
+        if "w13_weight_scale" in layer._parameters:
+            del layer._parameters["w13_weight_scale"]
+        if "w2_weight_scale" in layer._parameters:
+            del layer._parameters["w2_weight_scale"]
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
@@ -133,6 +533,21 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: "DispatchOutput",
     ) -> "CombineInput":
+        _npu_moe_probe_tensor(
+            getattr(dispatch_output, "hidden_states", None),
+            "apply-dispatch-hidden",
+            layer,
+        )
+        _npu_moe_probe_tensor(
+            getattr(dispatch_output, "topk_ids", None),
+            "apply-dispatch-topk-ids",
+            layer,
+        )
+        _npu_moe_probe_tensor(
+            getattr(dispatch_output, "topk_weights", None),
+            "apply-dispatch-topk-weights",
+            layer,
+        )
         combine_input = npu_apply_w4a4_mxfp_moe_deepep(layer, dispatch_output)
         if combine_input is not None:
             return combine_input
@@ -157,19 +572,41 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             topk_weights,
             topk_ids,
             top_k,
+            debug_layer=layer,
+            debug_label="standard",
         )
+        _npu_moe_probe_tensor(output, "standard-output-before-combine", layer)
         return StandardCombineInput(hidden_states=output)
 
 
 def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     if scale.dim() == 3:
+        global _scale_layout_logged
         num_experts, n, k32 = scale.shape
         if k32 % 2 != 0:
             raise ValueError(
                 "MXFP4 scale K dimension must be divisible by 2 for "
                 "[E, K/64, N, 2] layout."
             )
-        scale = scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
+        layout = os.getenv(_MXFP4_SCALE_LAYOUT_ENV, "transpose").strip().lower()
+        if layout not in ("transpose", "native", "transpose_contiguous"):
+            logger.warning(
+                "Unknown %s=%r; fallback to transpose",
+                _MXFP4_SCALE_LAYOUT_ENV,
+                layout,
+            )
+            layout = "transpose"
+        if not _scale_layout_logged:
+            logger.warning("DSV4 NPU MXFP4 scale layout: %s", layout)
+            _scale_layout_logged = True
+
+        scale = _maybe_transform_mxfp4_scale_values(scale)
+        scale = scale.view(num_experts, n, k32 // 2, 2)
+        if layout == "native":
+            return scale.contiguous()
+        scale = scale.transpose(1, 2)
+        if layout == "transpose_contiguous":
+            return scale.contiguous()
     return scale
 
 
@@ -182,6 +619,8 @@ def npu_fused_experts_w4a4_mxfp(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    debug_layer: Optional[torch.nn.Module] = None,
+    debug_label: str = "standard",
     **kwargs,
 ):
     if torch.npu.is_current_stream_capturing():
@@ -236,8 +675,14 @@ def npu_fused_experts_w4a4_mxfp(
         group_list_type=0,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_layer=debug_layer,
+        debug_label=f"{debug_label}-w13-gmm",
     )
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w13-gmm", debug_layer)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-swiglu", debug_layer)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
@@ -246,7 +691,11 @@ def npu_fused_experts_w4a4_mxfp(
         group_list_type=0,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_layer=debug_layer,
+        debug_label=f"{debug_label}-w2-gmm",
     )
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w2-gmm", debug_layer)
 
     hidden_states = hidden_states * valid_mask_2d.to(hidden_states.dtype)
 
@@ -262,6 +711,8 @@ def npu_fused_experts_w4a4_mxfp(
 
     if len(original_shape) == 3:
         final_hidden_states = final_hidden_states.view(original_shape)
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(final_hidden_states, f"{debug_label}-finalize", debug_layer)
     return final_hidden_states
 
 
@@ -304,6 +755,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list_type=group_list_type,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_label="decode-w13-gmm",
     )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a4_mxfp_gmm_npu(
@@ -314,6 +766,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list_type=group_list_type,
         group_list=expert_tokens,
         output_dtype=original_dtype,
+        debug_label="decode-w2-gmm",
     )
 
     final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
@@ -358,6 +811,14 @@ def npu_apply_w4a4_mxfp_moe_deepep(
         group_list = group_list.to(torch.int64)
         combine_cls = DeepEPLLCombineInput
 
+    _npu_moe_probe_tensor(hidden_states, "deepep-dispatch-hidden", layer)
+    _npu_moe_probe_tensor(hidden_states_scale, "deepep-dispatch-scale", layer)
+    _npu_moe_probe_tensor(dispatch_output.topk_ids, "deepep-dispatch-topk-ids", layer)
+    _npu_moe_probe_tensor(
+        dispatch_output.topk_weights, "deepep-dispatch-topk-weights", layer
+    )
+    _npu_moe_probe_group_list(group_list, "deepep-group-list", layer)
+
     hidden_states = npu_apply_without_routing_weights_w4a4_mxfp(
         layer,
         hidden_states,
@@ -365,7 +826,10 @@ def npu_apply_w4a4_mxfp_moe_deepep(
         group_list_type,
         group_list,
         output_dtype,
+        debug_label="deepep",
     )
+    _npu_moe_probe_tensor(hidden_states, "deepep-output-before-combine", layer)
+    _npu_moe_register_post_combine_probe(layer, "deepep-after-dispatcher-combine")
     return combine_cls(
         hidden_states=hidden_states,
         topk_ids=dispatch_output.topk_ids,
@@ -380,7 +844,11 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
     group_list_type,
     group_list,
     output_dtype,
+    debug_label="moe",
 ):
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-input", layer)
+    _npu_moe_probe_tensor(hidden_states_scale, f"{debug_label}-input-scale", layer)
+    _npu_moe_probe_group_list(group_list, f"{debug_label}-group-list", layer)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=hidden_states_scale,
@@ -389,8 +857,12 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list_type=group_list_type,
         group_list=group_list,
         output_dtype=output_dtype,
+        debug_layer=layer,
+        debug_label=f"{debug_label}-w13-gmm",
     )
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w13-gmm", layer)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-swiglu", layer)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
@@ -399,7 +871,10 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list_type=group_list_type,
         group_list=group_list,
         output_dtype=output_dtype,
+        debug_layer=layer,
+        debug_label=f"{debug_label}-w2-gmm",
     )
+    _npu_moe_probe_tensor(hidden_states, f"{debug_label}-after-w2-gmm", layer)
     return hidden_states
 
 
@@ -411,9 +886,13 @@ def w4a4_mxfp_gmm_npu(
     group_list_type: int,
     group_list: torch.Tensor,
     output_dtype=torch.bfloat16,
+    debug_layer: Optional[torch.nn.Module] = None,
+    debug_label: str = "gmm",
 ) -> torch.Tensor:
     group_list = group_list.to(torch.int64)
     if input_scale is None:
+        if debug_layer is not None:
+            _npu_moe_probe_tensor(input, f"{debug_label}-quant-input", debug_layer)
         x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
             input,
             axis=1,
@@ -422,15 +901,27 @@ def w4a4_mxfp_gmm_npu(
             block_size=MXFP4_BLOCK_SIZE,
             scale_alg=None,
         )
+        if debug_layer is not None:
+            _npu_moe_probe_tensor(x_scale, f"{debug_label}-dynamic-scale", debug_layer)
     else:
         x, x_scale = input, input_scale
+        if debug_layer is not None:
+            _npu_moe_probe_tensor(x, f"{debug_label}-prequant-input", debug_layer)
+            _npu_moe_probe_tensor(x_scale, f"{debug_label}-prequant-scale", debug_layer)
 
-    return torch.ops.npu.npu_grouped_matmul(
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(
+            weight_scale, f"{debug_label}-weight-scale-raw", debug_layer
+        )
+    gmm_weight_scale = _maybe_view_mxfp4_scale_as_e8m0(weight_scale)
+    gmm_x_scale = _maybe_view_mxfp4_scale_as_e8m0(x_scale)
+
+    output = torch.ops.npu.npu_grouped_matmul(
         [x],
         [weight],
-        scale=[weight_scale],
+        scale=[gmm_weight_scale],
         scale_dtype=torch_npu.float8_e8m0fnu,
-        per_token_scale=[x_scale],
+        per_token_scale=[gmm_x_scale],
         split_item=2,
         group_type=0,
         group_list=group_list,
@@ -440,6 +931,9 @@ def w4a4_mxfp_gmm_npu(
         weight_dtype=torch_npu.float4_e2m1fn_x2,
         per_token_scale_dtype=torch_npu.float8_e8m0fnu,
     )[0]
+    if debug_layer is not None:
+        _npu_moe_probe_tensor(output, f"{debug_label}-output", debug_layer)
+    return output
 
 
 def npu_fused_experts_w4a4(
