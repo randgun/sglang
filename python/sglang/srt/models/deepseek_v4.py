@@ -267,7 +267,7 @@ def _dsv4_npu_model_log_limited(key: str, message: str) -> None:
 
 def _dsv4_npu_model_debug_sync(label: str) -> None:
     if not (
-        _dsv4_npu_model_debug_enabled()
+        (_dsv4_npu_model_debug_enabled() or _dsv4_npu_model_summary_enabled())
         and get_bool_env_var(_DSV4_NPU_DEBUG_SYNC_ENV)
     ):
         return
@@ -281,7 +281,9 @@ def _dsv4_npu_model_debug_sync(label: str) -> None:
 
 
 def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
-    if not _dsv4_npu_model_debug_enabled() or _dsv4_npu_is_stream_capturing():
+    if not (
+        _dsv4_npu_model_debug_enabled() or _dsv4_npu_model_summary_enabled()
+    ) or _dsv4_npu_is_stream_capturing():
         return
 
     _dsv4_npu_model_debug_sync(label)
@@ -306,9 +308,29 @@ def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
             finite_values = probe[finite].to(torch.float32)
             min_val = float(finite_values.min().item())
             max_val = float(finite_values.max().item())
+            mean_val = float(finite_values.mean().item())
+            abs_mean = float(finite_values.abs().mean().item())
+            rms = float(torch.sqrt(torch.mean(finite_values.square())).item())
+            abs_max = float(finite_values.abs().max().item())
         else:
             min_val = float("nan")
             max_val = float("nan")
+            mean_val = float("nan")
+            abs_mean = float("nan")
+            rms = float("nan")
+            abs_max = float("nan")
+
+        flat = probe.flatten()
+        sample_indices: list[int] = []
+        if flat.numel() > 0:
+            sample_indices.extend(range(min(8, flat.numel())))
+            sample_indices.extend([flat.numel() // 2, flat.numel() - 1])
+            sample_indices = sorted(set(sample_indices))
+        sample_values = (
+            [float(v) for v in flat[sample_indices].to(torch.float32).cpu().tolist()]
+            if sample_indices
+            else []
+        )
 
         message_prefix = (
             "DSV4 NPU model tensor stats: "
@@ -320,7 +342,10 @@ def _dsv4_npu_model_probe_tensor(tensor: torch.Tensor, label: str) -> None:
             + f"label={label}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
             f"finite_count={finite_count}, nan_count={nan_count}, "
             f"inf_count={inf_count}, zero_count={zero_count}, "
-            f"finite_min={min_val}, finite_max={max_val}"
+            f"finite_min={min_val}, finite_max={max_val}, "
+            f"finite_mean={mean_val}, finite_abs_mean={abs_mean}, "
+            f"finite_rms={rms}, finite_abs_max={abs_max}, "
+            f"sample_indices={sample_indices}, sample_values={sample_values}"
         )
         _dsv4_npu_model_log_limited(
             f"{'tensor' if full_stats else 'invalid'}-{label}",
