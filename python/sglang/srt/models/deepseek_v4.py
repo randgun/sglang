@@ -355,13 +355,29 @@ def _dsv4_npu_model_probe_summary(tensor: torch.Tensor, label: str) -> None:
             finite_values = probe[finite].to(torch.float32)
             min_val = float(finite_values.min().item())
             max_val = float(finite_values.max().item())
+            mean_val = float(finite_values.mean().item())
             abs_mean = float(finite_values.abs().mean().item())
             abs_max = float(finite_values.abs().max().item())
+            rms = float(torch.sqrt(torch.mean(finite_values.square())).item())
         else:
             min_val = float("nan")
             max_val = float("nan")
+            mean_val = float("nan")
             abs_mean = float("nan")
             abs_max = float("nan")
+            rms = float("nan")
+
+        flat = probe.flatten()
+        sample_indices: list[int] = []
+        if flat.numel() > 0:
+            sample_indices.extend(range(min(8, flat.numel())))
+            sample_indices.extend([flat.numel() // 2, flat.numel() - 1])
+            sample_indices = sorted(set(sample_indices))
+        sample_values = (
+            [float(v) for v in flat[sample_indices].to(torch.float32).cpu().tolist()]
+            if sample_indices
+            else []
+        )
 
         _dsv4_npu_model_log_limited(
             f"summary-{label}",
@@ -371,7 +387,9 @@ def _dsv4_npu_model_probe_summary(tensor: torch.Tensor, label: str) -> None:
                 f"finite_count={finite_count}, nan_count={nan_count}, "
                 f"inf_count={inf_count}, zero_count={zero_count}, "
                 f"finite_min={min_val}, finite_max={max_val}, "
-                f"finite_abs_mean={abs_mean}, finite_abs_max={abs_max}"
+                f"finite_mean={mean_val}, finite_abs_mean={abs_mean}, "
+                f"finite_rms={rms}, finite_abs_max={abs_max}, "
+                f"sample_indices={sample_indices}, sample_values={sample_values}"
             ),
         )
     except Exception:
@@ -2259,8 +2277,10 @@ class DeepseekV4Model(nn.Module):
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             _dsv4_npu_model_probe_tensor(hidden_states, "model-after-embed")
+            _dsv4_npu_model_probe_summary(hidden_states, "model-after-embed")
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
             _dsv4_npu_model_probe_tensor(hidden_states, "model-after-mhc-repeat")
+            _dsv4_npu_model_probe_summary(hidden_states, "model-after-mhc-repeat")
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -2270,6 +2290,7 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
             _dsv4_npu_model_probe_tensor(hidden_states, "model-after-pp-input")
+            _dsv4_npu_model_probe_summary(hidden_states, "model-after-pp-input")
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -2348,11 +2369,13 @@ class DeepseekV4Model(nn.Module):
 
         pre_hc_head = hidden_states.flatten(1)
         _dsv4_npu_model_probe_tensor(pre_hc_head, "model-pre-hc-head")
+        _dsv4_npu_model_probe_summary(pre_hc_head, "model-pre-hc-head")
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         _dsv4_npu_model_probe_tensor(hidden_states, "model-after-hc-head")
+        _dsv4_npu_model_probe_summary(hidden_states, "model-after-hc-head")
         hidden_states = self.norm(hidden_states)
         _dsv4_npu_model_probe_tensor(hidden_states, "model-after-final-norm")
         _dsv4_npu_model_probe_summary(hidden_states, "model-after-final-norm")
