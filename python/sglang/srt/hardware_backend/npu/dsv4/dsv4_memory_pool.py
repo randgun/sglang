@@ -586,26 +586,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         rope_dim = freqs_cis.shape[-1] * 2
         rope_slice = kv_out[..., -rope_dim:]
 
-        # npu_rotary_mul expects interleaved cos/sin values with shape
-        # (tokens, 1, 1, rope_dim).  Materialize real/imag first: indexing a
-        # strided complex .real/.imag view can lower to an unsupported
-        # StridedSlice on Ascend.
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
-            _get_contig_freqs_real_imag,
-        )
+        # Reuse the shared NPU RoPE cache introduced by the DSV4 NPU backend.
+        # It materializes the strided complex real/imag views only once and
+        # keeps the interleaved tables stable for a later graph capture.
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
-        freqs_real, freqs_imag = _get_contig_freqs_real_imag(freqs_cis)
-        cos_half = freqs_real[positions].to(rope_slice.dtype)
-        sin_half = freqs_imag[positions].to(rope_slice.dtype)
-        cos = (
-            cos_half.repeat_interleave(2, dim=-1)
-            .view(-1, 1, 1, rope_dim)
-            .contiguous()
-        )
-        sin = (
-            sin_half.repeat_interleave(2, dim=-1)
-            .view(-1, 1, 1, rope_dim)
-            .contiguous()
+        cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
+            positions,
+            rope_slice.dtype,
+            view_4d=True,
+            allow_build=True,
+            cache_dtype=torch.float32,
         )
         rope_rot = torch_npu.npu_rotary_mul(
             rope_slice.unsqueeze(1).unsqueeze(2),

@@ -77,28 +77,21 @@ def apply_rotary_emb(
     if _is_npu:
         import torch_npu
 
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
-            _get_contig_freqs_real_imag,
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+            Dsv4NpuRoPE,
         )
 
-        # aclnnIndex does not support complex64, so split the full frequency
-        # table into contiguous real/imag tensors before indexing it.
-        freqs_real, freqs_imag = _get_contig_freqs_real_imag(freqs_cis)
-        cos_half = freqs_real[positions].to(x.dtype)
-        sin_half = freqs_imag[positions].to(x.dtype)
-        if inverse:
-            sin_half = -sin_half
-
+        # Reuse the shared DSV4 NPU interleaved RoPE tables.  Besides avoiding
+        # unsupported indexing of complex strided views, this keeps the table
+        # storage stable when the draft forward is captured into an NPU graph.
         rope_dim = x.shape[-1]
-        cos = (
-            cos_half.repeat_interleave(2, dim=-1)
-            .view(-1, 1, 1, rope_dim)
-            .contiguous()
-        )
-        sin = (
-            sin_half.repeat_interleave(2, dim=-1)
-            .view(-1, 1, 1, rope_dim)
-            .contiguous()
+        cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
+            positions,
+            x.dtype,
+            view_4d=True,
+            inverse=inverse,
+            allow_build=True,
+            cache_dtype=torch.float32,
         )
         x_3d = x.reshape(x.shape[0], -1, rope_dim)
         rotated = torch_npu.npu_rotary_mul(

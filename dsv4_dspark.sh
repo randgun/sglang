@@ -68,11 +68,14 @@ export SGLANG_DSPARK_ENABLE_MULTI_STREAM=0
 export SGLANG_DSPARK_QUANT_AUDIT=1
 export SGLANG_DSPARK_QUANT_AUDIT_STRICT=0
 
-MODEL_PATH=/data/weights/DeepSeek-V4-Flash-DSpark-w4a8
+MODEL_PATH=/home/weights/DeepSeek-V4-Flash-DSpark-w4a8-test
 
 LOCAL_IP="0.0.0.0"
 echo "Launch complete W4A8 target + bundled W4A8 DSpark on ${LOCAL_IP}"
-
+export LD_LIBRARY_PATH=/home/kelon/code/vllm-ascend/build/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/kelon/code/vllm-ascend/build/:$LD_LIBRARY_PATH
+export ASCEND_CUSTOM_OPP_PATH=/home/kelon/code/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer:$ASCEND_CUSTOM_OPP_PATH
+export SGLANG_DSPARK_VLLM_ASCEND_SO=/home/kelon/code/vllm-ascend/build/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so
 
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
@@ -104,4 +107,4 @@ python3 -m sglang.launch_server \
     --speculative-moe-a2a-backend deepep \
     --deepep-mode low_latency \
     --kv-cache-dtype bfloat16 \
-    --disable-cuda-graph 
+    --disable-cuda-graph
