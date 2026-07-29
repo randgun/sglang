@@ -43,6 +43,9 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # Committed/live lengths before the verify caller temporarily expands
+    # batch.seq_lens_cpu to the target-attention KV lengths.
+    live_seq_lens_cpu: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -64,6 +67,17 @@ class DFlashVerifyInput(SpecInput):
         """
         batch.input_ids = self.draft_token
         batch.spec_info = self
+        if not batch.forward_mode.is_idle():
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                maybe_build_dsv4_verify_bundle,
+            )
+
+            batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+                batch,
+                self.draft_token_num,
+                live_seq_lens_cpu=self.live_seq_lens_cpu,
+            )
+
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
@@ -82,14 +96,14 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
-        if can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-                verify_forward_batch
-            )
-        elif not batch.forward_mode.is_idle():
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
+        # Do not pre-plan target verify here. DP/EP padding can change the
+        # compressor's logical batch without changing ForwardBatch's stale-plan
+        # shape fields. Let ModelRunner select graph/eager and initialize the
+        # corresponding metadata after final batch preparation.
+        can_run_cuda_graph = False
+
+        # Eager target-verify metadata must be initialized inside the forward
+        # path, after prepare_mlp_sync_batch() has applied DP/EP padding.
 
         return verify_forward_batch, can_run_cuda_graph
 

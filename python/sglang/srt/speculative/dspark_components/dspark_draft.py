@@ -326,6 +326,33 @@ class DraftBlockProposer:
                 markov_head=self.draft_model.markov_head,
                 device=device,
             )
+            rid = str(batch.reqs[0].rid) if batch.reqs else ""
+            probe_counts = getattr(self, "_draft_logits_probe_counts", {})
+            probe_step = probe_counts.get(rid, 0)
+
+            if (
+                get_parallel().tp_rank == 0
+                and rid.startswith("dspark-token-debug")
+                and probe_step < 3
+            ):
+                base_values, base_indices = torch.topk(base_logits[0, 0].float(), k=10)
+                corrected_values, corrected_indices = torch.topk(
+                    draft_block.corrected_logits[0, 0].float(), k=10
+                )
+
+                logger.warning(
+                    "DSpark draft topk: rid=%s step=%d "
+                    "base_ids=%s base_values=%s corrected_ids=%s corrected_values=%s",
+                    rid,
+                    probe_step,
+                    base_indices.cpu().tolist(),
+                    base_values.cpu().tolist(),
+                    corrected_indices.cpu().tolist(),
+                    corrected_values.cpu().tolist(),
+                )
+
+                probe_counts[rid] = probe_step + 1
+                self._draft_logits_probe_counts = probe_counts
         return DraftProposal(
             draft_block_ids=draft_block_ids,
             draft_block=draft_block,
@@ -411,8 +438,15 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
-        with torch.inference_mode():
-            draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        probe_key = str(batch.reqs[0].rid) if batch.reqs else None
+        if hasattr(self.draft_model, "set_attention_probe_context"):
+            self.draft_model.set_attention_probe_context(probe_key)
+        try:
+            with torch.inference_mode():
+                draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        finally:
+            if hasattr(self.draft_model, "set_attention_probe_context"):
+                self.draft_model.set_attention_probe_context(None)
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:

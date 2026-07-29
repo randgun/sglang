@@ -440,9 +440,17 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
+        spec_tokens_per_req = int(
+            getattr(
+                forward_batch.spec_info,
+                "draft_token_num",
+                self.speculative_num_draft_tokens,
+            )
+            or 1
+        )
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
-            seq_lens_max += self.speculative_num_draft_tokens
+            seq_lens_max += spec_tokens_per_req
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -487,10 +495,14 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
-            forward_batch.spec_info
-        ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
+        if forward_batch.forward_mode.is_target_verify():
+            # DSpark callers already pass the full KV length in seq_lens_cpu:
+            # draft forward passes prefix+gamma, target verify passes
+            # prefix+(gamma+1). Adding the global verify width again produces
+            # invalid metadata (for example q=5/KV=14 becoming q=6/KV=20).
+            spec_algorithm = forward_batch.spec_algorithm
+            if spec_algorithm is None or not spec_algorithm.is_dspark():
+                self.forward_metadata.seq_lens_cpu_int += spec_tokens_per_req
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None

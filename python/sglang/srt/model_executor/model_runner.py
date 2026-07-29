@@ -78,6 +78,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+# from sglang.srt.layers.moe.dwdp import DwdpManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -577,7 +578,7 @@ class ModelRunner:
             moe_ep_rank=self.ps.moe_ep_rank,
         )
 
-        self.maybe_init_dwdp()
+        # self.maybe_init_dwdp()
 
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.

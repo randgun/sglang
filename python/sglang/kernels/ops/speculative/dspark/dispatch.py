@@ -10,5 +10,6 @@ def inputs_on_cuda(*args, **kwargs) -> bool:
     such as unit tests exercise the reference path)."""
     for value in (*args, *kwargs.values()):
         if isinstance(value, torch.Tensor):
-            return value.is_cuda
+            return value.device.type == "cuda"
     raise AssertionError("kernel dispatch requires at least one tensor argument")
+    

@@ -124,6 +124,14 @@ class DFlashDraftInputV2(SpecInput):
         bs = batch.batch_size()
         if bs == 0:
             return
+
+        # DSV4-NPU uses explicitly allocated, paged compressor-state pools
+        # instead of CUDA's fixed ring-buffer addressing. Reclaim state pages
+        # that have fallen out of the compressor retention window before
+        # reserving the next DFLASH verify block. The DSV4 state-reclaim hook
+        # inside maybe_evict_swa is a no-op without the NPU state allocators.
+        batch.maybe_evict_swa()
+
         self._ensure_prepare_length_buffers(bs, batch.device)
         assert self._prepare_batch_seq_lens_cpu_buf is not None
         assert self._prepare_cur_kv_lens_cpu_buf is not None

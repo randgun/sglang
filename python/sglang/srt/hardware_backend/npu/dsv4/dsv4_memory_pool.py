@@ -559,6 +559,69 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             cache = cache.unsqueeze(1)
         buf_flat[loc] = cache.to(buf_flat.dtype)
 
+    def set_swa_key_buffer_radix_fused_norm_rope(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """NPU equivalent of the CUDA fused RMSNorm + RoPE + SWA store.
+
+        The base implementation writes CUDA's packed FP8/BF16 FlashMLA cache
+        through a JIT-compiled CUDA kernel.  Ascend uses a plain BF16 PA_ND
+        cache, so normalize and rotate in torch/torch_npu and write through the
+        NPU pool accessor instead.  Negative locations are padding/out-of-SWA
+        sentinels and must not index the last cache slot.
+        """
+        kv_out = kv.float()
+        kv_out = kv_out * torch.rsqrt(
+            kv_out.square().mean(dim=-1, keepdim=True) + eps
+        )
+        kv_out = (kv_out * kv_weight.float()).to(kv.dtype)
+
+        rope_dim = freqs_cis.shape[-1] * 2
+        rope_slice = kv_out[..., -rope_dim:]
+
+        # npu_rotary_mul expects interleaved cos/sin values with shape
+        # (tokens, 1, 1, rope_dim).  Materialize real/imag first: indexing a
+        # strided complex .real/.imag view can lower to an unsupported
+        # StridedSlice on Ascend.
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            _get_contig_freqs_real_imag,
+        )
+
+        freqs_real, freqs_imag = _get_contig_freqs_real_imag(freqs_cis)
+        cos_half = freqs_real[positions].to(rope_slice.dtype)
+        sin_half = freqs_imag[positions].to(rope_slice.dtype)
+        cos = (
+            cos_half.repeat_interleave(2, dim=-1)
+            .view(-1, 1, 1, rope_dim)
+            .contiguous()
+        )
+        sin = (
+            sin_half.repeat_interleave(2, dim=-1)
+            .view(-1, 1, 1, rope_dim)
+            .contiguous()
+        )
+        rope_rot = torch_npu.npu_rotary_mul(
+            rope_slice.unsqueeze(1).unsqueeze(2),
+            cos,
+            sin,
+            rotary_mode="interleave",
+        )
+        rope_slice.copy_(rope_rot.view_as(rope_slice))
+
+        valid = swa_loc >= 0
+        self.set_swa_buffer(
+            layer_id,
+            swa_loc[valid].to(torch.int64),
+            kv_out[valid],
+        )
+
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
     # CompressStatePool stores a fused [kv | score] tensor; split is a last-dim slice.

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 import math
-from types import SimpleNamespace
+import os
+import re
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -14,6 +17,11 @@ from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
+    BuildBlockSeqLensCausal,
+    BuildDsparkSwaPageIndices,
+    ComputeDsparkWindowGather,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -21,6 +29,100 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+_DSPARK_VLLM_ASCEND_SO_ENV = "SGLANG_DSPARK_VLLM_ASCEND_SO"
+_DSV4_VERIFY_METADATA_PROBE_ENV = "SGLANG_DSV4_VERIFY_METADATA_PROBE"
+_loaded_vllm_ascend_so: Optional[Path] = None
+
+
+def _resolve_vllm_ascend_op_library() -> Path:
+    explicit = os.environ.get(_DSPARK_VLLM_ASCEND_SO_ENV)
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(
+                f"{_DSPARK_VLLM_ASCEND_SO_ENV} points to a missing file: {path}"
+            )
+        return path
+
+    search_roots: list[Path] = []
+    source_root = os.environ.get("VLLM_ASCEND_ROOT")
+    if source_root:
+        search_roots.append(Path(source_root).expanduser())
+    search_roots.extend(
+        Path(entry).expanduser()
+        for entry in sys.path
+        if isinstance(entry, str) and entry
+    )
+
+    candidates: list[Path] = []
+    for root in search_roots:
+        candidates.extend(
+            root.glob("vllm_ascend/vllm_ascend_C*.so")
+        )
+        candidates.extend(root.glob("vllm_ascend_C*.so"))
+    candidates = sorted({path.resolve() for path in candidates if path.is_file()})
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "Found multiple vLLM-Ascend operator libraries. Set "
+            f"{_DSPARK_VLLM_ASCEND_SO_ENV} to the exact library to load: "
+            + ", ".join(str(path) for path in candidates)
+        )
+    raise RuntimeError(
+        "Could not find vllm_ascend_C*.so without importing vLLM. Set "
+        f"{_DSPARK_VLLM_ASCEND_SO_ENV} to its absolute path, for example: "
+        f"{_DSPARK_VLLM_ASCEND_SO_ENV}=/path/to/"
+        "vllm_ascend_C.cpython-311-aarch64-linux-gnu.so"
+    )
+
+
+def _load_vllm_ascend_sparse_attn_library() -> Path:
+    global _loaded_vllm_ascend_so
+    if _loaded_vllm_ascend_so is not None:
+        return _loaded_vllm_ascend_so
+
+    import torch_npu  # noqa: F401  # registers the PrivateUse1/NPU dispatch
+
+    library_path = _resolve_vllm_ascend_op_library()
+    abi_match = re.search(r"\.cpython-(\d+)-", library_path.name)
+    current_abi = f"{sys.version_info.major}{sys.version_info.minor}"
+    if abi_match is not None and abi_match.group(1) != current_abi:
+        raise RuntimeError(
+            f"{library_path} was built for CPython {abi_match.group(1)}, but "
+            f"SGLang is running CPython {current_abi}. Rebuild the extension "
+            "with the SGLang Python/Torch/torch-npu environment."
+        )
+    try:
+        torch.ops.load_library(str(library_path))
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load the standalone vLLM-Ascend operator library "
+            f"{library_path}. Ensure its dependent CANN/custom-op libraries "
+            "are visible through LD_LIBRARY_PATH and the Ascend OPP setup."
+        ) from exc
+
+    required_ops = (
+        "npu_sparse_attn_sharedkv_metadata",
+        "npu_sparse_attn_sharedkv",
+    )
+    missing_ops = [
+        name for name in required_ops if not hasattr(torch.ops._C_ascend, name)
+    ]
+    if missing_ops:
+        raise RuntimeError(
+            f"Loaded {library_path}, but required _C_ascend operators are "
+            f"missing: {missing_ops}. The library version does not include "
+            "SparseAttnSharedkv support."
+        )
+
+    _loaded_vllm_ascend_so = library_path
+    logger.info(
+        "Loaded standalone vLLM-Ascend DSpark attention operators from %s",
+        library_path,
+    )
+    return library_path
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -102,6 +204,39 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
             _seq_lens = _seq_lens + self.speculative_num_draft_tokens
+        bundle = forward_batch.out_cache_loc_dsv4
+        self._probe_verify_metadata(
+            "compress_input",
+            forward_batch,
+            {
+                "compress_seq_lens": _seq_lens,
+                "bundle_swa_loc": (
+                    getattr(bundle, "out_swa_loc", None)
+                    if bundle is not None
+                    else None
+                ),
+                "bundle_c4_loc": (
+                    getattr(bundle, "out_c4_loc", None)
+                    if bundle is not None
+                    else None
+                ),
+                "bundle_c128_loc": (
+                    getattr(bundle, "out_c128_loc", None)
+                    if bundle is not None
+                    else None
+                ),
+                "bundle_c4_state_loc": (
+                    getattr(bundle, "out_c4_state_loc", None)
+                    if bundle is not None
+                    else None
+                ),
+                "bundle_c128_state_loc": (
+                    getattr(bundle, "out_c128_state_loc", None)
+                    if bundle is not None
+                    else None
+                ),
+            },
+        )
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -116,6 +251,14 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         )
         for k, v in result.items():
             setattr(fm, k, v)
+        self._probe_verify_metadata(
+            "compress_locs",
+            forward_batch,
+            {
+                "compress_seq_lens": _seq_lens,
+                **result,
+            },
+        )
         if not is_decode:
             for ratio in self._dsv4_compress_ratios:
                 if ratio in (4, 128):
@@ -1072,6 +1215,233 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_unique_compress_ratios = list(
             dict.fromkeys(self._dsv4_compress_ratios)
         )
+        self._is_dspark_draft_worker = bool(
+            getattr(model_runner, "is_draft_worker", False)
+        )
+        # DSpark draft attention directly loads the vLLM-Ascend extension.
+        # Keep this lazy so target-only SGLang does not load the extra library.
+        self._vllm_ascend_ops_loaded = False
+        self._logged_dspark_sparse_metadata = False
+        self._verify_metadata_probe_round = 0
+        self._verify_metadata_probe_active_round: Optional[int] = None
+
+    @staticmethod
+    def _format_verify_probe_tensor(value, max_items: int = 16) -> str:
+        if value is None:
+            return "None"
+        if not isinstance(value, torch.Tensor):
+            return repr(value)
+
+        tensor = value.detach()
+        shape = tuple(tensor.shape)
+        dtype = str(tensor.dtype).removeprefix("torch.")
+        if tensor.numel() == 0:
+            return f"shape={shape},dtype={dtype},values=[]"
+
+        # This probe is explicitly opt-in. Moving the small metadata tensors to
+        # CPU here intentionally synchronizes the NPU stream so the log reflects
+        # the values consumed by this exact verify round.
+        cpu = tensor.to(device="cpu").reshape(-1)
+        shown = cpu[:max_items].tolist()
+        suffix = "" if cpu.numel() <= max_items else f",...({cpu.numel()} total)"
+        return (
+            f"shape={shape},dtype={dtype},values={shown}{suffix},"
+            f"min={cpu.min().item()},max={cpu.max().item()}"
+        )
+
+    def _begin_verify_metadata_probe(self, forward_batch: ForwardBatch) -> None:
+        self._verify_metadata_probe_active_round = None
+        if os.environ.get(_DSV4_VERIFY_METADATA_PROBE_ENV, "0").lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return
+        if self._is_dspark_draft_worker:
+            return
+        if not forward_batch.forward_mode.is_target_verify():
+            return
+
+        requested_rank = int(
+            os.environ.get("SGLANG_DSV4_VERIFY_METADATA_PROBE_RANK", "0")
+        )
+        tp_rank = get_parallel().tp_rank
+        if requested_rank >= 0 and tp_rank != requested_rank:
+            return
+
+        round_id = self._verify_metadata_probe_round
+        self._verify_metadata_probe_round += 1
+        skip_rounds = int(
+            os.environ.get("SGLANG_DSV4_VERIFY_METADATA_PROBE_SKIP_ROUNDS", "0")
+        )
+        max_rounds = int(
+            os.environ.get("SGLANG_DSV4_VERIFY_METADATA_PROBE_MAX_ROUNDS", "32")
+        )
+        if round_id < skip_rounds or round_id >= skip_rounds + max_rounds:
+            return
+        self._verify_metadata_probe_active_round = round_id
+
+    def _probe_verify_metadata(
+        self,
+        stage: str,
+        forward_batch: ForwardBatch,
+        extra: Optional[dict] = None,
+    ) -> None:
+        round_id = self._verify_metadata_probe_active_round
+        if round_id is None:
+            return
+
+        fm = self.forward_metadata
+        spec_info = getattr(forward_batch, "spec_info", None)
+        verify_width = int(
+            getattr(spec_info, "draft_token_num", self.speculative_num_draft_tokens)
+            or 1
+        )
+        fields = {
+            "seq_lens_live": forward_batch.seq_lens,
+            "expected_attn_seq_lens": (
+                forward_batch.seq_lens.to(torch.int32) + verify_width
+            ),
+            "seq_lens_cpu_snapshot": forward_batch.seq_lens_cpu,
+            "seq_lens_cpu_metadata": getattr(fm, "seq_lens_cpu_int", None),
+            "actual_seq_lengths_q_pa": getattr(
+                fm, "actual_seq_lengths_q_pa", None
+            ),
+            "actual_seq_lengths_kv": getattr(fm, "actual_seq_lengths_kv", None),
+            "positions": getattr(forward_batch, "positions", None),
+            "out_cache_loc": getattr(forward_batch, "out_cache_loc", None),
+        }
+        if extra:
+            fields.update(extra)
+
+        rendered = "; ".join(
+            f"{key}={self._format_verify_probe_tensor(value)}"
+            for key, value in fields.items()
+        )
+        logger.info(
+            "DSV4 verify metadata probe: rank=%d round=%d stage=%s "
+            "bs=%d verify_width=%d tokens=%d; %s",
+            get_parallel().tp_rank,
+            round_id,
+            stage,
+            forward_batch.batch_size,
+            verify_width,
+            int(forward_batch.input_ids.numel()),
+            rendered,
+        )
+
+    def _ensure_vllm_ascend_sparse_attn_ops(self) -> None:
+        if not self._is_dspark_draft_worker:
+            return
+        if self._vllm_ascend_ops_loaded:
+            return
+
+        library_path = _load_vllm_ascend_sparse_attn_library()
+        self._vllm_ascend_ops_loaded = True
+        logger.info(
+            "DSpark NPU draft attention directly uses "
+            "torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata and "
+            "torch.ops._C_ascend.npu_sparse_attn_sharedkv from %s",
+            library_path,
+        )
+
+    def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
+        spec_algorithm = forward_batch.spec_algorithm
+        return (
+            self._is_dspark_draft_worker
+            and forward_batch.forward_mode.is_target_verify()
+            and spec_algorithm is not None
+            and spec_algorithm.is_dspark()
+        )
+
+    def _init_dspark_sparse_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Build block-noncausal SWA slot ids for a DSpark draft forward.
+
+        Every token in a DSpark draft block attends to the trailing SWA
+        context and to the whole current draft block.  The Ascend
+        sparse-attention operator consumes physical SWA slot ids with shape
+        [T, N_kv, K], where K must be 128-aligned.
+        """
+        fm = self.forward_metadata
+        fm.ori_sparse_indices = None
+        fm.ori_win_left = self._dsv4_sliding_window_size - 1
+        fm.ori_win_right = 0
+
+        if not self._is_dspark_draft_block(forward_batch):
+            return
+
+        block_size = int(
+            getattr(
+                forward_batch.spec_info,
+                "draft_token_num",
+                self.speculative_num_draft_tokens,
+            )
+            or 1
+        )
+        expected_tokens = forward_batch.batch_size * block_size
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc is None or out_cache_loc.numel() < expected_tokens:
+            raise RuntimeError(
+                "DSpark NPU sparse metadata needs one cache location per draft "
+                f"token: expected at least {expected_tokens}, got "
+                f"{None if out_cache_loc is None else out_cache_loc.numel()}."
+            )
+
+        seq_lens_causal = BuildBlockSeqLensCausal.execute(
+            seq_lens=forward_batch.seq_lens,
+            block_size=block_size,
+            device=forward_batch.seq_lens.device,
+        )
+        req_pool_indices_repeated = (
+            forward_batch.req_pool_indices.repeat_interleave(block_size)
+        )
+        gather = ComputeDsparkWindowGather.execute(
+            seq_lens_casual=seq_lens_causal,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            block_size=block_size,
+            swa_window=self._dsv4_sliding_window_size,
+        )
+        ori_sparse_indices, _ = BuildDsparkSwaPageIndices.execute(
+            req_to_token=self.req_to_token,
+            full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+            req_pool_indices_per_request=gather.req_pool_indices_per_request,
+            offsets=gather.offsets,
+            invalid=gather.invalid,
+            out_loc=out_cache_loc[:expected_tokens],
+            context_lens=gather.context_lens,
+            block_size=block_size,
+            swa_window=self._dsv4_sliding_window_size,
+            page_index_aligned_size=128,
+        )
+        ori_sparse_indices = ori_sparse_indices.unsqueeze(1).contiguous()
+        if (
+            ori_sparse_indices.dtype != torch.int32
+            or ori_sparse_indices.ndim != 3
+            or ori_sparse_indices.shape[1] != self._dsv4_kv_head_num
+            or ori_sparse_indices.shape[2] % 128 != 0
+            or ori_sparse_indices.shape[2] > 2048
+        ):
+            raise RuntimeError(
+                "Invalid DSpark ori_sparse_indices for "
+                "npu_sparse_attn_sharedkv: "
+                f"shape={tuple(ori_sparse_indices.shape)}, "
+                f"dtype={ori_sparse_indices.dtype}."
+            )
+
+        fm.ori_sparse_indices = ori_sparse_indices
+        fm.ori_win_left = self._dsv4_sliding_window_size + block_size - 1
+        fm.ori_win_right = 0
+
+        if not self._logged_dspark_sparse_metadata:
+            logger.info(
+                "DSpark NPU block-noncausal attention enabled: "
+                "ori_sparse_indices=%s, ori_win_left=%d, ori_win_right=%d",
+                tuple(ori_sparse_indices.shape),
+                fm.ori_win_left,
+                fm.ori_win_right,
+            )
+            self._logged_dspark_sparse_metadata = True
 
     def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
         device = self.device
@@ -1451,6 +1821,7 @@ class DeepseekV4AscendAttnBackend(
         self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        self._begin_verify_metadata_probe(forward_batch)
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
@@ -1493,9 +1864,14 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
-            from sglang.srt.runtime_context import get_server_args
-
-            n_draft = get_server_args().speculative_num_draft_tokens or 1
+            n_draft = int(
+                getattr(
+                    forward_batch.spec_info,
+                    "draft_token_num",
+                    self.speculative_num_draft_tokens,
+                )
+                or 1
+            )
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1529,7 +1905,17 @@ class DeepseekV4AscendAttnBackend(
             else:
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
+        self._init_dspark_sparse_metadata(forward_batch)
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
+        self._probe_verify_metadata(
+            "attention_ready",
+            forward_batch,
+            {
+                "swa_page_table": getattr(fm, "swa_page_table", None),
+                "block_tables": getattr(fm, "block_tables", None),
+                "block_tables_swa": getattr(fm, "block_tables_swa", None),
+            },
+        )
 
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
@@ -1540,9 +1926,14 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            from sglang.srt.runtime_context import get_server_args
-
-            max_seqlen_q = get_server_args().speculative_num_draft_tokens or 1
+            max_seqlen_q = int(
+                getattr(
+                    forward_batch.spec_info,
+                    "draft_token_num",
+                    self.speculative_num_draft_tokens,
+                )
+                or 1
+            )
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(
@@ -1564,14 +1955,17 @@ class DeepseekV4AscendAttnBackend(
         max_seqlen_q: int,
         is_nextn: bool,
     ) -> dict:
+        fm = self.forward_metadata
         common = {
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "seqused_kv": actual_seq_lengths_kv,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,
             "cmp_mask_mode": 3,
-            "ori_win_left": self._dsv4_sliding_window_size - 1,
-            "ori_win_right": 0,
+            "ori_win_left": getattr(
+                fm, "ori_win_left", self._dsv4_sliding_window_size - 1
+            ),
+            "ori_win_right": getattr(fm, "ori_win_right", 0),
             "layout_q": "TND",
             "layout_kv": "PA_ND",
         }
@@ -1584,11 +1978,33 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        kernel_metadata = {
-            "c1a_metadata": torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                **c1a_kwargs
+        if self._is_dspark_draft_worker:
+            seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
+            max_seqlen_kv = (
+                int(seq_lens_cpu[:bs].max().item())
+                if seq_lens_cpu is not None and bs > 0
+                else int(actual_seq_lengths_kv[:bs].max().item())
             )
-        }
+            # Match vLLM-Ascend's DSpark prefill metadata. DSpark presents a
+            # whole draft block per request, so the query offsets are also the
+            # original-KV offsets consumed by SparseAttnSharedkv metadata.
+            c1a_kwargs.update(
+                cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+            )
+            self._ensure_vllm_ascend_sparse_attn_ops()
+            c1a_metadata = (
+                torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+                    device=str(actual_seq_lengths_kv.device),
+                    **c1a_kwargs,
+                )
+            )
+        else:
+            c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                **c1a_kwargs,
+            )
+        kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
@@ -1628,7 +2044,9 @@ class DeepseekV4AscendAttnBackend(
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                    **c128a_kwargs
+                )
             )
 
         return kernel_metadata
@@ -1678,8 +2096,10 @@ class DeepseekV4AscendAttnBackend(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
-            ori_win_left=self._dsv4_sliding_window_size - 1,
-            ori_win_right=0,
+            ori_win_left=getattr(
+                fm, "ori_win_left", self._dsv4_sliding_window_size - 1
+            ),
+            ori_win_right=getattr(fm, "ori_win_right", 0),
             layout_q="TND",
             layout_kv="PA_ND",
             q=q,
@@ -1688,8 +2108,24 @@ class DeepseekV4AscendAttnBackend(
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
+            cmp_ratio=1,
         )
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        if self._is_dspark_draft_worker:
+            # Match the A3 vLLM-Ascend DSpark call directly.
+            attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
+        ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
+        if ori_sparse_indices is not None:
+            attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
+        q_arg = attn_kwargs.pop("q")
+        if self._is_dspark_draft_worker:
+            self._ensure_vllm_ascend_sparse_attn_ops()
+            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+                q_arg, **attn_kwargs
+            )
+        else:
+            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
+                q_arg, **attn_kwargs
+            )
         return out
 
     def _forward_compressed(
@@ -1753,12 +2189,34 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        q_arg = attn_kwargs.pop("q")
+        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
+
+    def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Return the SWA KV write locations used by DeepSeek-V4 draft layers.
+
+        During NPU graph capture/replay, ``swa_loc`` is stable graph storage
+        whose contents are refreshed by ``_apply_dsv4_graph_metadata``. Eager
+        forwards do not necessarily build that metadata, so translate the
+        current full-pool locations on demand as a fallback.
+        """
+        out_cache_loc = forward_batch.out_cache_loc
+        metadata = self.forward_metadata
+        cached = getattr(metadata, "swa_loc", None)
+        if (
+            cached is not None
+            and not forward_batch.forward_mode.is_idle()
+            and cached.shape[0] == out_cache_loc.shape[0]
+        ):
+            return cached
+        return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            out_cache_loc
+        ).to(torch.int64)
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
-        swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        swa_loc = self.get_swa_out_cache_loc(forward_batch)
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,
@@ -1778,7 +2236,11 @@ class DeepseekV4AscendAttnBackend(
                 self.speculative_num_draft_tokens,
             )
         )
-        verify_seq_lens_cpu = forward_batch.seq_lens_cpu[:bs] + int(n_draft)
+        # The verify caller has already expanded seq_lens_cpu from the live
+        # prefix length to the final target-attention KV length.  Adding
+        # n_draft again shifts compressor boundaries to the next reserved
+        # verify block and pairs current positions with future c4/c128 slots.
+        verify_seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
         padding_sizes = {}
         for ratio in (4, 128):
             if ratio not in self._dsv4_compress_ratios:
@@ -1811,6 +2273,32 @@ class DeepseekV4AscendAttnBackend(
                         )
                         loc[: bl.numel()].copy_(bl.to(torch.int32))
                 setattr(fm, f"c{ratio}_loc", loc)
+        self._probe_verify_metadata(
+            "compress_verify_ready",
+            forward_batch,
+            {
+                "start_pos": getattr(fm, "start_pos", None),
+                "seqused": getattr(fm, "seqused", None),
+                "positions_cmp_padding_c4": getattr(
+                    fm, "positions_cmp_padding_c4", None
+                ),
+                "positions_cmp_padding_c128": getattr(
+                    fm, "positions_cmp_padding_c128", None
+                ),
+                "c4_loc": getattr(fm, "c4_loc", None),
+                "c128_loc": getattr(fm, "c128_loc", None),
+                "c4_state_loc": getattr(fm, "c4_state_loc", None),
+                "c128_state_loc": getattr(fm, "c128_state_loc", None),
+                "c4_page_table": getattr(fm, "c4_page_table", None),
+                "c128_page_table": getattr(fm, "c128_page_table", None),
+                "c4_state_page_table": getattr(
+                    fm, "c4_state_page_table", None
+                ),
+                "c128_state_page_table": getattr(
+                    fm, "c128_state_page_table", None
+                ),
+            },
+        )
 
     def _fill_verify_positions_cmp_padding(
         self,

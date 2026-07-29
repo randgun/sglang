@@ -202,6 +202,7 @@ class TargetVerifyExecutor:
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
+        verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -209,7 +210,6 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
 
     def run_non_compact(
@@ -231,6 +231,7 @@ class TargetVerifyExecutor:
             draft_token_num=verify_w,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -296,6 +297,7 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        probe_key = str(batch.reqs[0].rid) if batch.reqs else None
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -303,6 +305,7 @@ class TargetVerifyExecutor:
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
+                probe_key=probe_key,
             )
             return
         hidden = logits_output.hidden_states
@@ -315,6 +318,8 @@ class TargetVerifyExecutor:
             cache_loc_2d=verify_window.verify_cache_loc_2d,
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
+            probe_key=probe_key,
+            probe_phase="verify_commit",
         )
 
     def _run_ragged(
@@ -332,6 +337,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=layout,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu

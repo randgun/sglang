@@ -276,8 +276,10 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("DSpark speculative decoding only supports CUDA device.")
+    if not server_args.device.startswith(("cuda", "npu")):
+        raise ValueError(
+            "DSpark speculative decoding only supports CUDA or NPU device."
+        )
 
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:

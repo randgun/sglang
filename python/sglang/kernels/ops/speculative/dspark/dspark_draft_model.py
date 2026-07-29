@@ -24,7 +24,7 @@ class SampleStepTokens:
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
     ) -> torch.Tensor:
-        if step_logits.is_cuda:
+        if inputs_on_cuda(step_logits):
             return cls.triton(
                 step_logits=step_logits,
                 temperatures=temperatures,
@@ -211,7 +211,7 @@ class CommitKvProj:
         main_x: torch.Tensor,
         wkv_linears: list[torch.nn.Module],
     ) -> list[torch.Tensor]:
-        if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
+        if inputs_on_cuda(main_x) and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
             return cls.triton(main_x=main_x, wkv_linears=wkv_linears)
         return cls.torch(main_x=main_x, wkv_linears=wkv_linears)
 
