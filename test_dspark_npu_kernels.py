@@ -187,54 +187,68 @@ def standard_case(
     kwargs: dict[str, Any],
     expected_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+    from sglang.kernels.ops.speculative.dspark.dispatch import (
         inputs_on_cuda,
     )
 
     tensor = first_tensor(kwargs)
-    direct_is_cuda_dispatch = op.__name__ in {
-        "SampleStepTokens",
-        "CommitKvProj",
-        "BuildQoIndptr",
-        "PaddedToBucket",
-    }
     if tensor is None:
         route_to_triton = None
-    elif direct_is_cuda_dispatch:
+        dispatch_rule = None
+    elif op.__module__.endswith("ragged_verify_kernels"):
+        # Shared ragged-verify wrappers dispatch directly on verify_lens.is_cuda.
         route_to_triton = bool(tensor.is_cuda)
+        dispatch_rule = ".is_cuda"
     else:
         route_to_triton = bool(inputs_on_cuda(**kwargs))
+        dispatch_rule = "inputs_on_cuda"
     base = {
         "device": str(tensor.device) if tensor is not None else None,
         "device_type": tensor.device.type if tensor is not None else None,
         "tensor_is_cuda": bool(tensor.is_cuda) if tensor is not None else None,
         "dispatch_reports_cuda": route_to_triton,
-        "dispatch_rule": ".is_cuda" if direct_is_cuda_dispatch else "inputs_on_cuda",
+        "dispatch_rule": dispatch_rule,
+        "op_module": op.__module__,
     }
 
     ref = expected_fn or op.torch
+    expected = None
+    reference_error = None
     try:
         torch.manual_seed(1234)
         expected = ref(**clone_kwargs(kwargs))
         sync(torch, device)
     except Exception as exc:
-        return {
-            **base,
-            "status": "REFERENCE_GAP",
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(),
-        }
+        reference_error = f"{type(exc).__name__}: {exc}"
+        reference_traceback = traceback.format_exc()
 
+    actual = None
     try:
         torch.manual_seed(1234)
         actual = op.execute(**clone_kwargs(kwargs))
         sync(torch, device)
     except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if reference_error is not None:
+            error += f"; reference also failed: {reference_error}"
         return {
             **base,
             "status": "NEEDS_MODIFICATION",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": error,
             "traceback": traceback.format_exc(),
+            **(
+                {"reference_traceback": reference_traceback}
+                if reference_error is not None
+                else {}
+            ),
+        }
+
+    if reference_error is not None:
+        return {
+            **base,
+            "status": "REFERENCE_GAP",
+            "error": reference_error,
+            "traceback": reference_traceback,
         }
 
     equal, detail = compare_results(torch, expected, actual)
@@ -265,7 +279,7 @@ def make_layout(torch, device):
 
 
 def build_case(name: str, torch, device):
-    from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
+    from sglang.kernels.ops.speculative.dspark.dspark_accept import (
         AcceptGreedy,
         AcceptSampling,
         CapCorrectLen,
@@ -273,20 +287,20 @@ def build_case(name: str, torch, device):
         SelectMixedAccept,
         SoftmaxTemp,
     )
-    from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
+    from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
         BuildBlockSeqLensCausal,
         BuildDsparkSwaPageIndices,
         ComputeDsparkWindowGather,
     )
-    from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
+    from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
         BuildStepLocal,
         CommitKvProj,
         SampleStepTokens,
     )
-    from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
+    from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
         ScheduleVerifyLensTopk,
     )
-    from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
+    from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
         BuildCommitInjectLayout,
         BuildOutTokens,
         BuildRaggedVerifyWindow,
@@ -513,13 +527,17 @@ def build_case(name: str, torch, device):
             "gamma": 3,
         }
     if name == "build_qo_indptr_shared":
-        from sglang.srt.speculative.ragged_verify_kernels import BuildQoIndptr
+        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+            BuildQoIndptr,
+        )
 
         return BuildQoIndptr, {
             "verify_lens": torch.tensor([3, 2], dtype=torch.int32, device=device)
         }
     if name == "padded_to_bucket_shared":
-        from sglang.srt.speculative.ragged_verify_kernels import PaddedToBucket
+        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+            PaddedToBucket,
+        )
 
         return PaddedToBucket, {
             "verify_lens": torch.tensor([3, 2], dtype=torch.int32, device=device),
@@ -534,7 +552,7 @@ def run_one(name: str, device_name: str) -> dict[str, Any]:
     torch, device = init_device(device_name)
 
     if name == "dispatch_probe":
-        from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+        from sglang.kernels.ops.speculative.dspark.dispatch import (
             inputs_on_cuda,
         )
 
