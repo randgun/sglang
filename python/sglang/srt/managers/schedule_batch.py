@@ -3107,6 +3107,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
             swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
             for idx, req in enumerate(self.reqs):
+                if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
                     # 2. Evict swa every eviction_interval iterations to reduce the overhead.
