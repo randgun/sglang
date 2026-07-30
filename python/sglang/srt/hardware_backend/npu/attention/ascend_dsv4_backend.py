@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
-
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 

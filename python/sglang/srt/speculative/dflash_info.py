@@ -61,9 +61,9 @@ class DFlashVerifyInput(SpecInput):
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. This helper only packages the verify forward and pre-initializes either CUDA-graph replay
-        metadata or eager attention metadata so the actual forward can run with
-        `skip_attn_backend_init=True`.
+        method is called. This helper packages the verify forward, but leaves
+        attention/graph metadata initialization to ModelRunner after DP/EP
+        padding has finalized the runtime shapes.
         """
         batch.input_ids = self.draft_token
         batch.spec_info = self

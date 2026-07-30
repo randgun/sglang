@@ -278,7 +278,6 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
