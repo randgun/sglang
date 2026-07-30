@@ -472,7 +472,12 @@ class Compressor(MultiPlatformOp):
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
-        if dsa_use_prefill_cp(forward_batch):
+        use_cp = (
+            getattr(forward_batch, "attn_cp_metadata", None) is not None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and get_parallel().attn_cp_size > 1
+        )
+        if dsa_use_prefill_cp(forward_batch) or use_cp:
             x = cp_all_gather_rerange_output(
                 x,
                 get_parallel().attn_cp_size,
