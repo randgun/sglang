@@ -35,6 +35,9 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_is_capture_mode,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -606,12 +609,26 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         rope_slice.copy_(rope_rot.view_as(rope_slice))
 
-        valid = swa_loc >= 0
-        self.set_swa_buffer(
-            layer_id,
-            swa_loc[valid].to(torch.int64),
-            kv_out[valid],
-        )
+        if get_is_capture_mode():
+            # Boolean advanced indexing lowers to NonZero on Ascend. NonZero
+            # synchronizes the stream to resolve its dynamic output length,
+            # which is forbidden while an ACL graph is being captured.
+            #
+            # Decode graph metadata represents padded rows with the reserved
+            # dummy SWA slot 0, so capture/replay can safely issue a fixed-size
+            # write without dynamically filtering locations.
+            self.set_swa_buffer(
+                layer_id,
+                swa_loc.to(torch.int64),
+                kv_out,
+            )
+        else:
+            valid = swa_loc >= 0
+            self.set_swa_buffer(
+                layer_id,
+                swa_loc[valid].to(torch.int64),
+                kv_out[valid],
+            )
 
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.

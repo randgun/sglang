@@ -76,7 +76,9 @@ export LD_LIBRARY_PATH=/home/kelon/code/vllm-ascend/build/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/home/kelon/code/vllm-ascend/build/:$LD_LIBRARY_PATH
 export ASCEND_CUSTOM_OPP_PATH=/home/kelon/code/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer:$ASCEND_CUSTOM_OPP_PATH
 export SGLANG_DSPARK_VLLM_ASCEND_SO=/home/kelon/code/vllm-ascend/build/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
+
+export ASCEND_LAUNCH_BLOCKING=1
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --quantization modelslim \
@@ -96,10 +98,10 @@ python3 -m sglang.launch_server \
     --nnodes 1 \
     --mem-fraction-static 0.69 \
     --prefill-max-requests 16 \
-    --max-prefill-tokens 16000 \
+    --max-prefill-tokens 8000 \
     --disable-radix-cache \
     --chunked-prefill-size -1 \
-    --max-running-requests 240 \
+    --max-running-requests 16 \
     --disable-overlap-schedule \
     --dp-size 16 \
     --enable-dp-attention \
@@ -108,5 +110,5 @@ python3 -m sglang.launch_server \
     --speculative-moe-a2a-backend deepep \
     --deepep-mode low_latency \
     --kv-cache-dtype bfloat16 \
-    --cuda-graph-max-bs-decode 4 \
+    --cuda-graph-max-bs-decode 16 \
     --disable-piecewise-cuda-graph
