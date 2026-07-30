@@ -35,9 +35,6 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.model_executor.runner_utils.capture_mode import (
-    get_is_capture_mode,
-)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -609,7 +606,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         rope_slice.copy_(rope_rot.view_as(rope_slice))
 
-        if get_is_capture_mode():
+        if torch.get_device_module().is_current_stream_capturing():
             # Boolean advanced indexing lowers to NonZero on Ascend. NonZero
             # synchronizes the stream to resolve its dynamic output length,
             # which is forbidden while an ACL graph is being captured.
