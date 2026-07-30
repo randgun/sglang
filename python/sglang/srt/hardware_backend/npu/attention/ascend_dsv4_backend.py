@@ -1672,14 +1672,36 @@ class DeepseekV4AscendAttnBackend(
         )
 
         final_seq_lens_cpu = seq_lens_cpu[:bs]
+        is_idle_replay = runtime_mode.is_idle()
         if graph_mode.is_target_verify():
             explicit_live_cpu = getattr(
                 getattr(forward_batch, "spec_info", None),
                 "live_seq_lens_cpu",
                 None,
             )
-            if explicit_live_cpu is not None:
-                live_seq_lens_cpu = explicit_live_cpu[:bs]
+            if is_idle_replay:
+                # An idle DP rank has a real batch size of zero, but graph
+                # replay still uses a non-empty captured bucket.  The
+                # unpadded live lengths stored in spec_info are therefore
+                # empty and must not replace the bucket-shaped metadata.
+                live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
+            elif explicit_live_cpu is not None:
+                # spec_info describes only real requests, while
+                # forward_batch has already been padded to the selected graph
+                # bucket.  Expand the live lengths to the captured batch size
+                # so every fixed-size graph metadata buffer receives a
+                # shape-compatible tensor.  Zero marks padded request rows.
+                explicit_live_cpu = torch.as_tensor(
+                    explicit_live_cpu,
+                    dtype=final_seq_lens_cpu.dtype,
+                    device=final_seq_lens_cpu.device,
+                ).flatten()
+                live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
+                num_live_rows = min(bs, explicit_live_cpu.numel())
+                if num_live_rows > 0:
+                    live_seq_lens_cpu[:num_live_rows].copy_(
+                        explicit_live_cpu[:num_live_rows]
+                    )
             else:
                 # Both DSpark draft and the legacy target-verify packager pass
                 # final KV lengths in seq_lens_cpu.  Recover the committed
@@ -1701,7 +1723,6 @@ class DeepseekV4AscendAttnBackend(
             live_seq_lens = live_seq_lens_cpu.to(
                 device=device, dtype=torch.int32
             )
-        is_idle_replay = runtime_mode.is_idle()
         has_compress = self._dsv4_has_c4 or self._dsv4_has_c128
         active_target_verify = (
             graph_mode.is_target_verify() and not is_idle_replay and has_compress
