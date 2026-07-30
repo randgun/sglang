@@ -94,13 +94,12 @@ python3 -m sglang.launch_server \
     --host "${LOCAL_IP}" \
     --port 30002 \
     --nnodes 1 \
-    --mem-fraction-static 0.69 \
+    --mem-fraction-static 0.65 \
     --prefill-max-requests 1 \
     --max-prefill-tokens 8000 \
     --disable-radix-cache \
     --chunked-prefill-size -1 \
-    --max-running-requests 1 \
-    --soft-watchdog-timeout 120 \
+    --max-running-requests 64 \
     --disable-overlap-schedule \
     --dp-size 1 \
     --moe-a2a-backend deepep \

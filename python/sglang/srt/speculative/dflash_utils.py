@@ -32,6 +32,43 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
+def _torch_top_k_renorm_prob(
+    probs: torch.Tensor, top_ks: torch.Tensor
+) -> torch.Tensor:
+    """Portable top-k renormalization for backends without sgl_kernel."""
+    vocab_size = probs.shape[-1]
+    top_ks = top_ks.to(device=probs.device, dtype=torch.int64).view(-1)
+    top_ks = top_ks.clamp(min=1, max=vocab_size)
+    max_top_k = int(top_ks.max().item())
+    if max_top_k == vocab_size and bool(torch.all(top_ks == vocab_size).item()):
+        return probs
+
+    values, indices = torch.topk(probs, k=max_top_k, dim=-1)
+    ranks = torch.arange(max_top_k, device=probs.device, dtype=torch.int64)
+    values = values.masked_fill(ranks.unsqueeze(0) >= top_ks.unsqueeze(1), 0)
+    out = torch.zeros_like(probs)
+    out.scatter_(1, indices, values)
+    return out / out.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(out.dtype).tiny
+    )
+
+
+def _torch_top_p_renorm_prob(
+    probs: torch.Tensor, top_ps: torch.Tensor
+) -> torch.Tensor:
+    """Portable nucleus renormalization for backends without sgl_kernel."""
+    top_ps = top_ps.to(device=probs.device, dtype=probs.dtype).view(-1, 1)
+    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+    # Keep the first token whose cumulative mass reaches top_p.
+    remove = sorted_probs.cumsum(dim=-1) - sorted_probs >= top_ps
+    sorted_probs = sorted_probs.masked_fill(remove, 0)
+    out = torch.zeros_like(probs)
+    out.scatter_(1, sorted_indices, sorted_probs)
+    return out / out.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(out.dtype).tiny
+    )
+
+
 if is_cuda() or is_musa():
     try:
         from sgl_kernel import (
@@ -42,12 +79,12 @@ if is_cuda() or is_musa():
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
+        top_k_renorm_prob = _torch_top_k_renorm_prob
+        top_p_renorm_prob = _torch_top_p_renorm_prob
         tree_speculative_sampling_target_only = None
 else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
+    top_k_renorm_prob = _torch_top_k_renorm_prob
+    top_p_renorm_prob = _torch_top_p_renorm_prob
     tree_speculative_sampling_target_only = None
 
 

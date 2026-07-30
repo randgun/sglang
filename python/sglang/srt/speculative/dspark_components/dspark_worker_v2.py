@@ -301,6 +301,19 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+            if (
+                str(self.device).startswith("npu")
+                and not self.server_args.disable_cuda_graph
+            ):
+                ensure_ops = getattr(
+                    self.draft_model_runner.attn_backend,
+                    "_ensure_vllm_ascend_sparse_attn_ops",
+                    None,
+                )
+                if ensure_ops is not None:
+                    # Loading/registering the external operator inside an
+                    # NPUGraph capture would make capture non-deterministic.
+                    ensure_ops()
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
@@ -315,12 +328,29 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = self._maybe_build_draft_sampler()
+                # Keep the first NPU graph milestone to the neural-model
+                # forward.  The folded sampler is useful on CUDA, but adds
+                # Markov-head/argmax tail ops to the graph and makes it harder
+                # to isolate NPU capture failures.  Proposal remains eager on
+                # NPU and consumes the graph-produced hidden state.
+                self._draft_sampler = (
+                    self._maybe_build_draft_sampler()
+                    if is_cuda()
+                    else None
+                )
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
+                if (
+                    str(self.device).startswith("npu")
+                    and self.ps.tp_rank == 0
+                ):
+                    logger.info(
+                        "DSpark NPU graph captures the draft model forward; "
+                        "draft sampling remains eager."
+                    )
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
