@@ -78,7 +78,7 @@ export ASCEND_CUSTOM_OPP_PATH=/home/kelon/code/vllm-ascend/vllm_ascend/_cann_ops
 export SGLANG_DSPARK_VLLM_ASCEND_SO=/home/kelon/code/vllm-ascend/build/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 
-export ASCEND_LAUNCH_BLOCKING=1
+# export ASCEND_LAUNCH_BLOCKING=1
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --quantization modelslim \
