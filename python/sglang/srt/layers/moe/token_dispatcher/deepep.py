@@ -70,6 +70,33 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _sync_npu_before_graph_deepep_dispatch() -> None:
+    """Drain graph-warmup work before entering a DeepEP dispatch on NPU.
+
+    The outer graph-construction scope also covers the warmup forwards that
+    run immediately before NPUGraph capture.  Synchronizing those forwards is
+    useful for diagnosing cross-stream/async handoff races, but synchronizing
+    from inside the actual capture context is illegal on Ascend.  Eager
+    serving is intentionally left unchanged.
+    """
+    if not _is_npu:
+        return
+
+    # Import lazily: importing runner_utils from this module at module-load
+    # time creates a cycle through deepep_adapter -> token_dispatcher.deepep.
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_capture_mode,
+    )
+
+    if not get_is_capture_mode():
+        return
+
+    device_module = torch.get_device_module()
+    if device_module.is_current_stream_capturing():
+        return
+    device_module.synchronize()
+
+
 def _is_mnnvl_fabric_supported() -> bool:
     if not is_flashinfer_available():
         return False
@@ -939,6 +966,10 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+        logger.info("Calling dispatch_a with hidden_states shape: %s, topk_output: %s", hidden_states.shape, topk_output)
+        _sync_npu_before_graph_deepep_dispatch()
+        logger.info("After sync_npu_before_graph_deepep_dispatch")
+        print("Dispatch A: hidden_states shape:",flush=True)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
