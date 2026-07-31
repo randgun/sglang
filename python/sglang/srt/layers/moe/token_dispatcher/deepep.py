@@ -298,12 +298,16 @@ class DeepEPBuffer:
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
-        cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
+        state = cls._state()
+        if state.dispatch_mode == DeepEPDispatchMode.LOW_LATENCY:
+            torch.npu.synchronize()
+        state.dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
         state = cls._state()
         if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
+            torch.npu.synchronize()
             cls.clean_buffer()
         state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 

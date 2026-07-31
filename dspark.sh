@@ -96,12 +96,12 @@ python3 -m sglang.launch_server \
     --host "${LOCAL_IP}" \
     --port 30008 \
     --nnodes 1 \
-    --mem-fraction-static 0.69 \
+    --mem-fraction-static 0.5 \
     --prefill-max-requests 16 \
     --max-prefill-tokens 8000 \
     --disable-radix-cache \
     --chunked-prefill-size -1 \
-    --max-running-requests 16 \
+    --max-running-requests 256 \
     --disable-overlap-schedule \
     --dp-size 16 \
     --enable-dp-attention \
@@ -110,5 +110,5 @@ python3 -m sglang.launch_server \
     --speculative-moe-a2a-backend deepep \
     --deepep-mode low_latency \
     --kv-cache-dtype bfloat16 \
-    --cuda-graph-max-bs-decode 16 \
+    --cuda-graph-max-bs-decode 256 \
     --disable-piecewise-cuda-graph
