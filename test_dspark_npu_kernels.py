@@ -24,8 +24,9 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
-
-
+import torch_npu
+import custom_ops
+import sgl_kernel_npu
 REPO_ROOT = Path(__file__).resolve().parent
 PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
