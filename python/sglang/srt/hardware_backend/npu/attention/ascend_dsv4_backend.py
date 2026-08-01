@@ -1661,6 +1661,13 @@ class DeepseekV4AscendAttnBackend(
         graph_mode = forward_batch.forward_mode
         runtime_mode = getattr(forward_batch, "actual_forward_mode", None) or graph_mode
         bs = forward_batch.batch_size
+        num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+        if num_padding < 0 or num_padding > bs:
+            raise RuntimeError(
+                "Invalid DSV4 graph replay padding: "
+                f"batch_size={bs}, num_padding={num_padding}."
+            )
+        raw_bs = bs - num_padding
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
 
@@ -1743,6 +1750,7 @@ class DeepseekV4AscendAttnBackend(
             has_compress=has_compress,
             active_target_verify=active_target_verify,
             bs=bs,
+            raw_bs=raw_bs,
             tokens_per_bs=tokens_per_bs,
             device=device,
             seq_lens_cpu=seq_lens_cpu,
@@ -1916,8 +1924,11 @@ class DeepseekV4AscendAttnBackend(
             return
 
         src = self._build_dspark_sparse_indices(
-            seq_lens=ctx.live_seq_lens,
-            req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
+            # ``out_cache_loc`` is deliberately left unpadded by the graph
+            # replay view.  Build sparse indices for real requests only, then
+            # populate the remaining rows of the captured buffer below.
+            seq_lens=ctx.live_seq_lens[: ctx.raw_bs],
+            req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.raw_bs],
             out_cache_loc=ctx.forward_batch.out_cache_loc,
             block_size=ctx.tokens_per_bs,
         ).unsqueeze(1)
