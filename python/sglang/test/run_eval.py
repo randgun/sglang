@@ -261,7 +261,7 @@ def run_eval(args):
         from sglang.test.simple_eval_gpqa import GPQAEval
 
         filename = (
-            "/home/c30058706/dataset/gpqa/gpqa_diamond.csv"
+            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":

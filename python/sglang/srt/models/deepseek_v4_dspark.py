@@ -752,6 +752,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.embed_tokens is None:
+            raise ValueError(
+                "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
+                "(call attach_shared_modules first)."
+            )
         x = self.embed_tokens(input_ids)
         x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
         return x
@@ -791,6 +796,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return self._logits_from_x_post_hc(x_post_hc), x_post_hc
 
     def _logits_from_x_post_hc(self, x_post_hc: torch.Tensor) -> torch.Tensor:
+        if self.lm_head is None:
+            raise ValueError(
+                "DeepseekV4ForCausalLMDSpark requires the target lm_head "
+                "(call attach_shared_modules first)."
+            )
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
@@ -829,19 +839,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
-        audit_enabled = envs.SGLANG_DSPARK_QUANT_AUDIT.get()
-        audit_strict = envs.SGLANG_DSPARK_QUANT_AUDIT_STRICT.get()
-        audit_counts = Counter()
-        loaded_source_to_param = {}
-        unexpected_weights = []
-        expert_source_signatures = defaultdict(set)
 
         weights = list(weights)
         if any(name.endswith(".wo_a.scale") for name, _ in weights):
             weights = list(_dequant_fp8_wo_a(weights))
 
-        if audit_enabled:
-            self._audit_quant_methods()
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -854,16 +856,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
         for name, loaded_weight in weights:
-            audit_counts["checkpoint_total"] += 1
-            self._record_expert_source_signature(
-                name=name, signatures=expert_source_signatures
-            )
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
-                audit_counts["ignored"] += 1
                 continue
 
-            audit_counts["draft_selected"] += 1
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
                     continue
@@ -874,8 +870,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(candidate)
-                loaded_source_to_param[name] = candidate
-                audit_counts["loaded_stacked"] += 1
                 break
             else:
                 for (
@@ -899,13 +893,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                         expert_id=expert_id,
                     )
                     loaded_params.add(candidate)
-                    loaded_source_to_param[name] = candidate
-                    audit_counts["loaded_expert"] += 1
                     break
                 else:
                     if mapped not in params_dict:
-                        audit_counts["unexpected"] += 1
-                        unexpected_weights.append((name, mapped))
                         logger.warning(
                             "DSpark V4 draft: unexpected weight %r -> %r", name, mapped
                         )
@@ -916,225 +906,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(mapped)
-                    loaded_source_to_param[name] = mapped
-                    audit_counts["loaded_direct"] += 1
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
-        self._assert_vocab_modules_loaded(loaded_params=loaded_params)
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "DeepSeek-V4 DSpark loaded checkpoint-local vocabulary weights: "
-                "mtp.0.embed.weight -> embed_tokens.weight, "
-                "mtp.%d.head.weight -> lm_head.weight",
-                self.num_stages - 1,
-            )
-        if audit_enabled:
-            self._finish_quant_audit(
-                params_dict=params_dict,
-                loaded_params=loaded_params,
-                loaded_source_to_param=loaded_source_to_param,
-                unexpected_weights=unexpected_weights,
-                expert_source_signatures=expert_source_signatures,
-                audit_counts=audit_counts,
-                strict=audit_strict,
-            )
-
-    @staticmethod
-    def _record_expert_source_signature(*, name: str, signatures) -> None:
-        """Record the tensor families present for each checkpoint expert.
-
-        Comparing these signatures catches partially exported experts even
-        when all tensors that are present happen to load successfully.
-        """
-        parts = name.split(".")
-        if (
-            len(parts) < 7
-            or parts[0] != "mtp"
-            or not parts[1].isdigit()
-            or parts[2] != "ffn"
-            or parts[3] != "experts"
-            or not parts[4].isdigit()
-            or parts[5] not in ("w1", "w2", "w3")
-        ):
-            return
-        signatures[(int(parts[1]), int(parts[4]))].add(
-            (parts[5], ".".join(parts[6:]))
-        )
-
-    def _audit_quant_methods(self) -> None:
-        rank = get_parallel().tp_rank
-        found = 0
-        for name, module in self.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is None:
-                continue
-            found += 1
-            details = []
-            for attr in ("scheme", "w13_scheme", "w2_scheme"):
-                value = getattr(module, attr, None)
-                if value is not None:
-                    details.append(f"{attr}={type(value).__name__}")
-            logger.warning(
-                "DSpark W4A8 audit method: rank=%d module=%s module_type=%s "
-                "quant_method=%s %s",
-                rank,
-                name,
-                type(module).__name__,
-                type(quant_method).__name__,
-                " ".join(details),
-            )
-        logger.warning(
-            "DSpark W4A8 audit methods summary: rank=%d quantized_modules=%d",
-            rank,
-            found,
-        )
-
-    @staticmethod
-    def _audit_sample_tensor(tensor: torch.Tensor, max_samples: int = 4096):
-        flat = tensor.detach().reshape(-1)
-        if flat.numel() == 0:
-            return {
-                "shape": tuple(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "samples": 0,
-            }
-        stride = max(1, flat.numel() // max_samples)
-        sample = flat[::stride][:max_samples].float()
-        finite = torch.isfinite(sample)
-        finite_sample = sample[finite]
-        if finite_sample.numel() == 0:
-            return {
-                "shape": tuple(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "samples": int(sample.numel()),
-                "finite": 0,
-            }
-        return {
-            "shape": tuple(tensor.shape),
-            "dtype": str(tensor.dtype),
-            "samples": int(sample.numel()),
-            "finite": int(finite.sum().item()),
-            "min": round(float(finite_sample.min().item()), 8),
-            "max": round(float(finite_sample.max().item()), 8),
-            "mean": round(float(finite_sample.mean().item()), 8),
-            "rms": round(
-                float(torch.sqrt(finite_sample.square().mean()).item()), 8
-            ),
-            "zero_fraction": round(
-                float((finite_sample == 0).float().mean().item()), 8
-            ),
-            # A cheap fingerprint useful for comparing TP/EP ranks and
-            # detecting identical/uninitialized expert shards.
-            "fingerprint": round(float(finite_sample[:256].sum().item()), 8),
-        }
-
-    @staticmethod
-    def _is_quant_audit_parameter(name: str) -> bool:
-        if name.startswith(("markov_head.", "confidence_head.")):
-            return True
-        if not name.startswith("stages."):
-            return False
-        return any(
-            marker in name
-            for marker in (
-                "main_proj",
-                "self_attn.w",
-                "mlp.experts.w13_",
-                "mlp.experts.w2_",
-            )
-        )
-
-    def _finish_quant_audit(
-        self,
-        *,
-        params_dict,
-        loaded_params,
-        loaded_source_to_param,
-        unexpected_weights,
-        expert_source_signatures,
-        audit_counts,
-        strict: bool,
-    ) -> None:
-        rank = get_parallel().tp_rank
-        missing_runtime = sorted(set(params_dict) - loaded_params)
-        audit_counts["loaded_sources"] = len(loaded_source_to_param)
-        audit_counts["loaded_runtime_params"] = len(loaded_params)
-        audit_counts["missing_runtime_params"] = len(missing_runtime)
-
-        signature_counts = Counter(
-            frozenset(signature)
-            for signature in expert_source_signatures.values()
-        )
-        modal_signature = (
-            signature_counts.most_common(1)[0][0] if signature_counts else frozenset()
-        )
-        inconsistent_experts = [
-            (
-                key,
-                sorted(modal_signature - signature),
-                sorted(signature - modal_signature),
-            )
-            for key, signature in expert_source_signatures.items()
-            if signature != modal_signature
-        ]
-
-        logger.warning(
-            "DSpark W4A8 audit load summary: rank=%d counts=%s "
-            "expert_groups=%d expert_signature_variants=%d "
-            "inconsistent_experts=%d",
-            rank,
-            dict(audit_counts),
-            len(expert_source_signatures),
-            len(signature_counts),
-            len(inconsistent_experts),
-        )
-        if missing_runtime:
-            logger.warning(
-                "DSpark W4A8 audit missing runtime params: rank=%d count=%d "
-                "sample=%s",
-                rank,
-                len(missing_runtime),
-                missing_runtime[:50],
-            )
-        if unexpected_weights:
-            logger.warning(
-                "DSpark W4A8 audit unexpected checkpoint tensors: rank=%d "
-                "count=%d sample=%s",
-                rank,
-                len(unexpected_weights),
-                unexpected_weights[:50],
-            )
-        if inconsistent_experts:
-            logger.warning(
-                "DSpark W4A8 audit inconsistent expert tensor families: rank=%d "
-                "sample=%s",
-                rank,
-                inconsistent_experts[:20],
-            )
-
-        for name, param in params_dict.items():
-            if not self._is_quant_audit_parameter(name):
-                continue
-            logger.warning(
-                "DSpark W4A8 audit tensor: rank=%d loaded=%s name=%s stats=%s",
-                rank,
-                name in loaded_params,
-                name,
-                self._audit_sample_tensor(param),
-            )
-
-        if strict and (
-            unexpected_weights or missing_runtime or inconsistent_experts
-        ):
-            raise ValueError(
-                "DSpark W4A8 strict audit failed: "
-                f"unexpected={len(unexpected_weights)}, "
-                f"missing_runtime={len(missing_runtime)}, "
-                f"inconsistent_experts={len(inconsistent_experts)}. "
-                "See preceding 'DSpark W4A8 audit' logs."
-            )
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
@@ -1152,17 +927,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
-    @staticmethod
-    def _assert_vocab_modules_loaded(*, loaded_params: set) -> None:
-        required = {"embed_tokens.weight", "lm_head.weight"}
-        missing = required - loaded_params
-        if missing:
-            raise ValueError(
-                "DeepSeek-V4 DSpark draft requires its MTP-local embedding and "
-                f"LM-head weights, but these runtime parameters were not loaded: "
-                f"{sorted(missing)}. Expected checkpoint tensors "
-                "`mtp.0.embed.weight` and `mtp.<last_stage>.head.weight`."
-            )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
@@ -1213,10 +977,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        # Only standalone FP8 scale tensors use the ``weight_scale_inv``
-        # runtime name.  W4A8 MoE also stores ``scale_bias`` tensors; a broad
-        # string replacement would corrupt those names into
-        # ``weight_scale_inv_bias`` and leave w13/w2_scale_bias uninitialized.
         if mapped_rest.endswith(".scale"):
             mapped_rest = (
                 mapped_rest.removesuffix(".scale") + ".weight_scale_inv"

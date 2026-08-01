@@ -328,11 +328,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                # Keep the first NPU graph milestone to the neural-model
-                # forward.  The folded sampler is useful on CUDA, but adds
-                # Markov-head/argmax tail ops to the graph and makes it harder
-                # to isolate NPU capture failures.  Proposal remains eager on
-                # NPU and consumes the graph-produced hidden state.
                 self._draft_sampler = (
                     self._maybe_build_draft_sampler()
                     if is_cuda()
@@ -343,14 +338,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-                if (
-                    str(self.device).startswith("npu")
-                    and self.ps.tp_rank == 0
-                ):
-                    logger.info(
-                        "DSpark NPU graph captures the draft model forward; "
-                        "draft sampling remains eager."
-                    )
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )

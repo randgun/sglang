@@ -32,22 +32,6 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-def _torch_top_p_renorm_prob(
-    probs: torch.Tensor, top_ps: torch.Tensor
-) -> torch.Tensor:
-    """Portable nucleus renormalization for backends without sgl_kernel."""
-    top_ps = top_ps.to(device=probs.device, dtype=probs.dtype).view(-1, 1)
-    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
-    # Keep the first token whose cumulative mass reaches top_p.
-    remove = sorted_probs.cumsum(dim=-1) - sorted_probs >= top_ps
-    sorted_probs = sorted_probs.masked_fill(remove, 0)
-    out = torch.zeros_like(probs)
-    out.scatter_(1, sorted_indices, sorted_probs)
-    return out / out.sum(dim=-1, keepdim=True).clamp_min(
-        torch.finfo(out.dtype).tiny
-    )
-
-
 if is_cuda() or is_musa():
     try:
         from sgl_kernel import (

@@ -321,11 +321,6 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
-    # Audit DSpark checkpoint-name remapping, selected quantization methods,
-    # and representative loaded parameter values.  STRICT additionally fails
-    # startup when a draft checkpoint tensor cannot be loaded.
-    SGLANG_DSPARK_QUANT_AUDIT = EnvBool(False)
-    SGLANG_DSPARK_QUANT_AUDIT_STRICT = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
