@@ -1118,14 +1118,7 @@ class DeepseekV4AscendAttnBackend(
             )
             or 1
         )
-        expected_tokens = forward_batch.batch_size * block_size
         out_cache_loc = forward_batch.out_cache_loc
-        if out_cache_loc is None or out_cache_loc.numel() < expected_tokens:
-            raise RuntimeError(
-                "DSpark NPU sparse metadata needs one cache location per draft "
-                f"token: expected at least {expected_tokens}, got "
-                f"{None if out_cache_loc is None else out_cache_loc.numel()}."
-            )
 
         ori_sparse_indices = self._build_dspark_sparse_indices(
             seq_lens=forward_batch.seq_lens,
@@ -1134,19 +1127,6 @@ class DeepseekV4AscendAttnBackend(
             block_size=block_size,
         )
         ori_sparse_indices = ori_sparse_indices.unsqueeze(1).contiguous()
-        if (
-            ori_sparse_indices.dtype != torch.int32
-            or ori_sparse_indices.ndim != 3
-            or ori_sparse_indices.shape[1] != self._dsv4_kv_head_num
-            or ori_sparse_indices.shape[2] % 128 != 0
-            or ori_sparse_indices.shape[2] > 2048
-        ):
-            raise RuntimeError(
-                "Invalid DSpark ori_sparse_indices for "
-                "npu_sparse_attn_sharedkv: "
-                f"shape={tuple(ori_sparse_indices.shape)}, "
-                f"dtype={ori_sparse_indices.dtype}."
-            )
 
         fm.ori_sparse_indices = ori_sparse_indices
         fm.ori_win_left = self._dsv4_sliding_window_size + block_size - 1
@@ -1178,12 +1158,6 @@ class DeepseekV4AscendAttnBackend(
         """
         bs = int(seq_lens.shape[0])
         expected_tokens = bs * block_size
-        if out_cache_loc is None or out_cache_loc.numel() < expected_tokens:
-            raise RuntimeError(
-                "DSpark NPU sparse metadata needs one cache location per draft "
-                f"token: expected at least {expected_tokens}, got "
-                f"{None if out_cache_loc is None else out_cache_loc.numel()}."
-            )
 
         seq_lens_causal = BuildBlockSeqLensCausal.execute(
             seq_lens=seq_lens,
@@ -1352,9 +1326,6 @@ class DeepseekV4AscendAttnBackend(
             metadata.ori_sparse_indices = self.graph_metadata[
                 "ori_sparse_indices"
             ][:T]
-            # The optional sparse input must be present and non-empty during
-            # capture so replay records the slot-gather kernel branch.  Runtime
-            # replay replaces these contents before the graph is launched.
             metadata.ori_sparse_indices.fill_(-1)
             metadata.ori_sparse_indices[:, :, 0] = 0
             metadata.ori_win_left = (
@@ -1393,11 +1364,7 @@ class DeepseekV4AscendAttnBackend(
         runtime_mode = getattr(forward_batch, "actual_forward_mode", None) or graph_mode
         bs = forward_batch.batch_size
         num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
-        if num_padding < 0 or num_padding > bs:
-            raise RuntimeError(
-                "Invalid DSV4 graph replay padding: "
-                f"batch_size={bs}, num_padding={num_padding}."
-            )
+
         raw_bs = bs - num_padding
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
