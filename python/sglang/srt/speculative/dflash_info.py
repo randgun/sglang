@@ -13,10 +13,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+_is_npu = is_npu()
 
 
 @dataclass
@@ -61,13 +64,13 @@ class DFlashVerifyInput(SpecInput):
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. This helper packages the verify forward, but leaves
-        attention/graph metadata initialization to ModelRunner after DP/EP
-        padding has finalized the runtime shapes.
+        method is called. GPU keeps the original pre-planning path. NPU leaves
+        attention/graph metadata initialization to ModelRunner because DP/EP
+        padding can still change the compressor's runtime shapes.
         """
         batch.input_ids = self.draft_token
         batch.spec_info = self
-        if not batch.forward_mode.is_idle():
+        if _is_npu and not batch.forward_mode.is_idle():
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                 maybe_build_dsv4_verify_bundle,
             )
@@ -96,14 +99,20 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
-        # Do not pre-plan target verify here. DP/EP padding can change the
-        # compressor's logical batch without changing ForwardBatch's stale-plan
-        # shape fields. Let ModelRunner select graph/eager and initialize the
-        # corresponding metadata after final batch preparation.
-        can_run_cuda_graph = False
-
-        # Eager target-verify metadata must be initialized inside the forward
-        # path, after prepare_mlp_sync_batch() has applied DP/EP padding.
+        if _is_npu:
+            # Do not pre-plan target verify on NPU. DP/EP padding can change
+            # the compressor's logical batch without changing ForwardBatch's
+            # stale-plan shape fields. Let ModelRunner select graph/eager and
+            # initialize metadata after final batch preparation.
+            can_run_cuda_graph = False
+        elif can_run_cuda_graph:
+            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
+                verify_forward_batch
+            )
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
 
         return verify_forward_batch, can_run_cuda_graph
 
