@@ -801,14 +801,7 @@ class C4IndexerBackendMixin:
                 : c4_sparse_page_indices.size(0)
             ]
         elif core_metadata.c4_sparse_raw_indices is not None:
-            # Ragged verify can compact the active query rows while the
-            # reusable metadata buffer remains sized for the padded verify
-            # tier.  Keep this optional top-k output aligned with logits and
-            # c4_sparse_page_indices just like the other per-query metadata
-            # above.
-            raw_indices = match_num_queries(
-                core_metadata.c4_sparse_raw_indices, value=-1
-            )
+            raw_indices = core_metadata.c4_sparse_raw_indices
 
         if (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
