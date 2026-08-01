@@ -1176,16 +1176,9 @@ class DeepseekV4AscendAttnBackend(
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
         )
-        # The draft runner and the target runner use different static widths:
-        # DSpark draft forwards contain gamma tokens, while target verify
-        # contains gamma + 1 candidates.  server_args only carries the public
-        # verify width, so use ModelRunner's phase-aware resolver for graph
-        # buffer shapes.
         self._dsv4_graph_tokens_per_req = int(
             model_runner.decode_num_tokens_per_req()
         )
-        # DSpark draft attention directly loads the vLLM-Ascend extension.
-        # Keep this lazy so target-only SGLang does not load the extra library.
         self._vllm_ascend_ops_loaded = False
         self._logged_dspark_sparse_metadata = False
 
@@ -1537,17 +1530,8 @@ class DeepseekV4AscendAttnBackend(
                 None,
             )
             if is_idle_replay:
-                # An idle DP rank has a real batch size of zero, but graph
-                # replay still uses a non-empty captured bucket.  The
-                # unpadded live lengths stored in spec_info are therefore
-                # empty and must not replace the bucket-shaped metadata.
                 live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
             elif explicit_live_cpu is not None:
-                # spec_info describes only real requests, while
-                # forward_batch has already been padded to the selected graph
-                # bucket.  Expand the live lengths to the captured batch size
-                # so every fixed-size graph metadata buffer receives a
-                # shape-compatible tensor.  Zero marks padded request rows.
                 explicit_live_cpu = torch.as_tensor(
                     explicit_live_cpu,
                     dtype=final_seq_lens_cpu.dtype,
@@ -1560,9 +1544,6 @@ class DeepseekV4AscendAttnBackend(
                         explicit_live_cpu[:num_live_rows]
                     )
             else:
-                # Both DSpark draft and the legacy target-verify packager pass
-                # final KV lengths in seq_lens_cpu.  Recover the committed
-                # prefix rather than adding the block width a second time.
                 live_seq_lens_cpu = torch.clamp(
                     final_seq_lens_cpu - int(tokens_per_bs), min=0
                 )
@@ -1993,9 +1974,6 @@ class DeepseekV4AscendAttnBackend(
                 if seq_lens_cpu is not None and bs > 0
                 else int(actual_seq_lengths_kv[:bs].max().item())
             )
-            # Match vLLM-Ascend's DSpark prefill metadata. DSpark presents a
-            # whole draft block per request, so the query offsets are also the
-            # original-KV offsets consumed by SparseAttnSharedkv metadata.
             c1a_kwargs.update(
                 cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
                 max_seqlen_q=max_seqlen_q,

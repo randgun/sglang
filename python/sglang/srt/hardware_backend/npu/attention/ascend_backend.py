@@ -496,10 +496,6 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
         if forward_batch.forward_mode.is_target_verify():
-            # DSpark callers already pass the full KV length in seq_lens_cpu:
-            # draft forward passes prefix+gamma, target verify passes
-            # prefix+(gamma+1). Adding the global verify width again produces
-            # invalid metadata (for example q=5/KV=14 becoming q=6/KV=20).
             spec_algorithm = forward_batch.spec_algorithm
             if spec_algorithm is None or not spec_algorithm.is_dspark():
                 self.forward_metadata.seq_lens_cpu_int += spec_tokens_per_req

@@ -394,21 +394,9 @@ def maybe_build_dsv4_verify_bundle(
 
     req_indices = batch.req_pool_indices_cpu.tolist()
 
-    # DSpark/DFlash expands ``batch.seq_lens_cpu`` to the target-attention KV
-    # length before this helper runs.  Using it as the interval start would
-    # select the *next* reserved block:
-    #
-    #   wrong: [live + verify_width, live + 2 * verify_width)
-    #
-    # Those callers pass their pre-expansion CPU snapshot explicitly. EAGLE
-    # calls this helper before expanding seq_lens_cpu, so the fallback remains
-    # its committed/live CPU length. Avoid reading batch.seq_lens back from NPU
-    # here: this function is on every speculative step's metadata hot path.
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens_cpu
     if live_seq_lens_cpu is None:
-        # Defensive fallback for callers without a CPU mirror. Normal
-        # DSpark/DFlash/EAGLE paths always provide one.
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 

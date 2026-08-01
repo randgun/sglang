@@ -284,9 +284,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        # Ascend supports DSpark DP attention with an explicit MoE A2A
-        # backend (for example, DeepEP). Keep the built-in TP MoE
-        # restriction for the other device backends.
         if (
             not server_args.device.startswith("npu")
             and server_args.moe_a2a_backend != "none"

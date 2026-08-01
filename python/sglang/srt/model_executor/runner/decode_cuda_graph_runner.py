@@ -405,27 +405,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         try:
             with model_capture_mode():
                 self.capture()
-
-            # Ascend graph capture is asynchronous.  In speculative decoding,
-            # target and draft runners are initialized independently on every
-            # rank; without a rendezvous, a faster rank may leave capture and
-            # start the next initialization/replay phase while peer ranks are
-            # still finalizing captured HCCL/DeepEP work.  Rendezvous once
-            # after the complete shape set has been captured, then drain the
-            # local NPU streams before exposing this runner for replay.
-            if self.device == "npu":
-                self.model_runner.tp_group.barrier()
-                self.device_module.synchronize()
-                if get_parallel().tp_rank == 0:
-                    logger.info(
-                        "NPU graph capture completed for %s runner; "
-                        "synchronized all TP ranks.",
-                        (
-                            "draft"
-                            if self.model_runner.is_draft_worker
-                            else "target"
-                        ),
-                    )
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"

@@ -569,14 +569,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        """NPU equivalent of the CUDA fused RMSNorm + RoPE + SWA store.
-
-        The base implementation writes CUDA's packed FP8/BF16 FlashMLA cache
-        through a JIT-compiled CUDA kernel.  Ascend uses a plain BF16 PA_ND
-        cache, so normalize and rotate in torch/torch_npu and write through the
-        NPU pool accessor instead.  Negative locations are padding/out-of-SWA
-        sentinels and must not index the last cache slot.
-        """
         kv_out = kv.float()
         kv_out = kv_out * torch.rsqrt(
             kv_out.square().mean(dim=-1, keepdim=True) + eps
@@ -586,9 +578,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         rope_dim = freqs_cis.shape[-1] * 2
         rope_slice = kv_out[..., -rope_dim:]
 
-        # Reuse the shared NPU RoPE cache introduced by the DSV4 NPU backend.
-        # It materializes the strided complex real/imag views only once and
-        # keeps the interleaved tables stable for a later graph capture.
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
@@ -606,16 +595,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         rope_slice.copy_(rope_rot.view_as(rope_slice))
 
-        # Keep this store fixed-shape in both eager execution and graph capture.
-        # Boolean indexing (``swa_loc[valid]`` / ``kv_out[valid]``) lowers to
-        # NonZero on Ascend; NonZero synchronizes with the host to resolve its
-        # dynamic output length and therefore both hurts eager performance and
-        # is illegal on a captured stream.
-        #
-        # SWA slot 0 is permanently reserved as the padding sink by every SWA
-        # allocator used here.  Route negative padding/tombstone locations to
-        # that slot and issue one fixed-size device-side indexed write.  Multiple
-        # padded rows may overwrite slot 0, but no real token can reference it.
         safe_swa_loc = swa_loc.clamp_min(0).to(torch.int64)
         self.set_swa_buffer(
             layer_id,

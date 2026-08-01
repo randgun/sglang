@@ -153,10 +153,6 @@ class ModelSlimConfig(QuantizationConfig):
                 alias = f"confidence_head.{rest[len('confidence_head.'):]}"
             else:
                 mapped_rest = rest
-                # The generic DeepSeek-V4 ModelSlim preprocessing may already
-                # have canonicalized these prefixes.  Use anchored,
-                # idempotent rewrites; a substring replacement would turn
-                # ``self_attn`` into ``self_self_attn``.
                 if mapped_rest.startswith("attn."):
                     mapped_rest = (
                         "self_attn." + mapped_rest.removeprefix("attn.")
@@ -186,8 +182,6 @@ class ModelSlimConfig(QuantizationConfig):
 
             dspark_quant_aliases[alias] = scheme
 
-        # An explicitly exported canonical runtime key takes precedence over
-        # the compatibility alias derived from an mtp key.
         quant_config = {
             **dspark_quant_aliases,
             **quant_config,
