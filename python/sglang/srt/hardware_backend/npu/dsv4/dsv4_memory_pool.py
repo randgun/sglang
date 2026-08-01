@@ -576,24 +576,23 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         kv_out = (kv_out * kv_weight.float()).to(kv.dtype)
 
         rope_dim = freqs_cis.shape[-1] * 2
-        rope_slice = kv_out[..., -rope_dim:]
 
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
             positions,
-            rope_slice.dtype,
+            kv_out.dtype,
             view_4d=True,
             allow_build=True,
             cache_dtype=torch.float32,
         )
-        rope_rot = torch_npu.npu_rotary_mul(
-            rope_slice.unsqueeze(1).unsqueeze(2),
+        Dsv4NpuRoPE.apply_rotary_mul_inplace(
+            kv_out.reshape(kv_out.shape[0], -1, kv_out.shape[-1]),
+            None,
             cos,
             sin,
-            rotary_mode="interleave",
+            qk_nope_dim=kv_out.shape[-1] - rope_dim,
         )
-        rope_slice.copy_(rope_rot.view_as(rope_slice))
 
         safe_swa_loc = swa_loc.clamp_min(0).to(torch.int64)
         self.set_swa_buffer(
