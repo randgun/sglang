@@ -42,8 +42,12 @@ if is_cuda() or is_musa():
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
 else:
+    top_k_renorm_prob = None
+    top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
 
 

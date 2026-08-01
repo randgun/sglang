@@ -2,26 +2,23 @@ from __future__ import annotations
 
 import logging
 import math
-import os
-import re
-import sys
-from pathlib import Path
-from typing import TYPE_CHECKING, Optional
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Optional
+
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+    BuildBlockSeqLensCausal,
+    BuildDsparkSwaPageIndices,
+    ComputeDsparkWindowGather,
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
-from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
-    BuildBlockSeqLensCausal,
-    BuildDsparkSwaPageIndices,
-    ComputeDsparkWindowGather,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -29,99 +26,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-_DSPARK_VLLM_ASCEND_SO_ENV = "SGLANG_DSPARK_VLLM_ASCEND_SO"
-_loaded_vllm_ascend_so: Optional[Path] = None
-
-
-def _resolve_vllm_ascend_op_library() -> Path:
-    explicit = os.environ.get(_DSPARK_VLLM_ASCEND_SO_ENV)
-    if explicit:
-        path = Path(explicit).expanduser().resolve()
-        if not path.is_file():
-            raise RuntimeError(
-                f"{_DSPARK_VLLM_ASCEND_SO_ENV} points to a missing file: {path}"
-            )
-        return path
-
-    search_roots: list[Path] = []
-    source_root = os.environ.get("VLLM_ASCEND_ROOT")
-    if source_root:
-        search_roots.append(Path(source_root).expanduser())
-    search_roots.extend(
-        Path(entry).expanduser()
-        for entry in sys.path
-        if isinstance(entry, str) and entry
-    )
-
-    candidates: list[Path] = []
-    for root in search_roots:
-        candidates.extend(
-            root.glob("vllm_ascend/vllm_ascend_C*.so")
-        )
-        candidates.extend(root.glob("vllm_ascend_C*.so"))
-    candidates = sorted({path.resolve() for path in candidates if path.is_file()})
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        raise RuntimeError(
-            "Found multiple vLLM-Ascend operator libraries. Set "
-            f"{_DSPARK_VLLM_ASCEND_SO_ENV} to the exact library to load: "
-            + ", ".join(str(path) for path in candidates)
-        )
-    raise RuntimeError(
-        "Could not find vllm_ascend_C*.so without importing vLLM. Set "
-        f"{_DSPARK_VLLM_ASCEND_SO_ENV} to its absolute path, for example: "
-        f"{_DSPARK_VLLM_ASCEND_SO_ENV}=/path/to/"
-        "vllm_ascend_C.cpython-311-aarch64-linux-gnu.so"
-    )
-
-
-def _load_vllm_ascend_sparse_attn_library() -> Path:
-    global _loaded_vllm_ascend_so
-    if _loaded_vllm_ascend_so is not None:
-        return _loaded_vllm_ascend_so
-
-    import torch_npu  # noqa: F401  # registers the PrivateUse1/NPU dispatch
-
-    library_path = _resolve_vllm_ascend_op_library()
-    abi_match = re.search(r"\.cpython-(\d+)-", library_path.name)
-    current_abi = f"{sys.version_info.major}{sys.version_info.minor}"
-    if abi_match is not None and abi_match.group(1) != current_abi:
-        raise RuntimeError(
-            f"{library_path} was built for CPython {abi_match.group(1)}, but "
-            f"SGLang is running CPython {current_abi}. Rebuild the extension "
-            "with the SGLang Python/Torch/torch-npu environment."
-        )
-    try:
-        torch.ops.load_library(str(library_path))
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to load the standalone vLLM-Ascend operator library "
-            f"{library_path}. Ensure its dependent CANN/custom-op libraries "
-            "are visible through LD_LIBRARY_PATH and the Ascend OPP setup."
-        ) from exc
-
-    required_ops = (
-        "npu_sparse_attn_sharedkv_metadata",
-        "npu_sparse_attn_sharedkv",
-    )
-    missing_ops = [
-        name for name in required_ops if not hasattr(torch.ops._C_ascend, name)
-    ]
-    if missing_ops:
-        raise RuntimeError(
-            f"Loaded {library_path}, but required _C_ascend operators are "
-            f"missing: {missing_ops}. The library version does not include "
-            "SparseAttnSharedkv support."
-        )
-
-    _loaded_vllm_ascend_so = library_path
-    logger.info(
-        "Loaded standalone vLLM-Ascend DSpark attention operators from %s",
-        library_path,
-    )
-    return library_path
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -1179,23 +1083,7 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_graph_tokens_per_req = int(
             model_runner.decode_num_tokens_per_req()
         )
-        self._vllm_ascend_ops_loaded = False
         self._logged_dspark_sparse_metadata = False
-
-    def _ensure_vllm_ascend_sparse_attn_ops(self) -> None:
-        if not self._is_dspark_draft_worker:
-            return
-        if self._vllm_ascend_ops_loaded:
-            return
-
-        library_path = _load_vllm_ascend_sparse_attn_library()
-        self._vllm_ascend_ops_loaded = True
-        logger.info(
-            "DSpark NPU draft attention directly uses "
-            "torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata and "
-            "torch.ops._C_ascend.npu_sparse_attn_sharedkv from %s",
-            library_path,
-        )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1979,7 +1867,6 @@ class DeepseekV4AscendAttnBackend(
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
             )
-            self._ensure_vllm_ascend_sparse_attn_ops()
             c1a_metadata = (
                 torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
                     device=str(actual_seq_lengths_kv.device),
@@ -2104,7 +1991,6 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         if self._is_dspark_draft_worker:
-            self._ensure_vllm_ascend_sparse_attn_ops()
             out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                 q_arg, **attn_kwargs
             )

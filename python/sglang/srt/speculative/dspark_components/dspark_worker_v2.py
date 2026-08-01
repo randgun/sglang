@@ -300,20 +300,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
-            self._draft_worker.init_attention_backends()
-            if (
-                str(self.device).startswith("npu")
-                and not self.server_args.disable_cuda_graph
-            ):
-                ensure_ops = getattr(
-                    self.draft_model_runner.attn_backend,
-                    "_ensure_vllm_ascend_sparse_attn_ops",
-                    None,
+            if str(self.device).startswith("npu"):
+                from sglang.srt.hardware_backend.npu.attention.vllm_ascend_sparse_attn_loader import (
+                    initialize_vllm_ascend_sparse_attn_ops,
                 )
-                if ensure_ops is not None:
-                    # Loading/registering the external operator inside an
-                    # NPUGraph capture would make capture non-deterministic.
-                    ensure_ops()
+
+                initialize_vllm_ascend_sparse_attn_ops()
+            self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph

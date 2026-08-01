@@ -81,9 +81,6 @@ def apply_rotary_emb(
             Dsv4NpuRoPE,
         )
 
-        # Reuse the shared DSV4 NPU interleaved RoPE tables.  Besides avoiding
-        # unsupported indexing of complex strided views, this keeps the table
-        # storage stable when the draft forward is captured into an NPU graph.
         rope_dim = x.shape[-1]
         cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
             positions,
