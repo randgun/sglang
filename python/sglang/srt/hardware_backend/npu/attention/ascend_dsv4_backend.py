@@ -1083,7 +1083,6 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_graph_tokens_per_req = int(
             model_runner.decode_num_tokens_per_req()
         )
-        self._logged_dspark_sparse_metadata = False
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1131,16 +1130,6 @@ class DeepseekV4AscendAttnBackend(
         fm.ori_sparse_indices = ori_sparse_indices
         fm.ori_win_left = self._dsv4_sliding_window_size + block_size - 1
         fm.ori_win_right = 0
-
-        if not self._logged_dspark_sparse_metadata:
-            logger.info(
-                "DSpark NPU block-noncausal attention enabled: "
-                "ori_sparse_indices=%s, ori_win_left=%d, ori_win_right=%d",
-                tuple(ori_sparse_indices.shape),
-                fm.ori_win_left,
-                fm.ori_win_right,
-            )
-            self._logged_dspark_sparse_metadata = True
 
     def _build_dspark_sparse_indices(
         self,
