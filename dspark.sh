@@ -78,7 +78,15 @@ export ASCEND_CUSTOM_OPP_PATH=/home/kelon/code/vllm-ascend/vllm_ascend/_cann_ops
 export SGLANG_DSPARK_VLLM_ASCEND_SO=/home/kelon/code/vllm-ascend/build/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 
+# export ASCEND_PROCESS_LOG_PATH=./aic_err_info/logs
+# export ASCEND_WORK_PATH=./aic_err_info
+# export NPU_COLLECT_PATH=./aic_err_info
+# export ASCEND_GLOBAL_LOG_LEVEL=3
+# export HCCL_ENTRY_LOG_ENABLE=1
+
 # export ASCEND_LAUNCH_BLOCKING=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --quantization modelslim \
@@ -101,14 +109,14 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 8000 \
     --disable-radix-cache \
     --chunked-prefill-size -1 \
-    --max-running-requests 256 \
-    --disable-overlap-schedule \
+    --max-running-requests 16 \
     --dp-size 16 \
     --enable-dp-attention \
     --enable-dp-lm-head \
     --moe-a2a-backend deepep \
     --speculative-moe-a2a-backend deepep \
-    --deepep-mode low_latency \
+    --deepep-mode auto \
     --kv-cache-dtype bfloat16 \
-    --cuda-graph-max-bs-decode 256 \
+    --cuda-graph-max-bs-decode 16  \
+    --skip-server-warmup \
     --disable-piecewise-cuda-graph
