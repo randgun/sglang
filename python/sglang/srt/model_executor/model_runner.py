@@ -78,7 +78,6 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-# from sglang.srt.layers.moe.dwdp import DwdpManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -216,7 +215,8 @@ from sglang.srt.utils.weight_checker import WeightChecker
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
-
+if not _is_npu:
+    from sglang.srt.layers.moe.dwdp import DwdpManager
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
@@ -577,8 +577,8 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
-
-        # self.maybe_init_dwdp()
+        if not _is_npu:
+            self.maybe_init_dwdp()
 
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
