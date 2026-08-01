@@ -74,29 +74,6 @@ def apply_rotary_emb(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> torch.Tensor:
-    if _is_npu:
-        import torch_npu
-
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
-            Dsv4NpuRoPE,
-        )
-
-        rope_dim = x.shape[-1]
-        cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
-            positions,
-            x.dtype,
-            view_4d=True,
-            inverse=inverse,
-            allow_build=True,
-            cache_dtype=torch.float32,
-        )
-        x_3d = x.reshape(x.shape[0], -1, rope_dim)
-        rotated = torch_npu.npu_rotary_mul(
-            x_3d.unsqueeze(1), cos, sin, rotary_mode="interleave"
-        )
-        x.copy_(rotated.squeeze(1).view_as(x))
-        return x
-
     y = x
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     freqs_cis = freqs_cis[positions]
@@ -156,6 +133,40 @@ class DSparkAttention(MqaAttentionBase):
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
 
+    def _apply_rotary_inplace(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        inverse: bool = False,
+    ) -> None:
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+
+            cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
+                positions,
+                x.dtype,
+                view_4d=True,
+                inverse=inverse,
+                allow_build=True,
+                cache_dtype=torch.float32,
+            )
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                x,
+                None,
+                cos4,
+                sin4,
+                qk_nope_dim=x.shape[-1] - self.rope_head_dim,
+            )
+            return
+
+        apply_rotary_emb(
+            x[..., -self.rope_head_dim :],
+            self.freqs_cis,
+            positions,
+            inverse=inverse,
+        )
+
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
         kv, _ = self.wkv(x)
         return kv
@@ -198,9 +209,7 @@ class DSparkAttention(MqaAttentionBase):
             q = q * torch.rsqrt(
                 q.float().square().mean(-1, keepdim=True) + self.eps
             ).to(q.dtype)
-            apply_rotary_emb(
-                q[..., -self.rope_head_dim :], self.freqs_cis, positions
-            )
+            self._apply_rotary_inplace(q, positions)
             if q_out is not None:
                 q_out.copy_(q)
                 return q_out
@@ -288,9 +297,7 @@ class DSparkAttention(MqaAttentionBase):
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
             )
         else:
-            apply_rotary_emb(
-                o[..., -rd:], self.freqs_cis, positions, inverse=True
-            )
+            self._apply_rotary_inplace(o, positions, inverse=True)
 
         o = o.view(
             o.shape[0],
