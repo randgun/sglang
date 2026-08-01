@@ -457,8 +457,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
             positions=positions,
-            probe_key=str(batch.reqs[0].rid) if batch.reqs else None,
-            probe_phase="prefill",
         )
         logits_output.hidden_states = None
 
@@ -547,10 +545,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-        self._kv_injector.probe_request_history(
-            batch=batch, probe_phase="before_draft_forward"
-        )
-
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -650,35 +644,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        # Temporary DSpark token-alignment probe.
-        rid = str(batch.reqs[0].rid) if batch.reqs else ""
-        is_debug_request = rid.startswith("dspark-token-debug")
-
-        probe_counts = getattr(self, "_token_alignment_probe_counts", {})
-        probe_step = probe_counts.get(rid, 0)
-
-        if self.ps.tp_rank == 0 and is_debug_request and probe_step < 3:
-            target_logits_3d = logits_output.next_token_logits.reshape(
-                bs, self.verify_num_draft_tokens, -1
-            )
-            target_predict = target_logits_3d.argmax(dim=-1)
-
-            candidates = verify_ids_2d
-            matches = candidates[:, 1:] == target_predict[:, :-1]
-
-            logger.warning(
-                "DSpark token alignment: rid=%s step=%d "
-                "anchor=%s candidates=%s target_predict=%s matches=%s",
-                rid,
-                probe_step,
-                candidates[0, 0].detach().cpu().item(),
-                candidates[0].detach().cpu().tolist(),
-                target_predict[0].detach().cpu().tolist(),
-                matches[0].detach().cpu().tolist(),
-            )
-
-            probe_counts[rid] = probe_step + 1
-            self._token_alignment_probe_counts = probe_counts
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.

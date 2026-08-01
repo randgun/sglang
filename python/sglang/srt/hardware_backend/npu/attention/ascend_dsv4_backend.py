@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DSPARK_VLLM_ASCEND_SO_ENV = "SGLANG_DSPARK_VLLM_ASCEND_SO"
-_DSV4_VERIFY_METADATA_PROBE_ENV = "SGLANG_DSV4_VERIFY_METADATA_PROBE"
 _loaded_vllm_ascend_so: Optional[Path] = None
 
 
@@ -204,39 +203,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
             _seq_lens = _seq_lens + self.speculative_num_draft_tokens
-        bundle = forward_batch.out_cache_loc_dsv4
-        self._probe_verify_metadata(
-            "compress_input",
-            forward_batch,
-            {
-                "compress_seq_lens": _seq_lens,
-                "bundle_swa_loc": (
-                    getattr(bundle, "out_swa_loc", None)
-                    if bundle is not None
-                    else None
-                ),
-                "bundle_c4_loc": (
-                    getattr(bundle, "out_c4_loc", None)
-                    if bundle is not None
-                    else None
-                ),
-                "bundle_c128_loc": (
-                    getattr(bundle, "out_c128_loc", None)
-                    if bundle is not None
-                    else None
-                ),
-                "bundle_c4_state_loc": (
-                    getattr(bundle, "out_c4_state_loc", None)
-                    if bundle is not None
-                    else None
-                ),
-                "bundle_c128_state_loc": (
-                    getattr(bundle, "out_c128_state_loc", None)
-                    if bundle is not None
-                    else None
-                ),
-            },
-        )
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -251,14 +217,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         )
         for k, v in result.items():
             setattr(fm, k, v)
-        self._probe_verify_metadata(
-            "compress_locs",
-            forward_batch,
-            {
-                "compress_seq_lens": _seq_lens,
-                **result,
-            },
-        )
         if not is_decode:
             for ratio in self._dsv4_compress_ratios:
                 if ratio in (4, 128):
@@ -1230,114 +1188,6 @@ class DeepseekV4AscendAttnBackend(
         # Keep this lazy so target-only SGLang does not load the extra library.
         self._vllm_ascend_ops_loaded = False
         self._logged_dspark_sparse_metadata = False
-        self._verify_metadata_probe_round = 0
-        self._verify_metadata_probe_active_round: Optional[int] = None
-
-    @staticmethod
-    def _format_verify_probe_tensor(value, max_items: int = 16) -> str:
-        if value is None:
-            return "None"
-        if not isinstance(value, torch.Tensor):
-            return repr(value)
-
-        tensor = value.detach()
-        shape = tuple(tensor.shape)
-        dtype = str(tensor.dtype).removeprefix("torch.")
-        if tensor.numel() == 0:
-            return f"shape={shape},dtype={dtype},values=[]"
-
-        # This probe is explicitly opt-in. Moving the small metadata tensors to
-        # CPU here intentionally synchronizes the NPU stream so the log reflects
-        # the values consumed by this exact verify round.
-        cpu = tensor.to(device="cpu").reshape(-1)
-        shown = cpu[:max_items].tolist()
-        suffix = "" if cpu.numel() <= max_items else f",...({cpu.numel()} total)"
-        return (
-            f"shape={shape},dtype={dtype},values={shown}{suffix},"
-            f"min={cpu.min().item()},max={cpu.max().item()}"
-        )
-
-    def _begin_verify_metadata_probe(self, forward_batch: ForwardBatch) -> None:
-        self._verify_metadata_probe_active_round = None
-        if os.environ.get(_DSV4_VERIFY_METADATA_PROBE_ENV, "0").lower() not in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
-            return
-        if self._is_dspark_draft_worker:
-            return
-        if not forward_batch.forward_mode.is_target_verify():
-            return
-
-        requested_rank = int(
-            os.environ.get("SGLANG_DSV4_VERIFY_METADATA_PROBE_RANK", "0")
-        )
-        tp_rank = get_parallel().tp_rank
-        if requested_rank >= 0 and tp_rank != requested_rank:
-            return
-
-        round_id = self._verify_metadata_probe_round
-        self._verify_metadata_probe_round += 1
-        skip_rounds = int(
-            os.environ.get("SGLANG_DSV4_VERIFY_METADATA_PROBE_SKIP_ROUNDS", "0")
-        )
-        max_rounds = int(
-            os.environ.get("SGLANG_DSV4_VERIFY_METADATA_PROBE_MAX_ROUNDS", "32")
-        )
-        if round_id < skip_rounds or round_id >= skip_rounds + max_rounds:
-            return
-        self._verify_metadata_probe_active_round = round_id
-
-    def _probe_verify_metadata(
-        self,
-        stage: str,
-        forward_batch: ForwardBatch,
-        extra: Optional[dict] = None,
-    ) -> None:
-        round_id = self._verify_metadata_probe_active_round
-        if round_id is None:
-            return
-
-        fm = self.forward_metadata
-        spec_info = getattr(forward_batch, "spec_info", None)
-        verify_width = int(
-            getattr(spec_info, "draft_token_num", self.speculative_num_draft_tokens)
-            or 1
-        )
-        fields = {
-            "seq_lens_live": forward_batch.seq_lens,
-            "expected_attn_seq_lens": (
-                forward_batch.seq_lens.to(torch.int32) + verify_width
-            ),
-            "seq_lens_cpu_snapshot": forward_batch.seq_lens_cpu,
-            "seq_lens_cpu_metadata": getattr(fm, "seq_lens_cpu_int", None),
-            "actual_seq_lengths_q_pa": getattr(
-                fm, "actual_seq_lengths_q_pa", None
-            ),
-            "actual_seq_lengths_kv": getattr(fm, "actual_seq_lengths_kv", None),
-            "positions": getattr(forward_batch, "positions", None),
-            "out_cache_loc": getattr(forward_batch, "out_cache_loc", None),
-        }
-        if extra:
-            fields.update(extra)
-
-        rendered = "; ".join(
-            f"{key}={self._format_verify_probe_tensor(value)}"
-            for key, value in fields.items()
-        )
-        logger.info(
-            "DSV4 verify metadata probe: rank=%d round=%d stage=%s "
-            "bs=%d verify_width=%d tokens=%d; %s",
-            get_parallel().tp_rank,
-            round_id,
-            stage,
-            forward_batch.batch_size,
-            verify_width,
-            int(forward_batch.input_ids.numel()),
-            rendered,
-        )
 
     def _ensure_vllm_ascend_sparse_attn_ops(self) -> None:
         if not self._is_dspark_draft_worker:
@@ -1989,7 +1839,6 @@ class DeepseekV4AscendAttnBackend(
         self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
-        self._begin_verify_metadata_probe(forward_batch)
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
@@ -2075,15 +1924,6 @@ class DeepseekV4AscendAttnBackend(
 
         self._init_dspark_sparse_metadata(forward_batch)
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
-        self._probe_verify_metadata(
-            "attention_ready",
-            forward_batch,
-            {
-                "swa_page_table": getattr(fm, "swa_page_table", None),
-                "block_tables": getattr(fm, "block_tables", None),
-                "block_tables_swa": getattr(fm, "block_tables_swa", None),
-            },
-        )
 
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
@@ -2441,33 +2281,6 @@ class DeepseekV4AscendAttnBackend(
                         )
                         loc[: bl.numel()].copy_(bl.to(torch.int32))
                 setattr(fm, f"c{ratio}_loc", loc)
-        self._probe_verify_metadata(
-            "compress_verify_ready",
-            forward_batch,
-            {
-                "start_pos": getattr(fm, "start_pos", None),
-                "seqused": getattr(fm, "seqused", None),
-                "positions_cmp_padding_c4": getattr(
-                    fm, "positions_cmp_padding_c4", None
-                ),
-                "positions_cmp_padding_c128": getattr(
-                    fm, "positions_cmp_padding_c128", None
-                ),
-                "c4_loc": getattr(fm, "c4_loc", None),
-                "c128_loc": getattr(fm, "c128_loc", None),
-                "c4_state_loc": getattr(fm, "c4_state_loc", None),
-                "c128_state_loc": getattr(fm, "c128_state_loc", None),
-                "c4_page_table": getattr(fm, "c4_page_table", None),
-                "c128_page_table": getattr(fm, "c128_page_table", None),
-                "c4_state_page_table": getattr(
-                    fm, "c4_state_page_table", None
-                ),
-                "c128_state_page_table": getattr(
-                    fm, "c128_state_page_table", None
-                ),
-            },
-        )
-
     def _fill_verify_positions_cmp_padding(
         self,
         positions: torch.Tensor,

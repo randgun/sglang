@@ -158,11 +158,6 @@ class DSparkAttention(MqaAttentionBase):
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
-        self._debug_probe_key: Optional[str] = None
-        self._debug_probe_count = 0
-
-    def set_debug_probe_context(self, probe_key: Optional[str]) -> None:
-        self._debug_probe_key = probe_key
 
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
         kv, _ = self.wkv(x)
@@ -285,56 +280,6 @@ class DSparkAttention(MqaAttentionBase):
             q = q_padded
         attn_sink = self._local_attn_sink()
 
-        do_probe = (
-            self._debug_probe_key is not None
-            and self._debug_probe_key.startswith(
-                ("dspark-kv-debug", "dspark-token-debug")
-            )
-            and get_parallel().tp_rank == 0
-            and self._debug_probe_count < 3
-        )
-        if do_probe:
-            fm = getattr(attn_backend, "forward_metadata", None)
-            page_table = getattr(fm, "swa_page_table", None)
-            actual_kv = getattr(fm, "actual_seq_lengths_kv", None)
-            actual_q_pa = getattr(fm, "actual_seq_lengths_q_pa", None)
-            swa_out = attn_backend.get_swa_out_cache_loc(forward_batch)
-            logger.warning(
-                "DSpark attention metadata: rid=%s step=%d stage=%d "
-                "positions=%s seq_lens=%s actual_kv=%s actual_q_pa=%s "
-                "page_table_head=%s out_cache_loc=%s swa_out=%s "
-                "q=(shape=%s,abs_mean=%.8f,rms=%.8f) "
-                "kv=(shape=%s,abs_mean=%.8f,rms=%.8f)",
-                self._debug_probe_key,
-                self._debug_probe_count,
-                self.layer_id,
-                positions.detach().cpu().tolist(),
-                forward_batch.seq_lens.detach().cpu().tolist(),
-                actual_kv.detach().cpu().tolist() if actual_kv is not None else None,
-                (
-                    actual_q_pa.detach().cpu().tolist()
-                    if actual_q_pa is not None
-                    else None
-                ),
-                (
-                    page_table[0, :8].detach().cpu().tolist()
-                    if page_table is not None and page_table.numel() > 0
-                    else None
-                ),
-                (
-                    forward_batch.out_cache_loc.detach().cpu().tolist()
-                    if forward_batch.out_cache_loc is not None
-                    else None
-                ),
-                swa_out.detach().cpu().tolist(),
-                tuple(q.shape),
-                float(q.detach().float().abs().mean().item()),
-                float(torch.sqrt(q.detach().float().square().mean()).item()),
-                tuple(kv.shape),
-                float(kv.detach().float().abs().mean().item()),
-                float(torch.sqrt(kv.detach().float().square().mean()).item()),
-            )
-
         o = attn_backend.forward(
             q=q,
             k=kv,
@@ -345,73 +290,6 @@ class DSparkAttention(MqaAttentionBase):
             attn_sink=attn_sink,
             save_kv_cache=False,
         )
-
-        history_ablation = None
-        if do_probe and hasattr(pool, "get_swa_buffer"):
-            prefix_len = int(forward_batch.seq_lens[0].detach().cpu().item())
-            req_idx = int(
-                forward_batch.req_pool_indices[0].detach().cpu().item()
-            )
-            full_history = attn_backend.req_to_token_pool.req_to_token[
-                req_idx, :prefix_len
-            ]
-            swa_history = pool.translate_loc_from_full_to_swa(
-                full_history
-            ).to(torch.int64)
-            cache = pool.get_swa_buffer(self.layer_id).flatten(0, 1)
-            saved_history = cache.index_select(0, swa_history).clone()
-            try:
-                cache.index_fill_(0, swa_history, 0)
-                o_without_history = attn_backend.forward(
-                    q=q,
-                    k=kv,
-                    v=kv,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                    compress_ratio=0,
-                    attn_sink=attn_sink,
-                    save_kv_cache=False,
-                )
-            finally:
-                cache.index_copy_(0, swa_history, saved_history)
-            actual = o.detach().float().cpu()
-            ablated = o_without_history.detach().float().cpu()
-            delta = actual - ablated
-            history_ablation = {
-                "history_swa": swa_history.detach().cpu().tolist(),
-                "out_abs_mean": round(float(actual.abs().mean().item()), 8),
-                "out_rms": round(
-                    float(torch.sqrt(actual.square().mean()).item()), 8
-                ),
-                "delta_abs_mean": round(
-                    float(delta.abs().mean().item()), 8
-                ),
-                "delta_max": round(float(delta.abs().max().item()), 8),
-                "relative_rms": round(
-                    float(
-                        torch.sqrt(delta.square().mean())
-                        / torch.sqrt(actual.square().mean()).clamp_min(1e-12)
-                    ),
-                    8,
-                ),
-                "cosine": round(
-                    float(
-                        F.cosine_similarity(
-                            actual.reshape(1, -1),
-                            ablated.reshape(1, -1),
-                            dim=-1,
-                        ).item()
-                    ),
-                    10,
-                ),
-            }
-            logger.warning(
-                "DSpark attention history ablation: rid=%s step=%d stage=%d %s",
-                self._debug_probe_key,
-                self._debug_probe_count,
-                self.layer_id,
-                history_ablation,
-            )
 
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
@@ -436,20 +314,6 @@ class DSparkAttention(MqaAttentionBase):
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
         out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
-        if do_probe:
-            out_float = out.detach().float()
-            logger.warning(
-                "DSpark attention output: rid=%s step=%d stage=%d "
-                "out=(shape=%s,abs_mean=%.8f,rms=%.8f,abs_max=%.8f)",
-                self._debug_probe_key,
-                self._debug_probe_count,
-                self.layer_id,
-                tuple(out.shape),
-                float(out_float.abs().mean().item()),
-                float(torch.sqrt(out_float.square().mean()).item()),
-                float(out_float.abs().max().item()),
-            )
-            self._debug_probe_count += 1
         return out
 
 
@@ -863,10 +727,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         del embed_tokens, lm_head
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
-    def set_attention_probe_context(self, probe_key: Optional[str]) -> None:
-        for stage in self.stages:
-            stage.self_attn.set_debug_probe_context(probe_key)
-
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
         projected, _ = stage0.main_proj(main_hidden)
@@ -879,19 +739,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         swa_loc: torch.Tensor,
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
-        probe_key: Optional[str] = None,
-        probe_phase: str = "unknown",
     ) -> None:
-        probe_count = getattr(self, "_kv_pipeline_probe_counts", {}).get(
-            probe_key, 0
-        )
-        do_probe = (
-            probe_key is not None
-            and probe_key.startswith(("dspark-kv-debug", "dspark-token-debug"))
-            and get_parallel().tp_rank == 0
-            and probe_count < 3
-        )
-
         main_x = self.project_target_hidden(main_hidden)
         swa_loc = swa_loc.to(torch.int32)
         kvs = CommitKvProj.execute(
@@ -899,84 +747,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
         )
 
-        def tensor_stats(x: torch.Tensor):
-            x_float = x.detach().float()
-            finite = torch.isfinite(x_float)
-            return {
-                "shape": tuple(x.shape),
-                "dtype": str(x.dtype),
-                "finite": int(finite.sum().item()),
-                "numel": x.numel(),
-                "abs_mean": round(float(x_float.abs().mean().item()), 8),
-                "abs_max": round(float(x_float.abs().max().item()), 8),
-                "rms": round(
-                    float(torch.sqrt(x_float.square().mean()).item()), 8
-                ),
-            }
-
-        if do_probe:
-            valid = swa_loc >= 0
-            feature_width = main_hidden.shape[-1] // self.num_target_features
-            hidden_blocks = [
-                tensor_stats(
-                    main_hidden[
-                        valid,
-                        feature_id * feature_width : (feature_id + 1)
-                        * feature_width,
-                    ]
-                )
-                for feature_id in range(self.num_target_features)
-            ]
-            logger.warning(
-                "DSpark KV pipeline: rid=%s phase=%s positions=%s swa_loc=%s "
-                "target_hidden=%s valid_hidden=%s invalid_hidden=%s "
-                "hidden_blocks_valid=%s main_x=%s valid_main_x=%s",
-                probe_key,
-                probe_phase,
-                positions.detach().cpu().tolist(),
-                swa_loc.detach().cpu().tolist(),
-                tensor_stats(main_hidden),
-                tensor_stats(main_hidden[valid]),
-                (
-                    tensor_stats(main_hidden[~valid])
-                    if bool((~valid).any().item())
-                    else None
-                ),
-                hidden_blocks,
-                tensor_stats(main_x),
-                tensor_stats(main_x[valid]),
-            )
-
         for stage, kv in zip(self.stages, kvs):
             attn = stage.self_attn
-            expected = None
-            if do_probe:
-                # Independent reference for RMSNorm + interleaved RoPE. This
-                # intentionally does not call torch_npu.npu_rotary_mul.
-                normalized = kv.detach().float()
-                normalized = normalized * torch.rsqrt(
-                    normalized.square().mean(dim=-1, keepdim=True) + attn.eps
-                )
-                normalized = (
-                    normalized * attn.kv_norm.weight.detach().float()
-                ).to(kv.dtype)
-
-                rope_dim = int(attn.freqs_cis.shape[-1]) * 2
-                expected = normalized.clone()
-                rope = normalized[..., -rope_dim:].float().unflatten(-1, (-1, 2))
-                freqs_real = attn.freqs_cis.real.contiguous()[positions].float()
-                freqs_imag = attn.freqs_cis.imag.contiguous()[positions].float()
-                real = rope[..., 0]
-                imag = rope[..., 1]
-                rotated = torch.stack(
-                    (
-                        real * freqs_real - imag * freqs_imag,
-                        real * freqs_imag + imag * freqs_real,
-                    ),
-                    dim=-1,
-                ).flatten(-2)
-                expected[..., -rope_dim:] = rotated.to(expected.dtype)
-
             pool.set_swa_key_buffer_radix_fused_norm_rope(
                 layer_id=attn.layer_id,
                 swa_loc=swa_loc,
@@ -986,61 +758,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 freqs_cis=attn.freqs_cis,
                 positions=positions,
             )
-            if do_probe:
-                valid = swa_loc >= 0
-                stored = None
-                comparison = None
-                if bool(valid.any().item()) and hasattr(pool, "get_swa_buffer"):
-                    stored = pool.get_swa_buffer(
-                        attn.layer_id, swa_loc[valid].to(torch.int64)
-                    )
-                    if stored.ndim == expected[valid].ndim + 1:
-                        stored = stored.squeeze(-2)
-                    # Compare on CPU so the diagnostic itself does not depend
-                    # on another NPU reduction/cosine kernel.
-                    actual = stored.detach().float().cpu()
-                    reference = expected[valid].detach().float().cpu()
-                    diff = actual - reference
-                    comparison = {
-                        "max_abs_error": round(
-                            float(diff.abs().max().item()), 8
-                        ),
-                        "mean_abs_error": round(
-                            float(diff.abs().mean().item()), 8
-                        ),
-                        "cosine": round(
-                            float(
-                                F.cosine_similarity(
-                                    actual.reshape(1, -1),
-                                    reference.reshape(1, -1),
-                                    dim=-1,
-                                ).item()
-                            ),
-                            10,
-                        ),
-                        "allclose_5e-2": bool(
-                            torch.allclose(
-                                actual, reference, atol=5e-2, rtol=5e-2
-                            )
-                        ),
-                    }
-                logger.warning(
-                    "DSpark KV stage: rid=%s phase=%s stage=%d layer=%d "
-                    "raw_kv=%s norm_rope_ref=%s stored=%s comparison=%s",
-                    probe_key,
-                    probe_phase,
-                    stage.stage_id,
-                    attn.layer_id,
-                    tensor_stats(kv),
-                    tensor_stats(expected),
-                    tensor_stats(stored) if stored is not None else None,
-                    comparison,
-                )
-
-        if do_probe:
-            counts = getattr(self, "_kv_pipeline_probe_counts", {})
-            counts[probe_key] = probe_count + 1
-            self._kv_pipeline_probe_counts = counts
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)

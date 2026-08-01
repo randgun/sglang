@@ -296,7 +296,6 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
-        probe_key = str(batch.reqs[0].rid) if batch.reqs else None
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -304,7 +303,6 @@ class TargetVerifyExecutor:
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
-                probe_key=probe_key,
             )
             return
         hidden = logits_output.hidden_states
@@ -317,8 +315,6 @@ class TargetVerifyExecutor:
             cache_loc_2d=verify_window.verify_cache_loc_2d,
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
-            probe_key=probe_key,
-            probe_phase="verify_commit",
         )
 
     def _run_ragged(

@@ -5,7 +5,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
-from sglang.srt.debug_utils.deepep_mode_probe import install_deepep_mode_probe
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1021,6 +1020,3 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
-
-
-install_deepep_mode_probe(DeepEPDispatcher)
