@@ -606,26 +606,22 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         rope_slice.copy_(rope_rot.view_as(rope_slice))
 
-        if torch.get_device_module().is_current_stream_capturing():
-            # Boolean advanced indexing lowers to NonZero on Ascend. NonZero
-            # synchronizes the stream to resolve its dynamic output length,
-            # which is forbidden while an ACL graph is being captured.
-            #
-            # Decode graph metadata represents padded rows with the reserved
-            # dummy SWA slot 0, so capture/replay can safely issue a fixed-size
-            # write without dynamically filtering locations.
-            self.set_swa_buffer(
-                layer_id,
-                swa_loc.to(torch.int64),
-                kv_out,
-            )
-        else:
-            valid = swa_loc >= 0
-            self.set_swa_buffer(
-                layer_id,
-                swa_loc[valid].to(torch.int64),
-                kv_out[valid],
-            )
+        # Keep this store fixed-shape in both eager execution and graph capture.
+        # Boolean indexing (``swa_loc[valid]`` / ``kv_out[valid]``) lowers to
+        # NonZero on Ascend; NonZero synchronizes with the host to resolve its
+        # dynamic output length and therefore both hurts eager performance and
+        # is illegal on a captured stream.
+        #
+        # SWA slot 0 is permanently reserved as the padding sink by every SWA
+        # allocator used here.  Route negative padding/tombstone locations to
+        # that slot and issue one fixed-size device-side indexed write.  Multiple
+        # padded rows may overwrite slot 0, but no real token can reference it.
+        safe_swa_loc = swa_loc.clamp_min(0).to(torch.int64)
+        self.set_swa_buffer(
+            layer_id,
+            safe_swa_loc,
+            kv_out,
+        )
 
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
