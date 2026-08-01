@@ -215,14 +215,6 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # An idle DP-attention rank still runs the draft stages so that it can
-        # participate in the downstream MoE collectives.  It has no local
-        # tokens, however, and Ascend W8A8 quantized matmul does not accept an
-        # empty M dimension.  Attention has no collective that the idle rank
-        # needs to join, so skip only this sublayer and let the stage continue
-        # into _run_moe_ffn_dp_sync.
-        if forward_batch.forward_mode.is_idle():
-            return torch.zeros_like(hidden_states)
 
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
