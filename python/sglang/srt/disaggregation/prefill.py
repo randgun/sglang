@@ -1211,6 +1211,30 @@ class SchedulerDisaggregationPrefillMixin:
                         prefix_len=0,
                     )
                 )
+                # Build draft SWA page indices for DSpark: translate the
+                # target's full locs through the draft pool's own
+                # full_to_swa_index_mapping (different from the target's).
+                draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+                if (
+                    draft_pool is not None
+                    and hasattr(draft_pool, "full_to_swa_index_mapping")
+                    and draft_pool.full_to_swa_index_mapping is not None
+                ):
+                    from sglang.srt.disaggregation.ascend.conn import (
+                        AscendStateType,
+                    )
+
+                    def _draft_swa_payload():
+                        window_size = self.sliding_window_size
+                        window_start = max(0, seq_len - window_size)
+                        window_start = (window_start // page_size) * page_size
+                        full_locs = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, window_start:seq_len
+                        ]
+                        swa_locs = draft_pool.full_to_swa_index_mapping[full_locs]
+                        return kv_to_page_indices(swa_locs, page_size)
+
+                    payloads[AscendStateType.DSV4_DRAFT_SWA] = _draft_swa_payload
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]

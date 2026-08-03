@@ -30,6 +30,7 @@ class AscendStateType(str, enum.Enum):
     DSV4_INDEXER = "dsv4_indexer"
     DSV4_C4_STATE = "dsv4_c4_state"
     DSV4_C128_STATE = "dsv4_c128_state"
+    DSV4_DRAFT_SWA = "dsv4_draft_swa"
 
 
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
