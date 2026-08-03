@@ -1198,31 +1198,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
-                # Build draft SWA page indices for DSpark: same translation
-                # as prefill but through the decode-side draft pool's mapping.
+                # DSpark draft SWA: the draft pool has its own SWA buffer but
+                # shares the allocator / full_to_swa_index_mapping with the
+                # target, so page indices are identical to DSV4_SWA.
                 draft_pool = self.draft_token_to_kv_pool
-                if (
-                    draft_pool is not None
-                    and hasattr(draft_pool, "full_to_swa_index_mapping")
-                    and draft_pool.full_to_swa_index_mapping is not None
+                if draft_pool is not None and isinstance(
+                    draft_pool, DeepSeekV4TokenToKVPool
                 ):
                     from sglang.srt.disaggregation.ascend.conn import (
                         AscendStateType,
                     )
 
-                    draft_page_size = self.token_to_kv_pool_allocator.page_size
-
-                    def _draft_swa_payload():
-                        window_size = self.scheduler.sliding_window_size
-                        window_start = max(total_prefix_len, seq_len - window_size)
-                        window_start = (window_start // draft_page_size) * draft_page_size
-                        full_locs = self.req_to_token_pool.req_to_token[
-                            decode_req.req.req_pool_idx, window_start:seq_len
+                    if AscendStateType.DSV4_SWA in payloads:
+                        payloads[AscendStateType.DSV4_DRAFT_SWA] = payloads[
+                            AscendStateType.DSV4_SWA
                         ]
-                        swa_locs = draft_pool.full_to_swa_index_mapping[full_locs]
-                        return kv_to_page_indices(swa_locs, draft_page_size)
-
-                    payloads[AscendStateType.DSV4_DRAFT_SWA] = _draft_swa_payload
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
@@ -1580,39 +1570,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ),
             kv_loc,
         )
-
-        # Allocate draft SWA pages for DSpark and map target full locs to
-        # draft SWA locs via full_to_swa_index_mapping. The draft pool is
-        # SWA-only; its SWA allocator is separate from the target's.
-        draft_pool = self.draft_token_to_kv_pool
-        if (
-            draft_pool is not None
-            and hasattr(draft_pool, "full_to_swa_index_mapping")
-            and draft_pool.full_to_swa_index_mapping is not None
-        ):
-            draft_runner = getattr(
-                getattr(getattr(self.scheduler, "draft_worker", None), "draft_model_runner", None),
-                "token_to_kv_pool_allocator",
-                None,
-            )
-            if draft_runner is not None and hasattr(draft_runner, "swa_attn_allocator"):
-                device = kv_loc.device
-                draft_swa_loc = draft_runner.swa_attn_allocator.alloc_extend(
-                    prefix_lens=torch.tensor(
-                        [0], dtype=torch.int64, device=device
-                    ),
-                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                    seq_lens=torch.tensor(
-                        [len(kv_loc)], dtype=torch.int64, device=device
-                    ),
-                    seq_lens_cpu=torch.tensor(
-                        [len(kv_loc)], dtype=torch.int64
-                    ),
-                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                    extend_num_tokens=len(kv_loc),
-                )
-                if draft_swa_loc is not None:
-                    draft_runner.set_full_to_swa_mapping(kv_loc, draft_swa_loc)
 
         # Truncate fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token

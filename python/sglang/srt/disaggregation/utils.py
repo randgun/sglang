@@ -971,10 +971,12 @@ def setup_state_kv_args(
             comp_item_lens,
         ) in token_to_kv_pool.get_pd_state_components():
             append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
-        # Register the draft model's SWA component (DSpark only). The draft pool
-        # is SWA-only, so get_pd_state_components returns just DSV4_SWA; override
-        # the type to DSV4_DRAFT_SWA so the sender can pair it with distinct
-        # page indices from the draft pool's full_to_swa_index_mapping.
+        # Register the draft model's SWA buffer (DSpark). The draft pool has
+        # its own swa_kv_pool.kv_buffer (data not shared with target), but
+        # shares the allocator / full_to_swa_index_mapping (slots shared).
+        # get_pd_state_components returns just DSV4_SWA; override the type
+        # to DSV4_DRAFT_SWA so the sender pairs it with the same page indices
+        # as DSV4_SWA (shared mapping → identical page indices).
         if draft_token_to_kv_pool is not None and isinstance(
             draft_token_to_kv_pool, DSV4NPUTokenToKVPool
         ):
