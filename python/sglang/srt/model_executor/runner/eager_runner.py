@@ -289,7 +289,23 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         cp_v2_active = is_cp_v2_active(forward_batch)
-        if not cp_v2_active:
+        forward_positions = forward_batch.positions
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+            if hasattr(model_runner.attn_backend, "prepare_dsv4_cp_metadata"):
+                model_runner.attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+            complete_hidden_states = kwargs.get("input_embeds")
+            if complete_hidden_states is None:
+                embed_layer = model_runner.model.get_input_embeddings()
+                complete_hidden_states = embed_layer(forward_batch.input_ids)
+            sharded_hidden_states, sharded_positions = cp_split_before_forward(
+                complete_hidden_states,
+                forward_batch.positions,
+                forward_batch,
+            )
+            kwargs["input_embeds"] = sharded_hidden_states
+            forward_positions = sharded_positions
+        elif not cp_v2_active:
             forward_batch.attn_cp_metadata = None
 
         category = (
@@ -350,11 +366,15 @@ class EagerRunner(BaseRunner):
         model = self.model_runner.model
 
         prepare_cp_forward(forward_batch)
+
         input_embeds = kwargs.get("input_embeds")
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+
         input_embeds, positions = cp_split_before_forward(
-            input_embeds, forward_batch.positions, forward_batch
+            input_embeds,
+            forward_batch.positions,
+            forward_batch,
         )
 
         hidden_states = model.model(
@@ -364,10 +384,25 @@ class EagerRunner(BaseRunner):
             input_embeds=input_embeds,
             pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
         )
-        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
+
+        capture_aux_hidden_states = getattr(
+            model,
+            "capture_aux_hidden_states",
+            False,
+        )
         aux_hidden_states = None
+
         if capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+
+        hidden_states_before_norm = None
+        if (
+            isinstance(hidden_states, tuple)
+            and len(hidden_states) == 2
+            and torch.is_tensor(hidden_states[0])
+            and torch.is_tensor(hidden_states[1])
+        ):
+            hidden_states, hidden_states_before_norm = hidden_states
 
         if not model.pp_group.is_last_rank:
             return (
@@ -376,15 +411,28 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        current_stream = torch.cuda.current_stream()
+
         hidden_states = cp_gather_after_forward(
-            hidden_states, forward_batch, torch.cuda.current_stream()
+            hidden_states,
+            forward_batch,
+            current_stream,
         )
+
+        if hidden_states_before_norm is not None:
+            hidden_states_before_norm = cp_gather_after_forward(
+                hidden_states_before_norm,
+                forward_batch,
+                current_stream,
+            )
+
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            hidden_states_before_norm=hidden_states_before_norm,
         )
 
     def _execute_idle(
