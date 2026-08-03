@@ -1079,6 +1079,7 @@ class DeepseekV4AscendAttnBackend(
         )
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
+            and model_runner.spec_algorithm.is_dspark()
         )
         self._dsv4_graph_tokens_per_req = int(
             model_runner.decode_num_tokens_per_req()
