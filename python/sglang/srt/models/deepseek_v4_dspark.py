@@ -861,7 +861,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
         for name, loaded_weight in weights:
-            mapped = self._remap_dspark_weight_name(name)
+            mapped = (
+                self._remap_dspark_weight_name_npu(name)
+                if _is_npu
+                else self._remap_dspark_weight_name(name)
+            )
             if mapped is None:
                 continue
 
@@ -934,6 +938,40 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
+        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+            return None
+        if "rotary_emb.inv_freq" in name:
+            return None
+
+        if not name.startswith("mtp."):
+            return None
+        parts = name.split(".", 2)
+        if len(parts) < 3:
+            return None
+        stage_id, rest = parts[1], parts[2]
+
+        if rest.startswith("markov_head."):
+            return f"markov_head.{rest[len('markov_head.'):]}"
+
+        if rest.startswith("confidence_head."):
+            if self.confidence_head is None:
+                return None
+            return f"confidence_head.{rest[len('confidence_head.'):]}"
+
+        mapped_rest = rest
+        mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
+        mapped_rest = mapped_rest.replace("ffn.", "mlp.", 1)
+        mapped_rest = mapped_rest.replace("attn_norm.", "input_layernorm.", 1)
+        mapped_rest = mapped_rest.replace("ffn_norm.", "post_attention_layernorm.", 1)
+        mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
+        mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
+        mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
+        mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+        mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        return f"stages.{stage_id}.{mapped_rest}"
+
+    def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
         if "rotary_emb.inv_freq" in name:
