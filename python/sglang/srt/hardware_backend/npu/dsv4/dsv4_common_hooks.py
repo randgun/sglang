@@ -400,17 +400,7 @@ def maybe_build_dsv4_verify_bundle(
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
-    spec_info = getattr(batch, "spec_info", None)
-    ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
-    if ragged_layout is not None:
-        verify_lens_cpu = getattr(ragged_layout, "verify_lens_cpu", None)
-        if verify_lens_cpu is None:
-            verify_lens_cpu = ragged_layout.verify_lens.cpu().tolist()
-        elif isinstance(verify_lens_cpu, torch.Tensor):
-            verify_lens_cpu = verify_lens_cpu.tolist()
-        verify_lens = [int(v) for v in verify_lens_cpu[: len(req_indices)]]
-    else:
-        verify_lens = [int(draft_token_num)] * len(req_indices)
+    verify_lens = [int(draft_token_num)] * len(req_indices)
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
         chunks = []

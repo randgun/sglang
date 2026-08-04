@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 class DSparkWorkerV2(BaseSpecWorker):
+    
     def __init__(
         self,
         server_args: ServerArgs,

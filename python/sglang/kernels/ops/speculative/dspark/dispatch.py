@@ -12,3 +12,4 @@ def inputs_on_cuda(*args, **kwargs) -> bool:
         if isinstance(value, torch.Tensor):
             return value.is_cuda
     raise AssertionError("kernel dispatch requires at least one tensor argument")
+    
