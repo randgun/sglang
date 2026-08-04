@@ -37,7 +37,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+_is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
@@ -210,6 +213,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
 
     def run_non_compact(
@@ -278,6 +282,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,

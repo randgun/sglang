@@ -1701,7 +1701,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
+            skip_attn_backend_init=True,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
