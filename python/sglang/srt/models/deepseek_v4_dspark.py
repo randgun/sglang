@@ -69,14 +69,10 @@ _is_npu = is_npu()
 
 
 def apply_rotary_emb(
-    x: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-    inverse: bool = False,
+    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
     y = x
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-    freqs_cis = freqs_cis[positions]
     if inverse:
         freqs_cis = freqs_cis.conj()
     if x.ndim == 3:
@@ -132,40 +128,16 @@ class DSparkAttention(MqaAttentionBase):
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
-
-    def _apply_rotary_inplace(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        *,
-        inverse: bool = False,
-    ) -> None:
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-
-            cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
-                positions,
-                x.dtype,
-                view_4d=True,
-                inverse=inverse,
-                allow_build=True,
-                cache_dtype=torch.float32,
+            # The post-projection Q normalization has no learned affine weight.
+            # Keep a unit weight as a buffer so npu_rms_norm can replace the
+            # decomposed square/mean/rsqrt/mul sequence without allocating a
+            # tensor on every draft forward.
+            self.register_buffer(
+                "_q_post_norm_weight",
+                torch.ones(self.head_dim),
+                persistent=False,
             )
-            Dsv4NpuRoPE.apply_rotary_mul_inplace(
-                x,
-                None,
-                cos4,
-                sin4,
-                qk_nope_dim=x.shape[-1] - self.rope_head_dim,
-            )
-            return
-
-        apply_rotary_emb(
-            x[..., -self.rope_head_dim :],
-            self.freqs_cis,
-            positions,
-            inverse=inverse,
-        )
 
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
         kv, _ = self.wkv(x)
@@ -206,10 +178,38 @@ class DSparkAttention(MqaAttentionBase):
             fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
             return q_out
         else:
-            q = q * torch.rsqrt(
-                q.float().square().mean(-1, keepdim=True) + self.eps
-            ).to(q.dtype)
-            self._apply_rotary_inplace(q, positions)
+            if _is_npu:
+                import torch_npu
+
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+                    Dsv4NpuRoPE,
+                )
+
+                q = torch_npu.npu_rms_norm(
+                    q, self._q_post_norm_weight, self.eps
+                )[0]
+                cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
+                    positions,
+                    q.dtype,
+                    view_4d=True,
+                    inverse=False,
+                    allow_build=True,
+                    cache_dtype=torch.float32,
+                )
+                Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                    q,
+                    None,
+                    cos4,
+                    sin4,
+                    qk_nope_dim=q.shape[-1] - self.rope_head_dim,
+                )
+            else:
+                q = q * torch.rsqrt(
+                    q.float().square().mean(-1, keepdim=True) + self.eps
+                ).to(q.dtype)
+                apply_rotary_emb(
+                    q[..., -self.rope_head_dim :], self.freqs_cis[positions]
+                )
             if q_out is not None:
                 q_out.copy_(q)
                 return q_out
@@ -296,8 +296,26 @@ class DSparkAttention(MqaAttentionBase):
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
             )
+        elif _is_npu:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+
+            cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
+                positions,
+                o.dtype,
+                view_4d=True,
+                inverse=True,
+                allow_build=True,
+                cache_dtype=torch.float32,
+            )
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                o,
+                None,
+                cos4,
+                sin4,
+                qk_nope_dim=o.shape[-1] - rd,
+            )
         else:
-            self._apply_rotary_inplace(o, positions, inverse=True)
+            apply_rotary_emb(o[..., -rd:], self.freqs_cis[positions], inverse=True)
 
         o = o.view(
             o.shape[0],
