@@ -615,10 +615,10 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
-    # DeepSeek-V4 DSpark checkpoints carry QuaRot-aligned, MTP-local
-    # embedding/head weights. They must not be replaced by the target model's
-    # vocabulary modules.
-    uses_own_vocab_modules = True
+    # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
+    # embedding/head weights. The native CUDA path keeps the original DSpark
+    # behavior and shares the target model's vocabulary modules.
+    uses_own_vocab_modules = _is_npu
 
     def __init__(
         self,
@@ -691,24 +691,26 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.norm_eps = float(config.rms_norm_eps)
         self.hc_eps = float(config.hc_eps)
 
-        # These weights are FLOAT in the ModelSlim checkpoint even when the
-        # stage MoE/linear weights are quantized, so intentionally do not pass
-        # the draft quant_config to either vocabulary module.
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=add_prefix("embed_tokens", prefix),
-            enable_tp=not is_dp_attention_enabled(),
-        )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
-        )
+        if self.uses_own_vocab_modules:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("embed_tokens", prefix),
+                enable_tp=not is_dp_attention_enabled(),
+            )
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.embed_tokens: Optional[nn.Module] = None
+            self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
-        self.markov_head.configure_tp_shard(lm_head=self.lm_head)
+        if self.lm_head is not None:
+            self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -717,10 +719,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        # Kept for API compatibility with generic DSpark worker code. This
-        # model owns QuaRot-aligned MTP vocabulary modules, so target modules
-        # must never overwrite them.
-        del embed_tokens, lm_head
+        if not self.uses_own_vocab_modules:
+            self.embed_tokens = embed_tokens
+            self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
@@ -948,9 +949,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         stage_idx = int(stage_id)
         if rest in ("embed.weight", "embed_tokens.weight"):
-            return "embed_tokens.weight" if stage_idx == 0 else None
+            return (
+                "embed_tokens.weight"
+                if self.uses_own_vocab_modules and stage_idx == 0
+                else None
+            )
         if rest in ("head.weight", "lm_head.weight"):
-            return "lm_head.weight" if stage_idx == self.num_stages - 1 else None
+            return (
+                "lm_head.weight"
+                if self.uses_own_vocab_modules
+                and stage_idx == self.num_stages - 1
+                else None
+            )
         if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
 
