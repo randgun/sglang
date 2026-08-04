@@ -569,11 +569,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        kv_out = kv.float()
-        kv_out = kv_out * torch.rsqrt(
-            kv_out.square().mean(dim=-1, keepdim=True) + eps
-        )
-        kv_out = (kv_out * kv_weight.float()).to(kv.dtype)
+        kv_out = torch_npu.npu_rms_norm(kv, kv_weight, eps)[0]
 
         rope_dim = freqs_cis.shape[-1] * 2
 
