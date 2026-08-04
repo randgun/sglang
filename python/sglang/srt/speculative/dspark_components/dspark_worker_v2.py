@@ -58,9 +58,11 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -301,12 +303,12 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
-            if str(self.device).startswith("npu"):
-                from sglang.srt.hardware_backend.npu.attention.vllm_ascend_sparse_attn_loader import (
-                    initialize_vllm_ascend_sparse_attn_ops,
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.extra_ops_loader import (
+                    initialize_dspark_sparse_attn_ops,
                 )
 
-                initialize_vllm_ascend_sparse_attn_ops()
+                initialize_dspark_sparse_attn_ops()
             self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
