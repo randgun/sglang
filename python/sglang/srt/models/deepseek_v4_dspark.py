@@ -613,17 +613,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.dim)
-        input_ids = forward_batch.input_ids
-        if input_ids is None:
-            raise RuntimeError(
-                "DeepSeek-V4 DSpark MoE requires forward_batch.input_ids for "
-                "hash routing and TP-attention/A2A token scatter."
-            )
         y = self._run_moe_ffn_dp_sync(
-            x,
-            forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids,
+            x, forward_batch, input_ids=None, input_ids_global=None
         )
         return y.view(shape)
 
