@@ -1216,7 +1216,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # target, so page indices are identical to DSV4_SWA.
                 draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
                 if draft_pool is not None and isinstance(
-                    draft_pool, DSV4NPUTokenToKVPool
+                    draft_pool, DeepSeekV4TokenToKVPool
                 ):
                     from sglang.srt.disaggregation.ascend.conn import (
                         AscendStateType,

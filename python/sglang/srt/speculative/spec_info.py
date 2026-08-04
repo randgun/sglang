@@ -185,13 +185,12 @@ class SpeculativeAlgorithm(Enum):
                 batch, server_args, last_tokens_tensor, future_map
             )
         if self.is_dflash_family():
-            from sglang.srt.speculative.draft_worker_common import (
-                make_next_draft_input,
+            from sglang.srt.speculative.dflash_disaggregation import (
+                build_dflash_family_disagg_draft_input,
             )
 
-            return make_next_draft_input(
-                bonus_tokens=last_tokens_tensor,
-                new_seq_lens=batch.seq_lens,
+            return build_dflash_family_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
             )
         return None
 
