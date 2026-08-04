@@ -129,10 +129,6 @@ class DSparkAttention(MqaAttentionBase):
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
         if _is_npu:
-            # The post-projection Q normalization has no learned affine weight.
-            # Keep a unit weight as a buffer so npu_rms_norm can replace the
-            # decomposed square/mean/rsqrt/mul sequence without allocating a
-            # tensor on every draft forward.
             self.register_buffer(
                 "_q_post_norm_weight",
                 torch.ones(self.head_dim),
