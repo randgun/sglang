@@ -218,6 +218,9 @@ class DSparkAttention(MqaAttentionBase):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
+        if forward_batch.forward_mode.is_idle():
+            return torch.zeros_like(hidden_states)
+
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         pool = _resolve_dspark_pool()
