@@ -104,7 +104,7 @@ class DFlashVerifyInput(SpecInput):
             # the compressor's logical batch without changing ForwardBatch's
             # stale-plan shape fields. Let ModelRunner select graph/eager and
             # initialize metadata after final batch preparation.
-            can_run_cuda_graph = False
+            return verify_forward_batch, can_run_cuda_graph
         elif can_run_cuda_graph:
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
