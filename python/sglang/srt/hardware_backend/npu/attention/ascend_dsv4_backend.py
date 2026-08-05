@@ -1941,7 +1941,6 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=1,
         )
         if self._is_dspark_draft_worker:
-            # Match the A3 vLLM-Ascend DSpark call directly.
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
