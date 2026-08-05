@@ -8,15 +8,15 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch_npu
 import torch.nn.functional as F
+import torch_npu
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -872,11 +872,13 @@ class C4IndexerAscendBackendMixin:
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
         return q, weights
 
     def _can_use_indexer_multi_stream(self) -> bool:
@@ -896,6 +898,7 @@ class C4IndexerAscendBackendMixin:
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
         q_lora_ready,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.hardware_backend.npu.utils import (
             get_indexer_weight_stream,
@@ -910,14 +913,13 @@ class C4IndexerAscendBackendMixin:
         stream_w.wait_stream(cur)
 
         # route-KV write on cur; ordered before the topk read by cur's program order.
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
 
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
             weights = c4_indexer.weights_proj(x)[0]
-            weights = weights * (
-                c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5
-            )
+            weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
             weights.record_stream(stream_w)
 
         # q (wq_b + rope + hadamard) on stream_q.
@@ -1111,21 +1113,25 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        assert (
-            not skip_compressor
-        ), "skip_compressor=True is not supported on the NPU indexer path"
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
         if self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
-                c4_indexer, x, q_lora, forward_batch, q_lora_ready
+                c4_indexer,
+                x,
+                q_lora,
+                forward_batch,
+                q_lora_ready,
+                skip_compressor=skip_compressor,
             )
         else:
             q, weights = self._forward_prepare(
-                c4_indexer, x, q_lora, forward_batch
+                c4_indexer,
+                x,
+                q_lora,
+                forward_batch,
+                skip_compressor=skip_compressor,
             )
-        topk_idxs = self._forward_indexer(
-            c4_indexer, x, q, weights, forward_batch
-        )
+        topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
 
 
