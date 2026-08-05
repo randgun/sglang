@@ -1198,21 +1198,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
-                # DSpark draft SWA: the draft pool has its own SWA buffer but
-                # shares the allocator / full_to_swa_index_mapping with the
-                # target, so page indices are identical to DSV4_SWA.
-                draft_pool = self.draft_token_to_kv_pool
-                if draft_pool is not None and isinstance(
-                    draft_pool, DeepSeekV4TokenToKVPool
-                ):
-                    from sglang.srt.disaggregation.ascend.conn import (
-                        AscendStateType,
-                    )
-
-                    if AscendStateType.DSV4_SWA in payloads:
-                        payloads[AscendStateType.DSV4_DRAFT_SWA] = payloads[
-                            AscendStateType.DSV4_SWA
-                        ]
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
