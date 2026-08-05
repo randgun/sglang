@@ -105,18 +105,47 @@ class PureSWARadixCache(RadixCache):
         else:
             insert_end = keys_len
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] PureSWA.cache_finished_req ENTER: "
+            f"rid={getattr(req, 'rid', '?')}, is_insert={is_insert}, "
+            f"kv_committed_len={kv_committed_len}, "
+            f"keys_len={keys_len}, old_prefix_len={old_prefix_len}, "
+            f"swa_evict_floor={swa_evict_floor}, "
+            f"swa_evicted_seqlen={swa_evicted_seqlen}, "
+            f"insert_end={insert_end}, "
+            f"evictable={self.evictable_size_}, "
+            f"available={self.token_to_kv_pool_allocator.available_size()}"
+        )
+
         if is_insert and insert_end > 0:
             insert_values = kv_indices[:insert_end].to(dtype=torch.int64, copy=True)
             result = self.insert(
                 InsertParams(key=radix_key[:insert_end], value=insert_values)
             )
             new_prefix_len = result.prefix_len
+            logger.warning(
+                f"[SWA_LEAK_TRACE] PureSWA.cache_finished_req AFTER insert: "
+                f"new_prefix_len={new_prefix_len}, old_prefix_len={old_prefix_len}, "
+                f"evictable={self.evictable_size_}, "
+                f"available={self.token_to_kv_pool_allocator.available_size()}"
+            )
             if new_prefix_len > old_prefix_len:
+                logger.warning(
+                    f"[SWA_LEAK_TRACE] PureSWA.cache_finished_req FREE overlapping: "
+                    f"free_range=[{old_prefix_len}:{new_prefix_len}], "
+                    f"kv_indices_sample={kv_indices[old_prefix_len:min(old_prefix_len+4, new_prefix_len)].tolist()}"
+                )
                 self.token_to_kv_pool_allocator.free(
                     kv_indices[old_prefix_len:new_prefix_len]
                 )
             alive_start = max(swa_evicted_seqlen, insert_end)
             if alive_start < keys_len:
+                logger.warning(
+                    f"[SWA_LEAK_TRACE] PureSWA.cache_finished_req FREE window_tail: "
+                    f"free_range=[{alive_start}:{keys_len}], "
+                    f"kv_indices_sample={kv_indices[alive_start:min(alive_start+4, keys_len)].tolist()}, "
+                    f"old_prefix_len={old_prefix_len}"
+                )
                 self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
         else:
             free_end = (

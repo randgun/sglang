@@ -463,6 +463,16 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] RadixCache.cache_finished_req ENTER: "
+            f"rid={getattr(req, 'rid', '?')}, is_insert={is_insert}, "
+            f"kv_len_to_handle={kv_len_to_handle}, "
+            f"cache_protected_len={req.cache_protected_len}, "
+            f"key_len={key_len}, "
+            f"evictable={self.evictable_size_}, "
+            f"available={self.token_to_kv_pool_allocator.available_size()}"
+        )
+
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
@@ -475,6 +485,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             session_leaf = None
             freed_end = key_len
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] RadixCache.cache_finished_req AFTER insert: "
+            f"freed_end={freed_end}, cache_protected_len={req.cache_protected_len}, "
+            f"evictable={self.evictable_size_}, "
+            f"available={self.token_to_kv_pool_allocator.available_size()}"
+        )
+
         # duplicates / uninserted range, then the unaligned tail
         self.token_to_kv_pool_allocator.free_segments(
             [
@@ -486,11 +503,23 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             ]
         )
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] RadixCache.cache_finished_req AFTER free_segments: "
+            f"evictable={self.evictable_size_}, "
+            f"available={self.token_to_kv_pool_allocator.available_size()}"
+        )
+
         self._tag_session_leaf(req, radix_key, node=session_leaf)
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] RadixCache.cache_finished_req EXIT: "
+            f"evictable={self.evictable_size_}, "
+            f"available={self.token_to_kv_pool_allocator.available_size()}"
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
@@ -507,6 +536,15 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] RadixCache.cache_unfinished_req ENTER: "
+            f"rid={getattr(req, 'rid', '?')}, chunked={chunked}, "
+            f"cache_protected_len={req.cache_protected_len}, "
+            f"radix_key_len={len(radix_key)}, "
+            f"evictable={self.evictable_size_}, "
+            f"available={self.token_to_kv_pool_allocator.available_size()}"
+        )
+
         # Radix Cache takes one ref in memory pool
         result = self.insert(
             InsertParams(
@@ -517,6 +555,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             )
         )
         new_prefix_len = result.prefix_len
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] RadixCache.cache_unfinished_req AFTER insert: "
+            f"new_prefix_len={new_prefix_len}, "
+            f"evictable={self.evictable_size_}, "
+            f"available={self.token_to_kv_pool_allocator.available_size()}"
+        )
 
         self.token_to_kv_pool_allocator.free_segment(
             kv_indices[req.cache_protected_len : new_prefix_len],
@@ -608,6 +653,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                logger.warning(
+                    f"[SWA_LEAK_TRACE] RadixCache.inc_lock_ref: "
+                    f"evictable->protected, key_len={len(node.key)}, "
+                    f"evictable -> {self.evictable_size_}"
+                )
             node.lock_ref += 1
             self._update_leaf_status(node)
             node = node.parent
@@ -625,6 +675,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
+                logger.warning(
+                    f"[SWA_LEAK_TRACE] RadixCache.dec_lock_ref: "
+                    f"protected->evictable, key_len={len(node.key)}, "
+                    f"evictable -> {self.evictable_size_}"
+                )
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
@@ -758,6 +813,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            logger.warning(
+                f"[SWA_LEAK_TRACE] RadixCache._insert_helper _add_node: "
+                f"key_len={len(key)}, evictable -> {self.evictable_size_}, "
+                f"available={self.token_to_kv_pool_allocator.available_size()}"
+            )
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
@@ -790,6 +850,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         self._discard_session_leaf(node)
         self.evictable_size_ -= len(node.key)
+        logger.warning(
+            f"[SWA_LEAK_TRACE] RadixCache._delete_leaf: "
+            f"key_len={len(node.key)}, evictable -> {self.evictable_size_}"
+        )
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
         self._update_leaf_status(node.parent)
