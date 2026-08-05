@@ -3794,6 +3794,32 @@ class Scheduler(
                         f"swa_avail+evict+protect={swa_avail + swa_evict + swa_protect}, "
                         f"excess={swa_avail + swa_evict + swa_protect - total_swa}"
                     )
+                    # Walk the tree to verify swa_evictable_size_ against actual nodes
+                    if hasattr(tree, '_collect_nontombstone_nodes'):
+                        nodes = tree._collect_nontombstone_nodes()
+                        actual_evictable = sum(len(n.value) for n in nodes if n.swa_lock_ref == 0 and n != tree.root_node)
+                        actual_protected = sum(len(n.value) for n in nodes if n.swa_lock_ref > 0)
+                        tombstone_nodes = [n for n in nodes if n.swa_tombstone]
+                        logger.error(
+                            f"[SWA_LEAK_TRACE] TREE WALK: "
+                            f"actual_swa_evictable={actual_evictable}, "
+                            f"counter_swa_evictable={swa_evict}, "
+                            f"evictable_diff={actual_evictable - swa_evict}, "
+                            f"actual_swa_protected={actual_protected}, "
+                            f"counter_swa_protected={swa_protect}, "
+                            f"n_nontombstone_nodes={len(nodes)}, "
+                            f"n_tombstone={len(tombstone_nodes)}"
+                        )
+                        # Dump all non-tombstone nodes for detailed analysis
+                        for n in nodes[:20]:
+                            logger.error(
+                                f"[SWA_LEAK_TRACE] NODE: id={n.id}, "
+                                f"key_len={len(n.key)}, value_len={len(n.value)}, "
+                                f"full_lock={n.full_lock_ref}, swa_lock={n.swa_lock_ref}, "
+                                f"tombstone={n.swa_tombstone}, "
+                                f"is_leaf={len(n.children)==0}, "
+                                f"value_sample={n.value[:4].tolist() if len(n.value) > 0 else '[]'}"
+                            )
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
 

@@ -502,6 +502,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        _swa_evict_before = self.swa_evictable_size_
+        _swa_avail_before = self.token_to_kv_pool_allocator.swa_available_size()
         if is_insert:
             self.insert(
                 InsertParams(
@@ -519,6 +521,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] cache_finished_req AFTER insert+tail_free: "
+            f"rid={getattr(req, 'rid', '?')}, "
+            f"swa_evictable {_swa_evict_before} -> {self.swa_evictable_size_}, "
+            f"swa_available {_swa_avail_before} -> {self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
+
         # Remove req slot release the cache lock
         self.dec_lock_ref(
             req.last_node,
@@ -526,6 +535,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=req.swa_prefix_lock_released,
         )
         req.swa_prefix_lock_released = False
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] cache_finished_req EXIT: "
+            f"rid={getattr(req, 'rid', '?')}, "
+            f"swa_evictable={self.swa_evictable_size_}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -777,6 +793,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 if node.swa_lock_ref == 0:
                     self.swa_evictable_size_ -= len(node.value)
                     self.swa_protected_size_ += len(node.value)
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] inc_lock_ref: "
+                        f"node_id={node.id}, len={len(node.value)}, "
+                        f"evictable->protected, "
+                        f"swa_evictable -> {self.swa_evictable_size_}, "
+                        f"swa_protected -> {self.swa_protected_size_}"
+                    )
                 node.swa_lock_ref += 1
                 swa_lock_size += len(node.value)
                 if swa_lock_size >= self.sliding_window_size:
@@ -827,6 +850,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 if node.swa_lock_ref == 1:
                     self.swa_evictable_size_ += len(node.value)
                     self.swa_protected_size_ -= len(node.value)
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] dec_lock_ref: "
+                        f"node_id={node.id}, len={len(node.value)}, "
+                        f"protected->evictable, "
+                        f"swa_evictable -> {self.swa_evictable_size_}, "
+                        f"swa_protected -> {self.swa_protected_size_}"
+                    )
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                     dec_lock_swa = False
@@ -1273,6 +1303,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 else:
                     # The node is not tombstone, so we don't need to update the node.
                     _swa_before = self.token_to_kv_pool_allocator.swa_available_size()
+                    _swa_evict_before = self.swa_evictable_size_
+                    # Critical check: does value[:prefix_len] overlap with node.value?
+                    # If yes, free_swa will translate via mapping and free the tree node's
+                    # own SWA slots while the node remains in swa_evictable_size_.
+                    _incoming = value[:prefix_len]
+                    _node_val = node.value[:prefix_len] if len(node.value) >= prefix_len else node.value
+                    _overlap = torch.isin(_incoming, _node_val).any().item() if len(_incoming) > 0 and len(_node_val) > 0 else False
                     self.token_to_kv_pool_allocator.free(value[:prefix_len])
                     _swa_after = self.token_to_kv_pool_allocator.swa_available_size()
                     logger.warning(
@@ -1286,8 +1323,18 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         f"swa_available {_swa_before} -> {_swa_after}, "
                         f"value_sample={value[:min(4, len(value))].tolist()}, "
                         f"node_value_sample={node.value[:min(4, len(node.value))].tolist()}, "
-                        f"swa_evictable={self.swa_evictable_size_}"
+                        f"VALUE_OVERLAPS_NODE_VALUE={_overlap}, "
+                        f"swa_evictable {_swa_evict_before} -> {self.swa_evictable_size_}"
                     )
+                    if _overlap:
+                        logger.error(
+                            f"[SWA_LEAK_TRACE] *** CRITICAL: freeing value that overlaps node.value! "
+                            f"This will free the tree node's own SWA slots via free_swa mapping, "
+                            f"causing double-counting (SWA in both available and evictable). "
+                            f"node_id={node.id}, "
+                            f"value[:4]={value[:min(4, len(value))].tolist()}, "
+                            f"node.value[:4]={node.value[:min(4, len(node.value))].tolist()}"
+                        )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1401,6 +1448,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)
+            logger.warning(
+                f"[SWA_LEAK_TRACE] _add_new_node: "
+                f"node_id={new_node.id}, value_len={len(value)}, "
+                f"parent_id={parent.id}, "
+                f"swa_evictable -> {self.swa_evictable_size_}, "
+                f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}, "
+                f"value_sample={value[:min(4, len(value))].tolist()}"
+            )
         self._record_store_event(new_node)
         return new_node
 
@@ -1438,11 +1493,21 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # already removed from swa_evictable_size_ when they were tombstoned.
         if not node.swa_tombstone:
             self.swa_evictable_size_ -= len(node.key)
+            logger.warning(
+                f"[SWA_LEAK_TRACE] _delete_leaf: "
+                f"node_id={node.id}, key_len={len(node.key)}, "
+                f"swa_evictable -> {self.swa_evictable_size_}"
+            )
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         node.swa_tombstone = True
         self.swa_evictable_size_ -= len(node.key)
+        logger.warning(
+            f"[SWA_LEAK_TRACE] _tombstone_internal_node: "
+            f"node_id={node.id}, key_len={len(node.key)}, "
+            f"swa_evictable -> {self.swa_evictable_size_}"
+        )
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (
