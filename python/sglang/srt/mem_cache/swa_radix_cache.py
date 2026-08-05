@@ -479,6 +479,27 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] cache_finished_req ENTER: "
+            f"rid={getattr(req, 'rid', '?')}, "
+            f"is_insert={is_insert}, "
+            f"kv_len_to_handle={kv_len_to_handle}, "
+            f"old_prefix_len={old_prefix_len}, "
+            f"page_aligned_len={page_aligned_len}, "
+            f"swa_evicted_seqlen={getattr(req.kv, 'swa_evicted_seqlen', '?')}, "
+            f"swa_evictable={self.swa_evictable_size_}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
+
+        if old_prefix_len < page_aligned_len:
+            logger.warning(
+                f"[SWA_LEAK_TRACE] cache_finished_req: old_prefix_len < page_aligned_len! "
+                f"This means insert will process nodes beyond old prefix. "
+                f"rid={getattr(req, 'rid', '?')}, "
+                f"old_prefix_len={old_prefix_len}, "
+                f"page_aligned_len={page_aligned_len}"
+            )
+
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         if is_insert:
@@ -528,6 +549,17 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] cache_unfinished_req ENTER: "
+            f"rid={getattr(req, 'rid', '?')}, chunked={chunked}, "
+            f"old_prefix_len={old_prefix_len}, "
+            f"page_aligned_len={len(radix_key)}, "
+            f"kv_indices_len={len(kv_indices)}, "
+            f"token_ids_len={len(token_ids)}, "
+            f"swa_evictable={self.swa_evictable_size_}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
+
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         result = self.insert(
@@ -573,6 +605,17 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] cache_unfinished_req EXIT: "
+            f"rid={getattr(req, 'rid', '?')}, "
+            f"cache_protected_len={req.cache_protected_len}, "
+            f"new_prefix_len={new_prefix_len}, "
+            f"len(new_indices)={len(new_indices)}, "
+            f"page_aligned_len={len(radix_key)}, "
+            f"swa_evictable={self.swa_evictable_size_}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -649,6 +692,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                     # 3. tombstone the node
                     self._tombstone_internal_node(x)
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] evict SWA internal: "
+                        f"node_id={x.id}, node_len={len(x.value)}, "
+                        f"full_lock_ref={x.full_lock_ref}, "
+                        f"swa_evictable -> {self.swa_evictable_size_}, "
+                        f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+                    )
                 elif x.full_lock_ref > 0:
                     # Leaf still holds a full-side lock (can happen when the
                     # SWA leaf-lock early-release optimization revived a
@@ -661,6 +711,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                     self.swa_evictable_size_ -= len(x.value)
                     x.swa_tombstone = True
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] evict SWA leaf (full_lock>0): "
+                        f"node_id={x.id}, node_len={len(x.value)}, "
+                        f"swa_evictable -> {self.swa_evictable_size_}, "
+                        f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+                    )
                 else:
                     assert (
                         x.full_lock_ref == 0
@@ -1177,6 +1233,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                             node.swa_tombstone = False
                             self.swa_lru_list.insert_mru(node)
                             self.swa_evictable_size_ += len(node.value)
+                            logger.warning(
+                                f"[SWA_LEAK_TRACE] _insert_helper tombstone recovery (full_lock=0): "
+                                f"node_id={node.id}, node_len={len(node.value)}, "
+                                f"prefix_len={prefix_len}, "
+                                f"swa_evictable -> {self.swa_evictable_size_}, "
+                                f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+                            )
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
@@ -1209,7 +1272,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         self.token_to_kv_pool_allocator.free(value[:prefix_len])
                 else:
                     # The node is not tombstone, so we don't need to update the node.
+                    _swa_before = self.token_to_kv_pool_allocator.swa_available_size()
                     self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                    _swa_after = self.token_to_kv_pool_allocator.swa_available_size()
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] _insert_helper non-tombstone free: "
+                        f"node_id={node.id}, node_len={len(node.value)}, "
+                        f"prefix_len={prefix_len}, "
+                        f"full_lock_ref={node.full_lock_ref}, "
+                        f"swa_lock_ref={node.swa_lock_ref}, "
+                        f"update_kv_after_len={update_kv_after_len}, "
+                        f"total_prefix_length={total_prefix_length}, "
+                        f"swa_available {_swa_before} -> {_swa_after}, "
+                        f"value_sample={value[:min(4, len(value))].tolist()}, "
+                        f"node_value_sample={node.value[:min(4, len(node.value))].tolist()}, "
+                        f"swa_evictable={self.swa_evictable_size_}"
+                    )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1278,6 +1356,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         allocator = self.token_to_kv_pool_allocator
         swa_value = allocator.translate_loc_from_full_to_swa(incoming_full)
+        old_swa_evictable = self.swa_evictable_size_
+        old_swa_available = allocator.swa_available_size()
+        # Snapshot the old SWA mapping for this node before overwriting
+        old_swa_mapping = allocator.full_to_swa_index_mapping[node.value.to(torch.int64)].clone()
+
         allocator.set_full_to_swa_mapping(node.value, swa_value)
         allocator.full_to_swa_index_mapping[incoming_full.to(torch.int64)] = 0
         allocator.full_attn_allocator.free(incoming_full)
@@ -1285,6 +1368,19 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         node.swa_tombstone = False
         self.swa_lru_list.insert_mru(node)
         self.swa_evictable_size_ += len(node.value)
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] _recover_tombstone_keeping_locked_full: "
+            f"node_id={node.id}, node_len={len(node.value)}, "
+            f"full_lock_ref={node.full_lock_ref}, swa_lock_ref={node.swa_lock_ref}, "
+            f"is_leaf={len(node.children) == 0}, "
+            f"swa_evictable {old_swa_evictable} -> {self.swa_evictable_size_}, "
+            f"swa_available {old_swa_available} -> {allocator.swa_available_size()}, "
+            f"old_swa_mapping_sample={old_swa_mapping[:4].tolist()}, "
+            f"new_swa_mapping_sample={swa_value[:4].tolist()}, "
+            f"incoming_full_sample={incoming_full[:4].tolist()}, "
+            f"node_value_sample={node.value[:4].tolist()}"
+        )
 
     def _add_new_node(
         self,

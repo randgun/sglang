@@ -3779,6 +3779,21 @@ class Scheduler(
                 self.pool_stats_observer.get_pool_stats(),
             )
             if has_leak:
+                # Diagnostic: dump SWA tree state when leak is detected
+                if self.is_hybrid_swa:
+                    tree = self.tree_cache
+                    alloc = self.token_to_kv_pool_allocator
+                    total_swa = self.invariant_checker.swa_tokens_per_layer
+                    swa_avail = alloc.swa_available_size()
+                    swa_evict = tree.swa_evictable_size()
+                    swa_protect = tree.swa_protected_size()
+                    logger.error(
+                        f"[SWA_LEAK_TRACE] LEAK DETECTED at on_idle: "
+                        f"swa_total={total_swa}, swa_available={swa_avail}, "
+                        f"swa_evictable={swa_evict}, swa_protected={swa_protect}, "
+                        f"swa_avail+evict+protect={swa_avail + swa_evict + swa_protect}, "
+                        f"excess={swa_avail + swa_evict + swa_protect - total_swa}"
+                    )
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
 

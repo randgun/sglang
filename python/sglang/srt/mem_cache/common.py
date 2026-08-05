@@ -146,6 +146,18 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
+
+    logger.warning(
+        f"[SWA_LEAK_TRACE] release_kv_cache: "
+        f"rid={getattr(req, 'rid', '?')}, "
+        f"is_insert={is_insert}, "
+        f"effective_kv_committed_len={effective_kv_committed_len}, "
+        f"cache_protected_len={req.cache_protected_len}, "
+        f"kv_allocated_len={req.kv.kv_allocated_len if req.kv else '?'}, "
+        f"swa_evicted_seqlen={getattr(req.kv, 'swa_evicted_seqlen', '?') if req.kv else '?'}, "
+        f"swa_prefix_lock_released={getattr(req, 'swa_prefix_lock_released', '?')}"
+    )
+
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
