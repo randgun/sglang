@@ -155,7 +155,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         f"cache_protected_len={req.cache_protected_len}, "
         f"kv_allocated_len={req.kv.kv_allocated_len if req.kv else '?'}, "
         f"swa_evicted_seqlen={getattr(req.kv, 'swa_evicted_seqlen', '?') if req.kv else '?'}, "
-        f"swa_prefix_lock_released={getattr(req, 'swa_prefix_lock_released', '?')}"
+        f"swa_prefix_lock_released={getattr(req, 'swa_prefix_lock_released', '?')}, "
+        f"tree_cache_type={type(tree_cache).__name__}, "
+        f"tree_cache_disabled={getattr(tree_cache, 'disable', '?')}, "
+        f"skip_radix_cache_insert={getattr(req, 'skip_radix_cache_insert', '?')}"
     )
 
     tree_cache.cache_finished_req(
