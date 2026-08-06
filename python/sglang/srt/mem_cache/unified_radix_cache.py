@@ -598,6 +598,16 @@ class UnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, :kv_len_to_handle
         ]
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] UnifiedRC.cache_finished_req ENTER: "
+            f"rid={getattr(req, 'rid', '?')}, is_insert={is_insert}, "
+            f"kv_len_to_handle={kv_len_to_handle}, "
+            f"cache_protected_len={req.cache_protected_len}, "
+            f"swa_evictable={self.tree_core.swa_evictable_size()}, "
+            f"swa_protected={self.tree_core.swa_protected_size()}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
+
         result = None
         insert_params = None
 
@@ -638,11 +648,28 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
+            logger.warning(
+                f"[SWA_LEAK_TRACE] UnifiedRC.cache_finished_req AFTER insert: "
+                f"prefix_len={result.prefix_len if result else '?'}, "
+                f"page_aligned_len={page_aligned_len}, "
+                f"effective_cache_len={effective_cache_len}, "
+                f"swa_evictable={self.tree_core.swa_evictable_size()}, "
+                f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+            )
+
             # Free unaligned tail (+ deferred truncation tail)
             segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
             if tail_free_start is not None:
                 segments.append((kv_indices_full[tail_free_start:], tail_free_start))
+
+            _swa_avail_before_free = self.token_to_kv_pool_allocator.swa_available_size()
             self.token_to_kv_pool_allocator.free_segments(segments)
+            logger.warning(
+                f"[SWA_LEAK_TRACE] UnifiedRC.cache_finished_req AFTER free_segments: "
+                f"n_segments={len(segments)}, "
+                f"swa_available {_swa_avail_before_free} -> {self.token_to_kv_pool_allocator.swa_available_size()}, "
+                f"swa_evictable={self.tree_core.swa_evictable_size()}"
+            )
         else:
             self.token_to_kv_pool_allocator.free_segment(
                 kv_indices[req.cache_protected_len :],
@@ -653,6 +680,13 @@ class UnifiedRadixCache(BasePrefixCache):
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
+        )
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] UnifiedRC.cache_finished_req EXIT: "
+            f"swa_evictable={self.tree_core.swa_evictable_size()}, "
+            f"swa_protected={self.tree_core.swa_protected_size()}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
         )
 
         # cleanup
@@ -677,6 +711,16 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] UnifiedRC.cache_unfinished_req ENTER: "
+            f"rid={getattr(req, 'rid', '?')}, chunked={chunked}, "
+            f"cache_protected_len={req.cache_protected_len}, "
+            f"token_ids_len={len(token_ids)}, "
+            f"swa_evictable={self.tree_core.swa_evictable_size()}, "
+            f"swa_protected={self.tree_core.swa_protected_size()}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
@@ -723,6 +767,13 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
+        logger.warning(
+            f"[SWA_LEAK_TRACE] UnifiedRC.cache_unfinished_req AFTER insert: "
+            f"prefix_len={result.prefix_len}, page_aligned_len={page_aligned_len}, "
+            f"swa_evictable={self.tree_core.swa_evictable_size()}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
+
         # Match prefix
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
@@ -757,6 +808,15 @@ class UnifiedRadixCache(BasePrefixCache):
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
+
+        logger.warning(
+            f"[SWA_LEAK_TRACE] UnifiedRC.cache_unfinished_req EXIT: "
+            f"cache_protected_len={req.cache_protected_len}, "
+            f"len_new_indices={len(new_indices)}, "
+            f"swa_evictable={self.tree_core.swa_evictable_size()}, "
+            f"swa_protected={self.tree_core.swa_protected_size()}, "
+            f"swa_available={self.token_to_kv_pool_allocator.swa_available_size()}"
+        )
 
         # cleanup
         for comp in self._components_tuple:

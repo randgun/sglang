@@ -970,6 +970,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        logger.warning(
+            f"[SWA_LEAK_TRACE] UTC._add_new_node: "
+            f"base_evictable += {len(value)}, -> {self.component_evictable_size_[BASE_COMPONENT_TYPE]}, "
+            f"swa_evictable={self.component_evictable_size_.get(2, 0)}"
+        )
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1728,6 +1733,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
         self.component_evictable_size_[component_type] += len(value)
+        logger.warning(
+            f"[SWA_LEAK_TRACE] UTC.store_component_device_value: "
+            f"ct={component_type}, evictable[{component_type}] += {len(value)}, "
+            f"-> {self.component_evictable_size_[component_type]}"
+        )
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType

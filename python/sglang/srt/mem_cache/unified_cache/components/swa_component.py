@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -50,6 +51,9 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class SWAComponent(TreeComponent):
@@ -393,6 +397,10 @@ class SWAComponent(TreeComponent):
             )
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[ct] -= freed
+            logger.warning(
+                f"[SWA_LEAK_TRACE] SWA_comp evict_node: "
+                f"evictable[{ct}] -= {freed}, -> {self.tree_core.component_evictable_size_[ct]}"
+            )
             cd.value = None
 
         # Host layer
@@ -508,6 +516,11 @@ class SWAComponent(TreeComponent):
                     key_len = len(cur.key)
                     self.tree_core.component_evictable_size_[ct] -= key_len
                     self.tree_core.component_protected_size_[ct] += key_len
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] SWA_comp inc_lock: "
+                        f"evictable[{ct}] -= {key_len}, -> {self.tree_core.component_evictable_size_[ct]}, "
+                        f"protected -> {self.tree_core.component_protected_size_[ct]}"
+                    )
             if lock_host:
                 comp.host_lock_ref = ref + 1
             else:
@@ -563,6 +576,11 @@ class SWAComponent(TreeComponent):
                     key_len = len(comp.value)
                     self.tree_core.component_evictable_size_[ct] += key_len
                     self.tree_core.component_protected_size_[ct] -= key_len
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] SWA_comp dec_lock: "
+                        f"evictable[{ct}] += {key_len}, -> {self.tree_core.component_evictable_size_[ct]}, "
+                        f"protected -> {self.tree_core.component_protected_size_[ct]}"
+                    )
             if lock_host:
                 comp.host_lock_ref = ref - 1
             else:
@@ -607,6 +625,11 @@ class SWAComponent(TreeComponent):
                 key_len = len(cur.key)
                 self.tree_core.component_protected_size_[ct] -= key_len
                 self.tree_core.component_evictable_size_[ct] += key_len
+                logger.warning(
+                    f"[SWA_LEAK_TRACE] SWA_comp release_window_lock: "
+                    f"evictable[{ct}] += {key_len}, -> {self.tree_core.component_evictable_size_[ct]}, "
+                    f"protected -> {self.tree_core.component_protected_size_[ct]}"
+                )
                 if self.tree_core._is_device_leaf(cur):
                     self.tree_core._evict_component_and_detach_lru(
                         cur,
