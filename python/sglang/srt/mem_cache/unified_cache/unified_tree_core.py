@@ -778,6 +778,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _advance_insert(self) -> InsertStepResult:
         """Run the in-flight insert to its next barrier or to completion."""
+        _swa_before = self.component_evictable_size_.get(ComponentType.SWA, 0)
         state = self._ongoing_insert_walk_state
         while True:
             flushed_len = len(state.pending_actions)
@@ -788,6 +789,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             elif state.phase is _InsertPhase.TAIL:
                 self._insert_tail_step(state)
                 self._ongoing_insert_walk_state = None
+                _swa_after = self.component_evictable_size_.get(ComponentType.SWA, 0)
+                if _swa_before != _swa_after:
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] UTC._advance_insert (TAIL): "
+                        f"swa_evictable {_swa_before} -> {_swa_after}, "
+                        f"delta={_swa_after - _swa_before}"
+                    )
                 return InsertStepResult(
                     actions=state.pending_actions, result=state.result
                 )
@@ -798,6 +806,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if new_actions and not all(map(self._is_deferrable_action, new_actions)):
                 flushed = state.pending_actions
                 state.pending_actions = []
+                _swa_after = self.component_evictable_size_.get(ComponentType.SWA, 0)
+                if _swa_before != _swa_after:
+                    logger.warning(
+                        f"[SWA_LEAK_TRACE] UTC._advance_insert (barrier): "
+                        f"swa_evictable {_swa_before} -> {_swa_after}, "
+                        f"delta={_swa_after - _swa_before}"
+                    )
                 return InsertStepResult(actions=flushed)
 
     @staticmethod
@@ -973,7 +988,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         logger.warning(
             f"[SWA_LEAK_TRACE] UTC._add_new_node: "
             f"base_evictable += {len(value)}, -> {self.component_evictable_size_[BASE_COMPONENT_TYPE]}, "
-            f"swa_evictable={self.component_evictable_size_.get(2, 0)}"
+            f"swa_evictable={self.component_evictable_size_.get(ComponentType.SWA, 0)}"
         )
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)

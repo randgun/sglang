@@ -843,6 +843,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
+        _swa_before = self.tree_core.swa_evictable_size()
         if isinstance(action, ComponentAction):
             self.components[action.component_type].apply_component_action(action)
         elif isinstance(action, ReplaceWriteThroughOnNodeSplit):
@@ -859,6 +860,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self._execute_and_commit_kv_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
+        _swa_after = self.tree_core.swa_evictable_size()
+        if _swa_before != _swa_after:
+            logger.warning(
+                f"[SWA_LEAK_TRACE] _apply_cache_action: "
+                f"action={type(action).__name__}, "
+                f"swa_evictable {_swa_before} -> {_swa_after}, "
+                f"delta={_swa_after - _swa_before}"
+            )
 
     def _drain_device_frees(
         self, device_frees: dict[ComponentType, list[torch.Tensor]]
