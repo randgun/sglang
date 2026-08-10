@@ -1196,6 +1196,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.token_to_kv_pool_allocator.page_size,
                         self.scheduler.sliding_window_size,
                         prefix_len=total_prefix_len,
+                        include_logical_pages=True,
                     )
                 )
             state_indices: Optional[List] = [

@@ -15,7 +15,12 @@ import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    StateIndexMap,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -69,6 +74,57 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+def pair_state_index_maps(
+    source: StateIndexMap,
+    dst_indices: List[int],
+    dst_logical_indices: List[int],
+) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+    """Pair a Prefill CP-local state map with Decode's full target map."""
+    destination = StateIndexMap(
+        logical_indices=np.asarray(dst_logical_indices, dtype=np.int32),
+        physical_indices=np.asarray(dst_indices, dtype=np.int32),
+    )
+    return source.pair_with(destination)
+
+
+def validate_state_map_cp_routing(
+    state_indices: Optional[List],
+    target_cp_ranks: List[int],
+    prefill_cp_size: int,
+) -> None:
+    """Require every Prefill CP rank for a DSV4 logical state map."""
+    if not state_indices or not any(
+        isinstance(indices, StateIndexMap) for indices in state_indices
+    ):
+        return
+    missing_cp_ranks = sorted(set(range(prefill_cp_size)) - set(target_cp_ranks))
+    if missing_cp_ranks:
+        missing = ", ".join(f"CP{rank}" for rank in missing_cp_ranks)
+        raise RuntimeError(
+            "DSV4 Prefill-CP PD state transfer requires "
+            "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1 on both Prefill "
+            f"and Decode; missing routes for {missing}."
+        )
+
+
+def split_state_index_maps(
+    state_indices: List,
+) -> tuple[List, Optional[List]]:
+    """Split physical state indices from optional logical page positions."""
+    physical_indices = []
+    logical_indices = []
+    has_logical_state_map = False
+    for indices in state_indices:
+        if isinstance(indices, StateIndexMap):
+            physical_indices.append(indices.physical_indices)
+            logical_indices.append(indices.logical_indices)
+            has_logical_state_map = True
+        else:
+            physical_indices.append(indices)
+            logical_indices.append(np.empty((0,), dtype=np.int32))
+    return physical_indices, logical_indices if has_logical_state_map else None
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -79,6 +135,9 @@ class TransferInfo:
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
     dst_state_indices: List[List[int]]  # parallel to receiver's state_types
+    # Logical page positions parallel to ``dst_state_indices``. Empty for
+    # state types that retain the legacy positional PD representation.
+    dst_state_logical_indices: List[List[int]]
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
@@ -92,10 +151,16 @@ class TransferInfo:
             dst_kv_indices = np.array([], dtype=np.int32)
             dst_aux_index = None
             dst_state_indices = []
+            dst_state_logical_indices = []
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
             dst_state_indices = unpack_int_lists(msg[6], "i")
+            dst_state_logical_indices = (
+                unpack_int_lists(msg[9], "i")
+                if len(msg) > 9 and msg[9] != b""
+                else []
+            )
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -105,6 +170,7 @@ class TransferInfo:
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
             dst_state_indices=dst_state_indices,
+            dst_state_logical_indices=dst_state_logical_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
             decode_prefix_len=(
@@ -1072,6 +1138,29 @@ class MooncakeKVManager(CommonKVManager):
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
+            if isinstance(indices, StateIndexMap):
+                if (
+                    self.attn_cp_size > 1
+                    and not self.enable_all_cp_ranks_for_transfer
+                ):
+                    raise RuntimeError(
+                        "DSV4 Prefill-CP PD state transfer requires "
+                        "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1 on "
+                        "both Prefill and Decode."
+                    )
+                dst_logical_indices = (
+                    req.dst_state_logical_indices[i]
+                    if i < len(req.dst_state_logical_indices)
+                    else []
+                )
+                try:
+                    indices, dst_indices = pair_state_index_maps(
+                        indices, dst_indices, dst_logical_indices
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"{st.upper()} logical state page mismatch: {exc}"
+                    ) from exc
 
             if st == StateType.MAMBA:
                 if (
@@ -1524,7 +1613,13 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices and not skip_state:
+                            has_logical_state_map = any(
+                                isinstance(indices, StateIndexMap)
+                                for indices in kv_chunk.state_indices or []
+                            )
+                            if kv_chunk.state_indices and (
+                                not skip_state or has_logical_state_map
+                            ):
                                 self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
@@ -2082,6 +2177,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return
 
         self.chunk_staging_infos = []
+        state_physical_indices = state_indices
+        state_logical_indices = None
+        if state_indices:
+            state_physical_indices, state_logical_indices = split_state_index_maps(
+                state_indices
+            )
+        validate_state_map_cp_routing(
+            state_indices,
+            self.target_cp_ranks,
+            self.prefill_info.attn_cp_size,
+        )
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -2104,12 +2210,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             kv_indices.tobytes() if not is_dummy else b"",
                             str(aux_index).encode("ascii") if not is_dummy else b"",
                             (
-                                pack_int_lists(state_indices, "i")
-                                if not is_dummy and state_indices
+                                pack_int_lists(state_physical_indices, "i")
+                                if not is_dummy and state_physical_indices
                                 else b""
                             ),
                             str(self.required_dst_info_num).encode("ascii"),
                             str(decode_prefix_len or 0).encode("ascii"),
+                            (
+                                pack_int_lists(state_logical_indices, "i")
+                                if not is_dummy and state_logical_indices is not None
+                                else b""
+                            ),
                         ]
                     )
             except zmq.ZMQError:

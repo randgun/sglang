@@ -92,6 +92,7 @@ def dsv4_state_payloads(
     window_size: int,
     *,
     prefix_len: int = 0,
+    include_logical_pages: bool = False,
 ):
     """Per-StateType PD-payload builders for DSV4-on-NPU.
 
@@ -105,12 +106,16 @@ def dsv4_state_payloads(
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.disaggregation.base.conn import StateIndexMap
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
 
     def empty_pages():
-        return np.empty((0,), dtype=np.int32)
+        pages = np.empty((0,), dtype=np.int32)
+        if include_logical_pages:
+            return StateIndexMap(logical_indices=pages, physical_indices=pages)
+        return pages
 
     def pages(table, lo: int, hi: int, *, drop_zero_pages: bool = False):
         if hi <= lo:
@@ -127,9 +132,19 @@ def dsv4_state_payloads(
         if slots.size == 0:
             return empty_pages()
 
+        logical_indices = np.arange(
+            page_lo // page_size, page_hi // page_size, dtype=np.int32
+        )
         page_indices = (slots // page_size).astype(np.int32)
         if drop_zero_pages:
-            page_indices = page_indices[page_indices > 0]
+            valid_pages = page_indices > 0
+            logical_indices = logical_indices[valid_pages]
+            page_indices = page_indices[valid_pages]
+        if include_logical_pages:
+            return StateIndexMap(
+                logical_indices=logical_indices,
+                physical_indices=page_indices,
+            )
         return page_indices
 
     def state_tail_range(compress_ratio: int):

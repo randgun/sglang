@@ -26,6 +26,67 @@ class StateType(str, enum.Enum):
     C128_STATE = "c128_state"
 
 
+@dataclasses.dataclass(frozen=True)
+class StateIndexMap:
+    """Page indices paired with their request-local logical page positions.
+
+    DSV4 Prefill-CP stores state pages on the rank that owns the corresponding
+    token range.  Physical page ids are local to an engine, so PD must pair
+    them through a common logical position instead of assuming source and
+    destination arrays have the same layout.
+    """
+
+    logical_indices: npt.NDArray[np.int32]
+    physical_indices: npt.NDArray[np.int32]
+
+    def __post_init__(self):
+        logical_indices = np.asarray(self.logical_indices, dtype=np.int32).reshape(-1)
+        physical_indices = np.asarray(self.physical_indices, dtype=np.int32).reshape(
+            -1
+        )
+        if logical_indices.size != physical_indices.size:
+            raise ValueError(
+                "StateIndexMap logical and physical index counts must match, "
+                f"got logical={logical_indices.size}, physical={physical_indices.size}"
+            )
+        if np.unique(logical_indices).size != logical_indices.size:
+            raise ValueError("StateIndexMap logical indices must be unique")
+        object.__setattr__(self, "logical_indices", logical_indices)
+        object.__setattr__(self, "physical_indices", physical_indices)
+
+    def __len__(self) -> int:
+        return self.physical_indices.size
+
+    def pair_with(
+        self, destination: "StateIndexMap"
+    ) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+        """Return physical source/destination pages paired by logical page."""
+        if len(self) == 0:
+            return self.physical_indices, destination.physical_indices[:0]
+        if len(destination) == 0:
+            raise ValueError(
+                "Decode metadata is missing DSV4 logical state pages: "
+                f"{self.logical_indices.tolist()}"
+            )
+
+        destination_order = np.argsort(destination.logical_indices)
+        sorted_logical = destination.logical_indices[destination_order]
+        positions = np.searchsorted(sorted_logical, self.logical_indices)
+        found = (positions < sorted_logical.size) & (
+            sorted_logical[np.minimum(positions, sorted_logical.size - 1)]
+            == self.logical_indices
+        )
+        if not np.all(found):
+            missing = self.logical_indices[~found].tolist()
+            raise ValueError(
+                "Decode metadata is missing DSV4 logical state pages: "
+                f"{missing}"
+            )
+        return self.physical_indices, destination.physical_indices[
+            destination_order[positions]
+        ]
+
+
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.
