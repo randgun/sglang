@@ -515,13 +515,52 @@ class C4IndexerAscendBackendMixin:
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
+    def _ensure_index_cache_topk(self, num_tokens: int) -> None:
+        # Lazily allocate the cross-layer topk buffer (eager); graph path
+        # points _index_cache_topk at a stable slice (see _init_dsv4_graph_metadata).
+        if not self._index_cache_enabled:
+            return
+        buf = self._index_cache_topk
+        if buf is None or buf.shape[0] < num_tokens:
+            self._index_cache_topk = torch.full(
+                (num_tokens, self._dsv4_index_topk),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+    def _get_index_cache_topk(self, num_tokens: int) -> torch.Tensor:
+        # Skip layers read a [num_tokens, topk] slice instead of running the
+        # lightning indexer.
+        self._ensure_index_cache_topk(num_tokens)
+        return self._index_cache_topk[:num_tokens]
+
+    def _update_index_cache_topk(self, topk_indices: torch.Tensor) -> None:
+        # Non-skip layers refresh the buffer so downstream skip layers read fresh topk.
+        if not self._index_cache_enabled:
+            return
+        n = topk_indices.shape[0]
+        k = topk_indices.shape[-1]
+        self._ensure_index_cache_topk(n)
+        dst = self._index_cache_topk[:n, :k]
+        src = topk_indices
+        if src.dim() == 3 and src.shape[1] == 1:
+            src = src.squeeze(1)
+        dst.copy_(src)
+
     def _forward_prepare(
         self,
         c4_indexer,
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        skip_topk: bool = False,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # IndexCache skip path: only write indexer KV; q/weights feed only the
+        # lightning indexer, which is skipped.
+        if skip_topk:
+            c4_indexer.compressor(x, forward_batch)
+            return None, None
         q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
@@ -545,7 +584,12 @@ class C4IndexerAscendBackendMixin:
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
         q_lora_ready,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        skip_topk: bool = False,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # IndexCache skip path: run only the compressor, skip q/weights + indexer.
+        if skip_topk:
+            c4_indexer.compressor(x, forward_batch)
+            return None, None
         from sglang.srt.hardware_backend.npu.utils import (
             get_indexer_weight_stream,
         )
@@ -767,13 +811,37 @@ class C4IndexerAscendBackendMixin:
             not skip_compressor
         ), "skip_compressor=True is not supported on the NPU indexer path"
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
+
+        skip_topk = bool(getattr(c4_indexer, "skip_topk", False)) and (
+            self._index_cache_enabled
+        )
+        num_tokens = x.shape[0]
+
         if self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
-                c4_indexer, x, q_lora, forward_batch, q_lora_ready
+                c4_indexer,
+                x,
+                q_lora,
+                forward_batch,
+                q_lora_ready,
+                skip_topk=skip_topk,
             )
         else:
-            q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
+            q, weights = self._forward_prepare(
+                c4_indexer, x, q_lora, forward_batch, skip_topk=skip_topk
+            )
+
+        if skip_topk:
+            # IndexCache reuse: write indexer KV only, then reuse the upstream
+            # non-skip layer's topk from the shared buffer (skip q/weights + indexer).
+            self.forward_metadata.c4_topk_indices = self._get_index_cache_topk(
+                num_tokens
+            )
+            return
+
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
+        if self._index_cache_enabled:
+            self._update_index_cache_topk(topk_idxs)
         self.forward_metadata.c4_topk_indices = topk_idxs
 
 
@@ -803,6 +871,31 @@ class DeepseekV4AscendAttnBackend(
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
         self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
         self._dsv4_has_c128 = 128 in self._dsv4_compress_ratios
+
+        # IndexCache: cross-layer shared topk buffer. Non-skip c4 layers
+        # copy_ topk here; skip layers read a slice.
+        self._index_cache_enabled = (
+            bool(getattr(hf, "use_index_cache", False)) and self._dsv4_has_c4
+        )
+        # Lazy (eager) / graph slice (see _init_dsv4_graph_metadata).
+        self._index_cache_topk: Optional[torch.Tensor] = None
+
+        if self._index_cache_enabled:
+            from sglang.srt.configs.model_config import csa_layer_skips_topk
+
+            c4_ids = [i for i, r in enumerate(self._dsv4_compress_ratios) if r == 4]
+            skip_ids = [i for i in c4_ids if csa_layer_skips_topk(hf, i)]
+            logger.info(
+                "DSV4 IndexCache enabled: index_topk_freq=%s, "
+                "index_topk_pattern=%r, c4_layers=%d, skip_layers=%d "
+                "(skip_layer_ids=%s).",
+                getattr(hf, "index_topk_freq", 1),
+                getattr(hf, "index_topk_pattern", None),
+                len(c4_ids),
+                len(skip_ids),
+                skip_ids,
+            )
+
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
@@ -936,6 +1029,8 @@ class DeepseekV4AscendAttnBackend(
                 1024, dtype=torch.int32, device=device
             )
 
+        # Also reused as the IndexCache shared topk buffer (see
+        # _init_dsv4_graph_metadata).
         self.graph_metadata["c4_topk_indices"] = torch.full(
             (max_num_tokens, self._dsv4_index_topk),
             -1,
@@ -1039,6 +1134,10 @@ class DeepseekV4AscendAttnBackend(
 
         T = bs * tokens_per_req
         metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
+
+        # IndexCache reuses the c4_topk_indices graph slice.
+        if self._index_cache_enabled:
+            self._index_cache_topk = self.graph_metadata["c4_topk_indices"][:T, :]
 
         metadata.ori_sparse_indices = None
         metadata.ori_win_left = self._dsv4_sliding_window_size - 1
@@ -1378,7 +1477,8 @@ class DeepseekV4AscendAttnBackend(
         ):
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
-        fm.c4_topk_indices.fill_(-1)
+        # c4_topk_indices is not reset here: it doubles as the IndexCache
+        # shared buffer (skip layers reuse a prior write).
 
     def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
