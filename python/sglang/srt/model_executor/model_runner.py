@@ -370,7 +370,7 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = get_memory().enable_hisparse
+        self.enable_hisparse = server_args.enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()

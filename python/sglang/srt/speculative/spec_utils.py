@@ -262,6 +262,9 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
 def spec_need_hidden_states() -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
+    # Draft-prefetch: the decode draft forward is pre-run inside
+    # draft_prefetch and reads the hidden states produced by this round's
+    # draft_extend directly, so the relayed ones are never consumed.
     # TODO(lsyin): also skip when step == 1.
     spec = get_spec()
     if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
