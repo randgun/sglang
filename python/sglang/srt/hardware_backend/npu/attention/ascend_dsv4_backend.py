@@ -17,7 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
@@ -626,7 +626,7 @@ class C4IndexerAscendBackendMixin:
         forward_batch: ForwardBatch,
         skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch)
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
         if not skip_compressor:
@@ -678,7 +678,7 @@ class C4IndexerAscendBackendMixin:
         with torch.npu.stream(stream_q):
             if q_lora_ready is not None:
                 stream_q.wait_event(q_lora_ready)
-            q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+            q = self._compute_q_npu(c4_indexer, q_lora, forward_batch)
             q.record_stream(stream_q)
 
         cur.wait_stream(stream_w)
@@ -795,24 +795,22 @@ class C4IndexerAscendBackendMixin:
             c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
 
     def _compute_q_npu(
-        self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
+        self, c4_indexer, q_lora: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
 
+        positions = forward_batch.positions
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
         qk_nope = c4_indexer.head_dim - c4_indexer.rope_head_dim
-        # Position-gathered RoPE values are forward-local.  The rotary embedding
-        # object is shared, so retaining them there can leak target positions into
-        # NextN (or a previous graph replay) when the next batch has the same shape.
-        cos4, sin4 = Dsv4NpuRoPE.for_freqs(
-            c4_indexer.freqs_cis, getattr(c4_indexer, "rotary_emb", None)
-        ).get_cos_sin(
+        # Per-forward memo keyed on the c4 layers' freqs_cis (the indexer
+        # shares it), so every c4 layer reads one gather instead of its own.
+        cos4, sin4 = rope_cos_sin(
+            c4_indexer.freqs_cis,
+            getattr(c4_indexer, "rotary_emb", None),
+            forward_batch,
             positions,
             q.dtype,
-            view_4d=True,
-            allow_build=False,
-            cache_dtype=torch.float32,
         )
         Dsv4NpuRoPE.apply_rotary_mul_inplace(
             q,
