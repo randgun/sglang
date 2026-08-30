@@ -368,10 +368,16 @@ class CompressorAscendBackendMixin:
             else:
                 n_c_tokens = max(1, seq_lens_max // ratio)
             if ratio == 4:
-                slots = req_to_token[req_pool_64, : n_c_tokens * ratio]
-                c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
-                    torch.int32
+                col_idx = torch.arange(
+                    0,
+                    n_c_tokens * ratio,
+                    self.page_size,
+                    device=req_to_token.device,
                 )
+                slots = torch.index_select(
+                    torch.index_select(req_to_token, 1, col_idx), 0, req_pool_64
+                )
+                c_page_table = (slots // self.page_size).to(torch.int32)
             else:
                 c128_page_size = req_to_token_pool.c128_page_size
                 n_groups = (n_c_tokens + c128_page_size - 1) // c128_page_size
@@ -957,6 +963,9 @@ class DeepseekV4AscendAttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None
         }
+        # High-water mark of written page-table columns per shared graph
+        # buffer; see _copy_page_table_into_graph.
+        self._graph_table_high_water: dict[str, int] = {}
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1372,14 +1381,19 @@ class DeepseekV4AscendAttnBackend(
 
         self.forward_metadata = metadata
 
-    @staticmethod
-    def _copy_2d_with_tail(dst: torch.Tensor, src: torch.Tensor, val: int) -> None:
-        # Graph replay metadata buffers are sliced to the active bs; only the
-        # page-column tail needs the sentinel refresh.
+    def _copy_page_table_into_graph(self, key: str, src: torch.Tensor) -> None:
+        # Graph page tables live in buffers shared across bs buckets (each
+        # bucket's metadata holds a row slice), refreshed in place on replay.
+        full = self.graph_metadata[key]
         r, c = src.shape
-        dst[:r, :c].copy_(src)
-        if c < dst.shape[1]:
-            dst[:, c:].fill_(val)
+        full[:r, :c].copy_(src)
+        high = self._graph_table_high_water.get(key, 0)
+        if c < high:
+            # Full height, not just this replay's slice: other buckets'
+            # replays may have written rows beyond this bucket's row count.
+            full[:, c:high].fill_(-1)
+        elif c > high:
+            self._graph_table_high_water[key] = c
 
     @staticmethod
     def _copy_1d_with_zero_tail(dst: torch.Tensor, src: Optional[torch.Tensor]) -> None:
@@ -1533,7 +1547,7 @@ class DeepseekV4AscendAttnBackend(
         )
         for key in ("c4_page_table", "c128_page_table"):
             if key in result:
-                self._copy_2d_with_tail(getattr(ctx.fm, key), result[key], -1)
+                self._copy_page_table_into_graph(key, result[key])
 
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
@@ -1642,7 +1656,7 @@ class DeepseekV4AscendAttnBackend(
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             if 0 < max_seq_pages < swa_src.shape[1]:
                 swa_src = swa_src[:, :max_seq_pages]
-        self._copy_2d_with_tail(fm.swa_page_table, swa_src, -1)
+        self._copy_page_table_into_graph("swa_page_table", swa_src)
 
     def _refresh_graph_dspark_sparse_metadata(self, ctx) -> None:
         if not (self._is_dspark_draft_worker and ctx.graph_mode.is_target_verify()):
