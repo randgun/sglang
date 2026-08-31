@@ -289,6 +289,7 @@ class TestMultiStepDraftCompressedLocs(unittest.TestCase):
             out_cache_loc=bundle.out_full_loc,
             out_cache_loc_dsv4=bundle,
             seq_lens=torch.tensor([7, 11], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([7, 11], dtype=torch.int32),
         )
 
         with patch("torch.cumsum", side_effect=AssertionError("unexpected compaction")):
@@ -300,6 +301,46 @@ class TestMultiStepDraftCompressedLocs(unittest.TestCase):
         self.assertEqual(step.out_c128_loc.numel(), 0)
         self.assertEqual(step.out_c4_loc.dtype, bundle.out_c4_loc.dtype)
         self.assertEqual(step.out_c128_loc.dtype, bundle.out_c128_loc.dtype)
+
+    def test_routes_graph_host_mirror_through_fused_step_compress(self):
+        backend = DeepseekV4AscendMultiStepDraftBackend.__new__(
+            DeepseekV4AscendMultiStepDraftBackend
+        )
+        backend.topk = 1
+        backend.speculative_num_steps = 3
+        backend._needs_step_compressed_locs = True
+        bundle = SimpleNamespace(
+            out_full_loc=torch.arange(6, dtype=torch.int32),
+            out_swa_loc=torch.arange(10, 16, dtype=torch.int64),
+            out_c4_loc=torch.tensor([101, 102], dtype=torch.int64),
+            out_c128_loc=torch.tensor([201], dtype=torch.int64),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            out_cache_loc=bundle.out_full_loc,
+            out_cache_loc_dsv4=bundle,
+            seq_lens=torch.tensor([7, 127], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([7, 127], dtype=torch.int32),
+        )
+        fused = MagicMock(
+            return_value=(
+                torch.tensor([1, 4], dtype=torch.int32),
+                torch.tensor([11, 14], dtype=torch.int64),
+                torch.tensor([101], dtype=torch.int64),
+                torch.tensor([201], dtype=torch.int64),
+            )
+        )
+        module = ModuleType("sglang.srt.hardware_backend.npu.attention.dsv4_metadata")
+        module.step_compress = fused
+
+        with patch.dict(sys.modules, {module.__name__: module}):
+            step = backend._step_out_cache_loc_dsv4(forward_batch, step_id=1)
+
+        fused.assert_called_once()
+        self.assertEqual(step.out_full_loc.tolist(), [1, 4])
+        self.assertEqual(step.out_swa_loc.tolist(), [11, 14])
+        self.assertEqual(step.out_c4_loc.tolist(), [101])
+        self.assertEqual(step.out_c128_loc.tolist(), [201])
 
 
 class TestC4StateTransferLayout(unittest.TestCase):
@@ -520,7 +561,10 @@ class TestCompressorStateTableABI(unittest.TestCase):
         graph_mode.is_decode.return_value = False
         graph_mode.is_target_verify.return_value = False
         ctx = SimpleNamespace(
-            fm=SimpleNamespace(dsv4_cycle_state_block_table=table),
+            fm=SimpleNamespace(
+                dsv4_cycle_state_block_table=table,
+                dsv4_explicit_state_block_tables={},
+            ),
             forward_batch=SimpleNamespace(
                 req_pool_indices=torch.arange(7, 19, dtype=torch.int64)
             ),
@@ -542,6 +586,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
 
         self.assertIs(ctx.fm.dsv4_cycle_state_block_table, table)
         self.assertEqual(table.tolist(), [7])
+        backend._refresh_graph_explicit_state_block_tables.assert_not_called()
 
     @patch(
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
@@ -564,7 +609,10 @@ class TestCompressorStateTableABI(unittest.TestCase):
         }
         backend._dsv4_graph_tokens_per_req = 1
         backend._dsv4_index_topk = 1
-        backend._dsv4_state_pools_by_ratio = {}
+        backend._dsv4_state_pools_by_ratio = {
+            4: SimpleNamespace(dummy_state_loc=31),
+            128: SimpleNamespace(dummy_state_loc=63),
+        }
         backend._dsv4_sliding_window_size = 128
         backend._is_dspark_draft_worker = False
         forward_mode = MagicMock()
@@ -577,6 +625,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         self.assertIsNotNone(table)
         self.assertEqual(tuple(table.shape), (2,))
         self.assertEqual(table.dtype, torch.int32)
+        self.assertEqual(metadata.dsv4_explicit_state_block_tables, {})
 
     @patch(
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",

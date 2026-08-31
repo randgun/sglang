@@ -1343,18 +1343,26 @@ class DeepseekV4AscendAttnBackend(
             if _is_npu_arch35()
             else None
         )
-        metadata.dsv4_explicit_state_block_tables = {
-            ratio: torch.full(
-                (
-                    bs,
-                    (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                ),
-                state_pool.dummy_state_loc,
-                dtype=torch.int32,
-                device=device,
-            )
-            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-        }
+        # Atlas A5 consumes the request-bank cycle table above and must never
+        # receive the pre-A5 explicit per-token table. Do not allocate or refresh
+        # graph buffers that no A5 compressor reads.
+        metadata.dsv4_explicit_state_block_tables = (
+            {}
+            if _is_npu_arch35()
+            else {
+                ratio: torch.full(
+                    (
+                        bs,
+                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
+                    ),
+                    state_pool.dummy_state_loc,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+                if ratio in self._dsv4_unique_compress_ratios
+            }
+        )
 
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
@@ -1725,21 +1733,22 @@ class DeepseekV4AscendAttnBackend(
         fm.seqused.zero_()
 
     def _refresh_graph_explicit_state_block_tables(self, ctx) -> None:
+        from sglang.srt.hardware_backend.npu.attention.dsv4_metadata import (
+            _refresh_graph_explicit_state_block,
+        )
+
         fm = ctx.fm
         for ratio, fixed_table in fm.dsv4_explicit_state_block_tables.items():
-            fixed_table.copy_(
-                _build_explicit_state_block_table(
-                    compress_ratio=ratio,
-                    coff=2 if ratio == 4 else 1,
-                    state_pool=self._dsv4_state_pools_by_ratio[ratio],
-                    token_to_kv_pool=self.token_to_kv_pool,
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
-                    start_pos=fm.start_pos,
-                    cu_seqlens=fm.actual_seq_lengths_q_pa,
-                    seqused=fm.seqused,
-                    max_input_capacity=fm.dsv4_max_input_capacity,
-                )
+            _refresh_graph_explicit_state_block(
+                fixed_table,
+                compress_ratio=ratio,
+                state_pool=self._dsv4_state_pools_by_ratio[ratio],
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
+                start_pos=fm.start_pos,
+                seqused=fm.seqused,
+                cu_seqlens=fm.actual_seq_lengths_q_pa,
             )
 
     def _refresh_graph_swa_metadata_direct(self, ctx) -> None:
@@ -1839,7 +1848,8 @@ class DeepseekV4AscendAttnBackend(
             elif ctx.active_target_verify:
                 self._refresh_graph_target_verify_compress_1d_direct(ctx)
 
-        self._refresh_graph_explicit_state_block_tables(ctx)
+        if ctx.fm.dsv4_explicit_state_block_tables:
+            self._refresh_graph_explicit_state_block_tables(ctx)
 
         self._refresh_graph_swa_metadata_direct(ctx)
         self._refresh_graph_dspark_sparse_metadata(ctx)
@@ -2447,18 +2457,7 @@ class DeepseekV4AscendMultiStepDraftBackend:
         if step_width == 0 or bundle.out_full_loc.numel() < total_width:
             return bundle
 
-        full_steps = bundle.out_full_loc[:total_width].reshape(
-            step_width // self.topk, self.topk, self.speculative_num_steps
-        )
-        full_steps = full_steps.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
-        swa_steps = bundle.out_swa_loc[:total_width].reshape(
-            step_width // self.topk, self.topk, self.speculative_num_steps
-        )
-        swa_steps = swa_steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)
-
-        def step_compress(loc, ratio: int):
+        def step_compress_torch(loc, ratio: int):
             if loc is None or loc.numel() == 0:
                 return loc
             raw_bs = step_width // self.topk
@@ -2478,22 +2477,63 @@ class DeepseekV4AscendMultiStepDraftBackend:
             )[:, :, step_id].reshape(-1)
             return loc[step_offsets[step_mask].to(torch.int64)]
 
-        if self._needs_step_compressed_locs:
-            out_c4_loc = step_compress(bundle.out_c4_loc, 4)
-            out_c128_loc = step_compress(bundle.out_c128_loc, 128)
-        else:
-            out_c4_loc = (
-                None if bundle.out_c4_loc is None else bundle.out_c4_loc.new_empty((0,))
-            )
-            out_c128_loc = (
-                None
-                if bundle.out_c128_loc is None
-                else bundle.out_c128_loc.new_empty((0,))
+        raw_bs = step_width // self.topk
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if self._needs_step_compressed_locs and seq_lens_cpu is not None:
+            from sglang.srt.hardware_backend.npu.attention.dsv4_metadata import (
+                step_compress,
             )
 
+            full_step, swa_step, out_c4_loc, out_c128_loc = step_compress(
+                bundle.out_full_loc[:total_width],
+                bundle.out_swa_loc[:total_width],
+                bundle.out_c4_loc if self._needs_step_compressed_locs else None,
+                bundle.out_c128_loc if self._needs_step_compressed_locs else None,
+                forward_batch.seq_lens[:raw_bs],
+                seq_lens_cpu,
+                raw_bs=raw_bs,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                step_id=step_id,
+            )
+        else:
+            # Full/SWA extraction is a view. Keep that zero-launch path when no
+            # child consumes compressed locations; materializing it in Triton
+            # would add work to the current A5 draft configuration.
+            full_steps = bundle.out_full_loc[:total_width].reshape(
+                raw_bs, self.topk, self.speculative_num_steps
+            )
+            full_steps = full_steps.permute((2, 0, 1)).reshape(
+                self.speculative_num_steps, -1
+            )
+            swa_steps = bundle.out_swa_loc[:total_width].reshape(
+                raw_bs, self.topk, self.speculative_num_steps
+            )
+            swa_steps = swa_steps.permute((2, 0, 1)).reshape(
+                self.speculative_num_steps, -1
+            )
+            full_step = full_steps[step_id]
+            swa_step = swa_steps[step_id]
+            if self._needs_step_compressed_locs:
+                # Defensive eager fallback. Draft graph capture/replay supplies
+                # the host mirror, so its hot path uses the fused operator.
+                out_c4_loc = step_compress_torch(bundle.out_c4_loc, 4)
+                out_c128_loc = step_compress_torch(bundle.out_c128_loc, 128)
+            else:
+                out_c4_loc = (
+                    None
+                    if bundle.out_c4_loc is None
+                    else bundle.out_c4_loc.new_empty((0,))
+                )
+                out_c128_loc = (
+                    None
+                    if bundle.out_c128_loc is None
+                    else bundle.out_c128_loc.new_empty((0,))
+                )
+
         return DSV4OutCacheLoc(
-            out_full_loc=full_steps[step_id],
-            out_swa_loc=swa_steps[step_id],
+            out_full_loc=full_step,
+            out_swa_loc=swa_step,
             out_c4_loc=out_c4_loc,
             out_c128_loc=out_c128_loc,
         )
@@ -2501,12 +2541,18 @@ class DeepseekV4AscendMultiStepDraftBackend:
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):
         old_out_cache_loc = forward_batch.out_cache_loc
         old_out_cache_loc_dsv4 = forward_batch.out_cache_loc_dsv4
-        step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
+        step_bundle = self._step_out_cache_loc_dsv4(forward_batch, step_id)
+        if (
+            step_bundle is not None
+            and step_bundle is not old_out_cache_loc_dsv4
+            and step_bundle.out_full_loc is not None
+        ):
+            step_out_cache_loc = step_bundle.out_full_loc
+        else:
+            step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
         if step_out_cache_loc is not None:
             forward_batch.out_cache_loc = step_out_cache_loc
-        forward_batch.out_cache_loc_dsv4 = self._step_out_cache_loc_dsv4(
-            forward_batch, step_id
-        )
+        forward_batch.out_cache_loc_dsv4 = step_bundle
         try:
             return call_fn()
         finally:
@@ -2524,7 +2570,6 @@ class DeepseekV4AscendMultiStepDraftBackend:
             forward_mode=ForwardMode.DECODE,
         )
         old_bundle = forward_batch.out_cache_loc_dsv4
-        step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
         step_bundle = self._step_out_cache_loc_dsv4(forward_batch, step_id)
         step_fb.out_cache_loc_dsv4 = step_bundle
         step_fb.global_forward_mode = getattr(
@@ -2536,8 +2581,10 @@ class DeepseekV4AscendMultiStepDraftBackend:
             and step_bundle.out_full_loc is not None
         ):
             step_fb.out_cache_loc = step_bundle.out_full_loc
-        elif step_out_cache_loc is not None:
-            step_fb.out_cache_loc = step_out_cache_loc
+        else:
+            step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
+            if step_out_cache_loc is not None:
+                step_fb.out_cache_loc = step_out_cache_loc
         return step_fb
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
