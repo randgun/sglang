@@ -27,9 +27,122 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import triton
+import triton.language as tl
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+
+# ---------------------------------------------------------------------------
+# Triton kernels for maybe_build_dsv4_verify_bundle
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _dsv4_flatten_interval_kernel(
+    table_ptr,
+    req_indices_ptr,
+    starts_ptr,
+    ends_ptr,
+    offsets_ptr,
+    out_ptr,
+    num_pages,
+    page_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    req_idx = tl.load(req_indices_ptr + req).to(tl.int64)
+    start = tl.load(starts_ptr + req)
+    end = tl.load(ends_ptr + req)
+    out_offset = tl.load(offsets_ptr + req)
+
+    length = end - start
+    pos_offs = tl.arange(0, BLOCK)
+    mask = pos_offs < length
+    positions = start + pos_offs
+    page_col = positions // page_size
+    row_ptr = table_ptr + req_idx * num_pages
+    pages = tl.load(row_ptr + page_col, mask=mask, other=0)
+    result = pages * page_size + (positions % page_size)
+    tl.store(out_ptr + out_offset + pos_offs, result, mask=mask)
+
+
+@triton.jit
+def _dsv4_filter_div4_kernel(
+    in_ptr,
+    out_ptr,
+    count_ptr,
+    N,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    vals = tl.load(in_ptr + offs, mask=mask, other=0)
+    valid = (vals >= 0) & ((vals % 4) == 3)
+    valid_int = valid.to(tl.int32)
+    incl = tl.cumsum(valid_int, axis=0)
+    excl = incl - valid_int
+    tl.store(out_ptr + excl, vals // 4, mask=mask & valid)
+    tl.store(count_ptr, tl.sum(valid_int, axis=0))
+
+
+def _flatten_interval_triton(
+    table: torch.Tensor,
+    req_indices_cpu: torch.Tensor,
+    live_seq_lens_cpu: torch.Tensor,
+    verify_len: int,
+    ratio: int,
+    page_size: int,
+) -> torch.Tensor:
+    num_reqs = len(req_indices_cpu)
+    if num_reqs == 0:
+        return table.new_empty((0,))
+
+    starts_cpu = live_seq_lens_cpu[:num_reqs] // ratio
+    ends_cpu = (live_seq_lens_cpu[:num_reqs] + verify_len) // ratio
+    lengths_cpu = (ends_cpu - starts_cpu).clamp(min=0)
+    total_len = int(lengths_cpu.sum().item())
+    if total_len == 0:
+        return table.new_empty((0,))
+
+    offsets_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+    if num_reqs > 1:
+        offsets_cpu[1:] = lengths_cpu.cumsum(0)[:-1]
+
+    device = table.device
+    req_indices_dev = req_indices_cpu[:num_reqs].to(device=device)
+    starts_dev = starts_cpu.to(device=device, dtype=torch.int32)
+    ends_dev = ends_cpu.to(device=device, dtype=torch.int32)
+    offsets_dev = offsets_cpu.to(device=device, dtype=torch.int32)
+
+    out = torch.empty(total_len, dtype=table.dtype, device=device)
+    num_pages = table.shape[1]
+    max_len = int(lengths_cpu.max().item())
+    BLOCK = triton.next_power_of_2(max(1, max_len))
+
+    _dsv4_flatten_interval_kernel[(num_reqs,)](
+        table, req_indices_dev, starts_dev, ends_dev, offsets_dev, out,
+        num_pages, page_size, BLOCK=BLOCK,
+    )
+    return out
+
+
+def _filter_div4_triton(in_tensor: torch.Tensor) -> torch.Tensor:
+    N = in_tensor.numel()
+    if N == 0:
+        return in_tensor.new_empty((0,))
+
+    BLOCK = min(triton.next_power_of_2(N), 8192)
+    if N > BLOCK:
+        return in_tensor[(in_tensor >= 0) & ((in_tensor % 4) == 3)] // 4
+
+    count = torch.zeros(1, dtype=torch.int32, device=in_tensor.device)
+    out = torch.empty(N, dtype=in_tensor.dtype, device=in_tensor.device)
+    _dsv4_filter_div4_kernel[(1,)](
+        in_tensor, out, count, N, BLOCK=BLOCK,
+    )
+    total = int(count.item())
+    return out[:total]
 
 
 def maybe_write_dsv4_extend(
@@ -245,39 +358,30 @@ def maybe_build_dsv4_verify_bundle(
     if reserve_bundle is None:
         return None
 
-    req_indices = batch.req_pool_indices_cpu.tolist()
+    req_indices = batch.req_pool_indices_cpu
 
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens_cpu
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
-    live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
-
-    verify_lens = [int(draft_token_num)] * len(req_indices)
-
-    def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
-        page_size = pool.c128_page_size
-        chunks = []
-        for req_idx, live_seq_len, verify_len in zip(
-            req_indices, live_seq_lens, verify_lens
-        ):
-            start = int(live_seq_len) // ratio
-            end = (int(live_seq_len) + int(verify_len)) // ratio
-            if end > start:
-                positions = torch.arange(start, end, device=table.device)
-                pages = table[int(req_idx), positions // page_size]
-                chunks.append(pages * page_size + positions % page_size)
-        return torch.cat(chunks) if chunks else table.new_empty((0,))
 
     out_full_loc = batch.out_cache_loc
-    out_c4_loc = out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4
+    out_c4_loc = _filter_div4_triton(out_full_loc)
+    out_c128_loc = _flatten_interval_triton(
+        pool.req_to_c128_sidecar,
+        req_indices,
+        live_seq_lens_cpu,
+        draft_token_num,
+        ratio=128,
+        page_size=pool.c128_page_size,
+    )
     return type(reserve_bundle)(
         out_full_loc=out_full_loc,
         out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
             out_full_loc
         ),
         out_c4_loc=out_c4_loc,
-        out_c128_loc=flatten_interval(pool.req_to_c128_sidecar, 128),
+        out_c128_loc=out_c128_loc,
     )
 
 
