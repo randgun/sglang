@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel_npu.utils.triton_utils import get_device_properties
+
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 
