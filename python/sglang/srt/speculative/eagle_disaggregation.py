@@ -28,6 +28,16 @@ def build_eagle_disagg_draft_input(
     num_states = spec.speculative_eagle_topk
     if spec.enable_multi_layer_eagle:
         num_states *= spec.speculative_num_steps
+    elif (
+        spec.enable_draft_prefetch and spec.speculative_num_steps > 1
+    ):
+        # Draft-prefetch: the prefill engine pre-concatenated the seed to the
+        # candidate width (steps * topk) and normalized it to target-vocab ids
+        # (see _pad_topk_for_draft_prefetch). Keep the full width here -- the
+        # first decode round's prepare_verify_fully_async_decoding runs
+        # torch.topk(num_draft_tokens - 1) over it, which crashes on a
+        # width-1 seed and merge_batch needs matching widths anyway.
+        num_states *= spec.speculative_num_steps
 
     topk_p = torch.stack(
         [

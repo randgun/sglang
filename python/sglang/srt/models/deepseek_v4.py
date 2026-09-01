@@ -1118,16 +1118,21 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        # NPU multi-stream: KV on stream_kv, Q on stream_q, overlapped with
-        # indexer/compressor on current. rope is split; the kv-only call passes
-        # kv.unsqueeze(1) as q_rope so the op sees [T,1,1,head_dim] like the
-        # fused path.
+        # NPU 3-block Cube/Vector prolog + compressor/indexer overlap.
+        #
+        # The Ascend NPU has physically independent Cube (matmul) and Vector
+        # (norm/rope/quant) execution units.  By splitting each path into a
+        # Cube phase and a Vector phase, the hardware scheduler can overlap
+        # Cube from one stream with Vector from another.
+        #
+        # Block 1 (Cube):  stream_kv does wkv[C], stream_q does wq_b[C]
+        # Block 2 (Vector): stream_kv does norm+rope+store[V], stream_q does norm+rope[V]
+        # Parallel:        stream_cmp does compressor[C+V], current does indexer[C+V]
         assert self.alt_streams is not None
         current_stream = torch.npu.current_stream()
         stream_kv = self.alt_streams[0]
         stream_q = self.alt_streams[1]
-        stream_kv.wait_stream(current_stream)
-        stream_q.wait_stream(current_stream)
+        stream_compressor = self.alt_streams[2]
 
         x_linear = x_quant if x_quant is not None else x
         qkv_a: Optional[torch.Tensor] = None
@@ -1142,14 +1147,37 @@ class MQALayer(MqaAttentionBase):
         q_lora = self.q_norm(q_lora)
         q_lora_ready = current_stream.record_event()
 
-        # KV block on stream_kv.
+        # ── Compressor on stream_compressor (early start, only needs x) ──
+        # Overlaps with Q/KV/indexer.  Started before the Q/KV fork so its
+        # Cube phase precedes the Q/KV Cube phase, reducing Cube contention.
+        has_compressor = self.compressor is not None
+        if has_compressor:
+            stream_compressor.wait_stream(current_stream)
+            with torch.npu.stream(stream_compressor):
+                attn_backend.forward_core_compressor(
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                )
+
+        # ── Block 1: Cube phase — KV and Q matmuls on separate streams ──
         with torch.npu.stream(stream_kv):
+            stream_kv.wait_stream(current_stream)
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
             else:
                 kv, _ = self.wkv(x)
+
+        with torch.npu.stream(stream_q):
+            stream_q.wait_event(q_lora_ready)
+            q, _ = self.wq_b(q_lora)
+            q = q.view(-1, self.n_local_heads, self.head_dim)
+
+        # ── Block 2: Vector phase — norm + rope + store overlap ──
+        with torch.npu.stream(stream_kv):
             kv = self.kv_norm(kv)
             cos4_k, sin4_k = self._get_npu_rope_position_cache(
                 forward_batch, positions, kv.dtype, inverse=False
@@ -1167,11 +1195,7 @@ class MQALayer(MqaAttentionBase):
                 forward_batch=forward_batch,
             )
 
-        # Q block on stream_q (needs only q_lora).
         with torch.npu.stream(stream_q):
-            stream_q.wait_event(q_lora_ready)
-            q, _ = self.wq_b(q_lora)
-            q = q.view(-1, self.n_local_heads, self.head_dim)
             q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
@@ -1189,7 +1213,7 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
-        # Indexer + compressor: serial on current.
+        # ── Indexer on current stream (parallel with Q/KV/compressor) ──
         if self.indexer is not None:
             self.indexer(
                 x=x,
@@ -1197,17 +1221,12 @@ class MQALayer(MqaAttentionBase):
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
             )
-        if self.compressor is not None:
-            attn_backend.forward_core_compressor(
-                x,
-                forward_batch,
-                self.layer_id,
-                self.compressor,
-            )
 
-        # Join stream_kv + stream_q before downstream attention.
+        # ── Join all streams before downstream attention ──
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_q)
+        if has_compressor:
+            current_stream.wait_stream(stream_compressor)
         return q
 
     def _forward_prepare_multi_stream_hip(
