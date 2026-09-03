@@ -1992,31 +1992,15 @@ class DeepseekV4AscendMultiStepDraftBackend:
         )
         swa_steps = swa_steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)
 
-        def step_compress(loc, ratio: int):
-            if loc is None or loc.numel() == 0:
-                return loc
-            raw_bs = step_width // self.topk
-            seq_lens = forward_batch.seq_lens[:raw_bs].to(torch.int64)
-            positions = seq_lens[:, None, None] + torch.arange(
-                self.speculative_num_steps,
-                device=seq_lens.device,
-                dtype=seq_lens.dtype,
-            )
-            positions = positions.expand(-1, self.topk, -1)
-            should_compress = ((positions + 1) % ratio) == 0
-            counts = should_compress.reshape(-1).to(torch.int64)
-            offsets = torch.cumsum(counts, dim=0) - counts
-            step_mask = should_compress[:, :, step_id].reshape(-1)
-            step_offsets = offsets.reshape(
-                raw_bs, self.topk, self.speculative_num_steps
-            )[:, :, step_id].reshape(-1)
-            return loc[step_offsets[step_mask].to(torch.int64)]
-
+        # Draft worker has _dsv4_compress_ratios cleared, so compress
+        # metadata is never built and C4/C128 locs are never consumed.
+        # Passing None avoids a position-offset mismatch (forward_batch.seq_lens
+        # is post-write) that caused out-of-bounds indexing in step_compress.
         return DSV4OutCacheLoc(
             out_full_loc=full_steps[step_id],
             out_swa_loc=swa_steps[step_id],
-            out_c4_loc=step_compress(bundle.out_c4_loc, 4),
-            out_c128_loc=step_compress(bundle.out_c128_loc, 128),
+            out_c4_loc=None,
+            out_c128_loc=None,
         )
 
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):
