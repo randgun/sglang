@@ -51,21 +51,21 @@ def _rope_fq4(x, freqs, rope_dim):
     return fake_quant_fp4(rope_tail(x, freqs, rope_dim))
 
 
-def token_req_indices(forward_batch) -> torch.Tensor:
+def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     """req_pool_indices repeated once per token of the batch."""
     req = forward_batch.req_pool_indices.to(torch.int64)
     if forward_batch.forward_mode.is_decode():
         return req
+    if forward_batch.forward_mode.is_target_verify():
+        return torch.repeat_interleave(
+            req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
+        )
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend and decode only"
     )
-    req = torch.repeat_interleave(
-        req, forward_batch.extend_seq_lens.to(torch.int64)
+    return torch.repeat_interleave(
+        req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
     )
-    target_len = forward_batch.positions.shape[0]
-    if req.shape[0] < target_len:
-        req = torch.cat([req, req.new_zeros(target_len - req.shape[0])])
-    return req
 
 
 def topk_from_scores(

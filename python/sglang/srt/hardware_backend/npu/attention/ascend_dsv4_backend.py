@@ -1138,22 +1138,23 @@ class DeepseekV4AscendAttnBackend(
         block_tables_shape = self.graph_metadata["block_tables"].shape
         max_pages = block_tables_shape[1]
 
-        # -1 = invalid-page sentinel; full max_pages width keeps the replay
-        # in-place copy shape-aligned across seq lengths.
-        self.graph_metadata["swa_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        # 0 = dummy page (req_to_token init value); -1 would sign-extend to
+        # 0xFFFFFFFFFFFFFFFF in int64 inside NPU attention kernels,
+        # exceeding the 48-bit GM address space.
+        self.graph_metadata["swa_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c1_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c1_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c2_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c2_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c4_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c4_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c128_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c128_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
 
         # 1024 int32 per kernel-metadata buffer (fixed op metadata size).
@@ -1342,7 +1343,13 @@ class DeepseekV4AscendAttnBackend(
         if c < high:
             # Full height, not just this replay's slice: other buckets'
             # replays may have written rows beyond this bucket's row count.
-            full[:, c:high].fill_(-1)
+            # Use 0 (dummy page) instead of -1: NPU attention kernels compute
+            # GM addresses as page_id * page_size * dim; -1 sign-extends to
+            # 0xFFFFFFFFFFFFFFFF in int64, exceeding the 48-bit GM address
+            # space and triggering "GM address exceeds 48 bits" AI Core errors.
+            # Page 0 is the reserved dummy slot (req_to_token init value),
+            # guaranteeing a valid in-range address for out-of-bounds reads.
+            full[:, c:high].fill_(0)
         elif c > high:
             self._graph_table_high_water[key] = c
 
@@ -1593,7 +1600,11 @@ class DeepseekV4AscendAttnBackend(
             if ratio in (1, 2) and raw_loc is not None and raw_loc.numel() > 0:
                 # Derive c1/c2 loc from out_cache_loc: loc = full_loc // ratio
                 # for tokens that complete a group; matches the eager path.
+                # Graph replay pads positions to capture bucket width while
+                # out_cache_loc stays at raw_bs; align positions to loc length.
                 pos = ctx.forward_batch.positions.to(torch.int64)
+                n_loc = raw_loc.numel()
+                pos = pos[:n_loc]
                 completes = (pos + 1) % ratio == 0
                 loc = torch.where(
                     completes,
@@ -2772,7 +2783,7 @@ class DeepseekV4AscendAttnBackend(
         if forward_batch.forward_mode.is_idle():
             return
 
-        req = token_req_indices(forward_batch)
+        req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
         pos = positions.to(torch.int64)
         fm = self.forward_metadata
         if layer.compressor is not None:

@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_div, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -945,6 +945,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_ptrs.append(t.data_ptr())
             data_lens.append(t.nbytes)
             item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
+        # V4.1 pair state (ratio-2): per-layer kv + score tensors, each
+        # [num_req_slots+1, head_dim] float32, addressed by req_pool_idx.
+        if is_npu():
+            for layer_id in sorted(self.c2_pair_kv_state):
+                for t in (
+                    self.c2_pair_kv_state[layer_id],
+                    self.c2_pair_score_state[layer_id],
+                ):
+                    data_ptrs.append(t.data_ptr())
+                    data_lens.append(t.nbytes)
+                    item_lens.append(t[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
     def _make_kv_pool(
@@ -1258,6 +1269,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 half = rows.shape[-1] // 2
                 rows[:, :half].zero_()
                 rows[:, half:].fill_(float("-inf"))
+
+        # V4.1 pair state (ratio-2): clear kv and score for this req slot
+        # so the D node starts from zeros before receiving PD transfer.
+        if is_npu():
+            for layer_id in self.c2_pair_kv_state:
+                self.c2_pair_kv_state[layer_id][req_pool_idx].zero_()
+                self.c2_pair_score_state[layer_id][req_pool_idx].zero_()
 
     def clear_unaccepted_c128_draft_states(
         self,

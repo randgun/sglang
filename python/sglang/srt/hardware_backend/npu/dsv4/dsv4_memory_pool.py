@@ -26,6 +26,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DSV41_INDEX_PAGE_SIZE,
     ONLINE_C128,
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
@@ -249,6 +250,16 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 index_k_scale.to(index_scale_cache.dtype).view(-1, 1, 1),
             )
 
+    @property
+    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
+        """NPU indexer uses separate index_k_buffer and index_scale_buffer
+        (not the base packed index_k_with_scale_buffer). Flatten each to 2D
+        page rows so the base ratio-ordered PD loop picks them up correctly."""
+        return [
+            buf.view(torch.uint8).flatten(1)
+            for buf in (*self.index_k_buffer, *self.index_scale_buffer)
+        ]
+
     def get_index_k_dequant(
             self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -421,17 +432,77 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """Main PD buffers addressed by the full KV page id."""
-        buffers = (
-            self.c4_kv_pool.kv_buffer
-            + self.c4_indexer_kv_pool.index_k_buffer
-            + self.c4_indexer_kv_pool.index_scale_buffer
-        )
-        return (
-            [buf.data_ptr() for buf in buffers],
-            [buf.nbytes for buf in buffers],
-            [buf[0].nbytes for buf in buffers],
-        )
+        """Main PD buffers addressed by the full KV page id.
+
+        NPU buffers are 4D PA_ND (num_pages, kernel_page_size, 1, dim), not
+        the 2D (pages, dim) shape the base class asserts. Flatten each buffer
+        to 2D page rows so the PD page-block transfer (one item = one FULL
+        page = one KV row) keeps working. V4.1 (ratios 1/2) reuses this path
+        via the plain SWA allocator, so we must respect the base ratio order
+        (4, 128, 1, 2)."""
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        page_size = self.page_size
+
+        # ratio 4: KV + indexer (index_k + index_scale)
+        for buf in self.c4_kv_pool.kv_buffer:
+            flat = buf.view(torch.uint8).flatten(1) if buf.ndim > 2 else buf
+            data_ptrs.append(flat.data_ptr())
+            data_lens.append(flat.nbytes)
+            item_lens.append(flat[0].nbytes)
+        for buf in self.c4_indexer_kv_pool.contiguous_page_row_buffers:
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes)
+
+        # ratio 128: KV only (V4.1 has no c128 pool)
+        if self.c128_kv_pool is not None:
+            for buf in self.c128_kv_pool.kv_buffer:
+                flat = buf.view(torch.uint8).flatten(1) if buf.ndim > 2 else buf
+                data_ptrs.append(flat.data_ptr())
+                data_lens.append(flat.nbytes)
+                item_lens.append(flat[0].nbytes)
+
+        # ratio 1: KV (V4.1 only)
+        if self.c1_kv_pool is not None:
+            for buf in self.c1_kv_pool.kv_buffer:
+                flat = buf.view(torch.uint8).flatten(1) if buf.ndim > 2 else buf
+                data_ptrs.append(flat.data_ptr())
+                data_lens.append(flat.nbytes)
+                item_lens.append(flat[0].nbytes)
+            idx_pool = self.low_ratio_index_pools.get(1)
+            if idx_pool is not None:
+                # DSV41_INDEX_PAGE_SIZE=64 but full page_size=128: one full
+                # page covers 2 indexer pages, so item_len must count both.
+                index_pages_per_full_page = page_size // (
+                    DSV41_INDEX_PAGE_SIZE * 1
+                )
+                assert page_size % (DSV41_INDEX_PAGE_SIZE * 1) == 0
+                for buf in idx_pool.contiguous_page_row_buffers:
+                    data_ptrs.append(buf.data_ptr())
+                    data_lens.append(buf.nbytes)
+                    item_lens.append(buf[0].nbytes * index_pages_per_full_page)
+
+        # ratio 2: KV (V4.1 only)
+        if self.c2_kv_pool is not None:
+            for buf in self.c2_kv_pool.kv_buffer:
+                flat = buf.view(torch.uint8).flatten(1) if buf.ndim > 2 else buf
+                data_ptrs.append(flat.data_ptr())
+                data_lens.append(flat.nbytes)
+                item_lens.append(flat[0].nbytes)
+            idx_pool = self.low_ratio_index_pools.get(2)
+            if idx_pool is not None:
+                index_pages_per_full_page = page_size // (
+                    DSV41_INDEX_PAGE_SIZE * 2
+                )
+                assert page_size % (DSV41_INDEX_PAGE_SIZE * 2) == 0
+                for buf in idx_pool.contiguous_page_row_buffers:
+                    data_ptrs.append(buf.data_ptr())
+                    data_lens.append(buf.nbytes)
+                    item_lens.append(buf[0].nbytes * index_pages_per_full_page)
+
+        return data_ptrs, data_lens, item_lens
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
@@ -490,6 +561,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_c128_kv_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        if self.c128_kv_pool is None:
+            return [], [], []  # V4.1 has no c128 pool
         buffers = self.c128_kv_pool.kv_buffer
         return (
             [buf.data_ptr() for buf in buffers],
