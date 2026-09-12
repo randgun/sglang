@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -1024,6 +1025,13 @@ class CommonKVManager(BaseKVManager):
         c128_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 128)
 
         if state_type == StateType.C128_STATE:
+            # V4.1 has no c128 layers; the C128_STATE component carries
+            # ratio-2 pair state buffers instead.  Pair state is per-layer
+            # and request-scoped (not PP-bucketed like c128), so when there
+            # are no c128 layers, return src/dst as-is (src is already
+            # PP-filtered on the prefill side).
+            if c128_full == 0 and is_npu():
+                return src_kv_ptrs, list(dst_kv_ptrs)
             return src_kv_ptrs, list(dst_kv_ptrs[c128_off_s:c128_off_e])
 
         if state_type == StateType.SWA_RING:
