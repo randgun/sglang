@@ -3019,7 +3019,7 @@ class DeepseekV4Model(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank or (_is_npu and self.pp_group.is_last_rank):
             embedding_quant_config = (
                 quant_config
                 if quant_config is not None and quant_config.get_name() == "expert_pack"
