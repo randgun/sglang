@@ -39,6 +39,16 @@ before any vector arithmetic starts.  The wrapper asserts
 ``k_buf.numel() < 2**31`` so the K-row offsets cannot wrap (the escape hatch
 for larger pools is the legacy kernel below).
 
+The K tile load has a contiguous-run fast path.  A data-dependent 2D gather
+(``k_buf[slots]``) lowers to element-wise copies on the Vector unit and was
+measured as the dominant cost (183 GFLOP of dots ran at 2.6 TFLOPS); when a
+tile's slots form one consecutive run -- the near-universal case for
+prefill's sequential allocation, and always true inside a pool page -- the
+kernel loads through an affine address instead, which vectorizes.  Arbitrary
+page-table layouts fall back to the gather.  With a paged pool, choosing
+``BLOCK_N = page_size // ratio`` keeps every tile inside one page and
+maximizes fast-path coverage.
+
 Masking (fused in-kernel):
   - causal: position j visible iff j < lens[t] = (pos[t] + 1) // ratio,
     invalid positions written as -inf;
@@ -173,11 +183,29 @@ def _index_score_kernel(
     offs_h = tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
 
-    # ---- 所有独立 load 一起发出，让 MTE2 在 Cube 计算期间搬运 ----
-    # K tile [BLOCK_N, BLOCK_D]：原始量化值（scale 已因式分解到 epilogue，
-    # 见模块 docstring）。D=128 时每行恰好 128B，gather 对 L2 友好。
-    k_ptrs = k_buf_ptr + slots[:, None] * D + offs_d[None, :]
-    k_v = tl.load(k_ptrs, mask=valid[:, None] & d_mask[None, :], other=0.0)
+    # ---- K tile [BLOCK_N, BLOCK_D]：原始量化值（scale 已因式分解到
+    # epilogue，见模块 docstring）。数据依赖下标的 2D gather 在 AIV 上会
+    # 退化成逐元素搬运（实测 183 GFLOP 只跑出 2.6 TFLOPS 的主因）；
+    # prefill 的顺序/分页分配下 tile 内 slots 几乎总是连续（分页池页内
+    # 必连续），检测到连续就改用 affine 地址，让 load 走向量化块拷贝；
+    # 任意页表布局仍落回 gather 慢路径。无效 lane 不参与判定，边界 tile
+    # 的有效前缀同样走快路径。
+    idx_n = tl.arange(0, BLOCK_N)
+    slot0 = tl.sum(tl.where(idx_n == 0, slots, 0))  # 标量：slots[0]
+    is_run = tl.sum(tl.where(valid, slots != slot0 + idx_n, 0)) == 0
+    k_mask = valid[:, None] & d_mask[None, :]
+    if is_run:
+        k_v = tl.load(
+            k_buf_ptr + (slot0 + idx_n)[:, None] * D + offs_d[None, :],
+            mask=k_mask,
+            other=0.0,
+        )
+    else:
+        k_v = tl.load(
+            k_buf_ptr + slots[:, None] * D + offs_d[None, :],
+            mask=k_mask,
+            other=0.0,
+        )
 
     # q^T tile [BLOCK_D, BLOCK_H]：d 轴（axis 0）连续，一次 load 覆盖全部
     # 头 —— 旧实现每个头循环迭代都要重新加载一遍 q_h。
