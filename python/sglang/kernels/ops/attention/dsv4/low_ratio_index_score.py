@@ -39,15 +39,20 @@ before any vector arithmetic starts.  The wrapper asserts
 ``k_buf.numel() < 2**31`` so the K-row offsets cannot wrap (the escape hatch
 for larger pools is the legacy kernel below).
 
-The K tile load has a contiguous-run fast path.  A data-dependent 2D gather
-(``k_buf[slots]``) lowers to element-wise copies on the Vector unit and was
-measured as the dominant cost (183 GFLOP of dots ran at 2.6 TFLOPS); when a
-tile's slots form one consecutive run -- the near-universal case for
-prefill's sequential allocation, and always true inside a pool page -- the
-kernel loads through an affine address instead, which vectorizes.  Arbitrary
-page-table layouts fall back to the gather.  With a paged pool, choosing
-``BLOCK_N = page_size // ratio`` keeps every tile inside one page and
-maximizes fast-path coverage.
+The K tile load has an affine fast path (``AFFINE_K``).  A data-dependent
+2D gather (``k_buf[slots]``) lowers to element-wise copies on the Vector
+unit and was measured as the dominant cost (183 GFLOP of dots ran at
+2.6 TFLOPS).  When the caller passes ``page_size`` and
+``page_size % (BLOCK_N * ratio) == 0``, no tile straddles a pool page, so
+its slots are one consecutive run by construction (intra-page token indices
+are consecutive and page starts are divisible by ``ratio``): the kernel
+then loads K and the dequant scale through affine addresses, which
+vectorize, and needs only a scalar load of the tile's first slot.  Any
+other layout (or a missing ``page_size``) falls back to the general gather.
+The choice is a constexpr made by the wrapper -- a runtime branch here
+breaks triton-ascend's lowering.  With a paged pool, ``BLOCK_N =
+page_size // ratio`` (the default, 64 for page 128 / ratio 2) maximizes
+fast-path coverage.
 
 Masking (fused in-kernel):
   - causal: position j visible iff j < lens[t] = (pos[t] + 1) // ratio,
@@ -86,7 +91,9 @@ against the bf16 path before enabling it in production.
 
 Environment knobs:
   - SGLANG_DSV4_INDEX_SCORE_BLOCK_N: position tiling (ignored for the
-    candidate-source layer, where BLOCK_N == block size).  Default 128.
+    candidate-source layer, where BLOCK_N == block size).  Default 64 ==
+    page_size(128) // ratio(2), one tile per pool page so the contiguous-run
+    fast path always hits; override with page_size // ratio on other pools.
   - SGLANG_DSV4_INDEX_SCORE_FP8_DOT=1: run the dot in e4m3 x e4m3 (arch35
     fp8 pools only; bf16 dot otherwise).
   - SGLANG_DSV4_INDEX_SCORE_VEC=1: launch the legacy pure-Vector kernel
@@ -139,6 +146,7 @@ def _index_score_kernel(
     HAS_CONSUME: tl.constexpr,
     IS_CANDIDATE_SOURCE: tl.constexpr,
     K_QUANTIZED: tl.constexpr,
+    AFFINE_K: tl.constexpr,
     Q_FP8: tl.constexpr,
 ):
     t = tl.program_id(0)
@@ -172,40 +180,56 @@ def _index_score_kernel(
     # 已经填 0，不需要额外的 tl.where 保护。
     r = tl.load(req_ptr + t).to(tl.int64)
     rtt_row = req_to_token_ptr + r * stride_rtt
-    full = tl.load(rtt_row + offs_n * RATIO, mask=valid, other=0)
-    if RATIO == 2:
-        slots = full >> 1  # full >= 0：移位与 // 等价，且免掉向量整除
-    else:
-        slots = full
 
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < D
     offs_h = tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
+    k_mask = valid[:, None] & d_mask[None, :]
 
     # ---- K tile [BLOCK_N, BLOCK_D]：原始量化值（scale 已因式分解到
-    # epilogue，见模块 docstring）。数据依赖下标的 2D gather 在 AIV 上会
-    # 退化成逐元素搬运（实测 183 GFLOP 只跑出 2.6 TFLOPS 的主因）；
-    # prefill 的顺序/分页分配下 tile 内 slots 几乎总是连续（分页池页内
-    # 必连续），检测到连续就改用 affine 地址，让 load 走向量化块拷贝；
-    # 任意页表布局仍落回 gather 慢路径。无效 lane 不参与判定，边界 tile
-    # 的有效前缀同样走快路径。
-    idx_n = tl.arange(0, BLOCK_N)
-    slot0 = tl.sum(tl.where(idx_n == 0, slots, 0))  # 标量：slots[0]
-    is_run = tl.sum(tl.where(valid, slots != slot0 + idx_n, 0)) == 0
-    k_mask = valid[:, None] & d_mask[None, :]
-    if is_run:
+    # epilogue，见模块 docstring）。两种取数方式由 wrapper 按
+    # page_size % (BLOCK_N * ratio) == 0 静态选择（不做运行时分支——
+    # 载入路径不一致的 scf.if 会让 triton-ascend 的 lowering 失败）：
+    #   * AFFINE_K：tile 不跨页 => 页内下标连续、页起点可被 ratio 整除，
+    #     slots 必为一段连续 run。只需标量加载首个 slot，K/scale 全部
+    #     affine 寻址 —— 无数据依赖下标，装载走向量化块拷贝（数据依赖
+    #     的 2D gather 在 AIV 上会退化成逐元素搬运，是实测只有
+    #     2.6 TFLOPS 的主因）。
+    #   * 否则：任意页表布局的 gather 慢路径（保底正确）。
+    if AFFINE_K:
+        first = tl.load(rtt_row + (pid_n * BLOCK_N) * RATIO)
+        if RATIO == 2:
+            slot0 = first >> 1
+        else:
+            slot0 = first
+        offs_row = slot0 + tl.arange(0, BLOCK_N)
         k_v = tl.load(
-            k_buf_ptr + (slot0 + idx_n)[:, None] * D + offs_d[None, :],
+            k_buf_ptr + offs_row[:, None] * D + offs_d[None, :],
             mask=k_mask,
             other=0.0,
         )
+        if K_QUANTIZED:
+            # 因式分解出来的 per-slot 反量化 scale：只乘最终结果，不进 dot。
+            sc = tl.load(k_scale_ptr + offs_row, mask=valid, other=0.0).to(
+                tl.float32
+            )
     else:
+        full = tl.load(rtt_row + offs_n * RATIO, mask=valid, other=0)
+        if RATIO == 2:
+            slots = full >> 1  # full >= 0：移位与 // 等价，且免掉向量整除
+        else:
+            slots = full
         k_v = tl.load(
             k_buf_ptr + slots[:, None] * D + offs_d[None, :],
             mask=k_mask,
             other=0.0,
         )
+        if K_QUANTIZED:
+            # 因式分解出来的 per-slot 反量化 scale：只乘最终结果，不进 dot。
+            sc = tl.load(k_scale_ptr + slots, mask=valid, other=0.0).to(
+                tl.float32
+            )
 
     # q^T tile [BLOCK_D, BLOCK_H]：d 轴（axis 0）连续，一次 load 覆盖全部
     # 头 —— 旧实现每个头循环迭代都要重新加载一遍 q_h。
@@ -219,10 +243,6 @@ def _index_score_kernel(
     w = tl.load(weights_ptr + t64 * H + offs_h, mask=h_mask, other=0.0).to(
         tl.float32
     )
-
-    if K_QUANTIZED:
-        # 因式分解出来的 per-slot 反量化 scale：只乘最终结果，不进 dot。
-        sc = tl.load(k_scale_ptr + slots, mask=valid, other=0.0).to(tl.float32)
 
     if HAS_CONSUME:
         cm = tl.load(
@@ -391,6 +411,11 @@ def low_ratio_index_score_triton(
     # scale applied in-kernel.
     consume: Optional[torch.Tensor] = None,  # [T, W] bool
     ratio: int = 2,
+    page_size: Optional[int] = None,  # token-pool page size.  When
+    # page_size % (BLOCK_N * ratio) == 0, no tile straddles a page, so the
+    # tile's index-pool slots are one consecutive run by construction and
+    # the kernel takes the affine (vectorized) K-load path; otherwise it
+    # falls back to the general gather (correct for any page layout).
     candidate_block_size: Optional[int] = None,  # set on the candidate-source
     # layer: additionally emit [T, cdiv(max_lc, block_size)] fp32 block amax
     # scores (newest block already forced to +inf) for the outside block
@@ -453,7 +478,11 @@ def low_ratio_index_score_triton(
         BLOCK_N = candidate_block_size
     else:
         env_bn = os.environ.get("SGLANG_DSV4_INDEX_SCORE_BLOCK_N", "")
-        BLOCK_N = int(env_bn) if env_bn else (32 if use_vec else 128)
+        # 默认 64：page_size(128) 下 64 个压缩位置 = 恰好一页（ratio=2）或
+        # 半页（ratio=1，同样不跨页），页内 slots 必连续，K 装载全部命中
+        # affine 快路径；BLOCK_N=128 时每隔一个 tile 跨页，会掉进 gather
+        # 慢路径。页大小不是 128 的部署请用 env 覆盖为 page_size//ratio。
+        BLOCK_N = int(env_bn) if env_bn else (32 if use_vec else 64)
 
     num_blocks = triton.cdiv(max_lc, BLOCK_N) if is_candidate_source else 0
     out = torch.empty((T, max_lc), dtype=torch.float32, device=q.device)
@@ -480,6 +509,11 @@ def low_ratio_index_score_triton(
             and k_quantized
             and k_buf.dtype == torch.float8_e4m3fn
         )
+        # 页对齐判定（静态，kernel 内不做运行时分支）：tile 覆盖
+        # [n0, n0+BLOCK_N) 个压缩位置 = [n0*ratio, (n0+BLOCK_N)*ratio) 个
+        # token；page_size 能整除 BLOCK_N*ratio 时 tile 永不跨页，页内
+        # 下标连续且页起点可被 ratio 整除 => slots 必连续。
+        affine_k = page_size is not None and page_size % (BLOCK_N * ratio) == 0
         _index_score_kernel[grid](
             q,
             weights,
@@ -504,6 +538,7 @@ def low_ratio_index_score_triton(
             HAS_CONSUME=consume is not None,
             IS_CANDIDATE_SOURCE=is_candidate_source,
             K_QUANTIZED=k_quantized,
+            AFFINE_K=affine_k,
             Q_FP8=q_fp8,
         )
     else:
