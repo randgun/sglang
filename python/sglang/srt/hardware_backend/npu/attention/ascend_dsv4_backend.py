@@ -59,20 +59,25 @@ _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
-def _sparse_attn_ops():
+def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
     A5 reads a quantized KV cache, which is a different kernel rather than a
     flag on the pre-A5 one.
     """
     if is_npu_arch35():
+        if is_dspark:
+            return (
+                torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_v2_metadata,
+                torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_v2,
+            )
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
         )
     return (
         torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
-        torch.ops.custom.npu_sparse_attn_sharedkv,
+        torch.ops.custom.npu_sparse_attn_sharedkv if not is_dspark else torch.ops.npu.sparse_attn_sharedkv,
     )
 
 
@@ -1068,7 +1073,6 @@ class DeepseekV4AscendAttnBackend(
         [T, N_kv, K], where K must be 128-aligned.
         """
         fm = self.forward_metadata
-        fm.ori_sparse_indices = None
         fm.ori_win_left = self._dsv4_sliding_window_size - 1
         fm.ori_win_right = 0
 
@@ -2056,7 +2060,6 @@ class DeepseekV4AscendAttnBackend(
         is_nextn: bool,
     ) -> dict:
         fm = self.forward_metadata
-        metadata_op, _ = _sparse_attn_ops()
 
         # Build per-sequence query lengths (seqused_q) and cumulative KV
         # lengths (cu_seqlens_ori_kv) that the A5 metadata kernel needs.
@@ -2099,7 +2102,7 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and not is_npu_arch35():
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
@@ -2113,7 +2116,7 @@ class DeepseekV4AscendAttnBackend(
                 "cu_seqlens_q": actual_seq_lengths_q_pa,
                 "seqused_kv": actual_seq_lengths_kv,
             }
-            metadata_op, _ = _sparse_attn_ops()
+            metadata_op, _ = _sparse_attn_ops(self._is_dspark_draft_worker)
         c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {
             "c1a_metadata": c1a_metadata,
@@ -2529,13 +2532,13 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and not is_npu_arch35():
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
-        _, attn_op = _sparse_attn_ops()
+        _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
         out, _ret = attn_op(q_arg, **attn_kwargs)
         return out
 
@@ -3211,6 +3214,9 @@ class DeepseekV4AscendAttnBackend(
                 k_scale=k_scale,
                 consume=consume,
                 ratio=ratio,
+                # page_size 让 kernel 走 affine K 装载快路径（页对齐时
+                # tile 内 slots 必连续，免去逐元素 gather）。
+                page_size=self.page_size,
                 candidate_block_size=(
                     indexer.candidate_block_size
                     if indexer.is_candidate_source
