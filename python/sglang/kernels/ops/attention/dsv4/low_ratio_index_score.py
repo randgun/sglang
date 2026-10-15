@@ -16,7 +16,11 @@ Masking (fused in-kernel):
   - causal: position j visible iff j < lens[t] = (pos[t] + 1) // ratio,
     invalid positions written as -inf;
   - consume (layers that use candidates): additionally -inf where the
-    candidate mask published by the candidate-source layer is False.
+    candidate mask published by the candidate-source layer is False;
+  - a tile lying entirely at/past lens[t] short-circuits: it stores -inf
+    (and an -inf block score on the candidate-source layer) without
+    touching q/k -- max_lc is an upper bound, so short rows hit many of
+    these and the MACs they would have run are all dead.
 
 NOT fused (kept in torch on the [T, max_lc] score matrix, per design):
   - the final token-level top-k;
@@ -76,6 +80,24 @@ def _index_score_kernel(
 
     lens_t = tl.load(lens_ptr + t)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    out_ptrs = out_ptr + t.to(tl.int64) * max_lc + offs_n
+    out_mask = offs_n < max_lc
+
+    # 整块落在 lens 之外时不需要任何乘加：max_lc 是上界，短行会命中大量这种
+    # tile。直接写 -inf 返回，省掉 req_to_token gather 和 H 次
+    # [BLOCK_N, BLOCK_D] 归约（本就是死算）。
+    if pid_n * BLOCK_N >= lens_t:
+        tl.store(out_ptrs, float("-inf"), mask=out_mask)
+        if IS_CANDIDATE_SOURCE:
+            # 整块不可达 => 不是最新块，amax 恒为 -inf（与 torch 参考一致）。
+            tl.store(
+                block_scores_ptr
+                + t.to(tl.int64) * tl.num_programs(1)
+                + pid_n,
+                float("-inf"),
+            )
+        return
+
     valid = offs_n < lens_t  # causal: group end passed by this query
 
     r = tl.load(req_ptr + t)
@@ -118,11 +140,7 @@ def _index_score_kernel(
             other=0,
         )
         out = tl.where(valid & (cm != 0), out, float("-inf"))
-    tl.store(
-        out_ptr + t.to(tl.int64) * max_lc + offs_n,
-        out,
-        mask=offs_n < max_lc,
-    )
+    tl.store(out_ptrs, out, mask=out_mask)
 
     if IS_CANDIDATE_SOURCE:
         # BLOCK_N == candidate block size here, so this program's tile is
