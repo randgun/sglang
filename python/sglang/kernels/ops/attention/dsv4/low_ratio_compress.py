@@ -360,9 +360,16 @@ def low_ratio_compress_triton(
         state_score: [num_req_slots+1, D] float32 — per-request pair state.
 
     Returns:
-        pooled:             [num_odd, D] float32 — softmax-weighted pair pool.
-        compacted_out_loc:  [num_odd] int64 — cache write slots for odd tokens.
-        compacted_group_pos:[num_odd] int64 — group base positions (pos - 1).
+        pooled:             [max_odd, D] float32 — softmax-weighted pair pool.
+        compacted_out_loc:  [max_odd] int64 — cache write slots for odd tokens.
+        compacted_group_pos:[max_odd] int64 — group base positions (pos - 1).
+
+    ``max_odd = (N + 1) // 2`` is the padded output width, not the live count:
+    the tiled kernel stores only odd rows, so the tail past the last odd token
+    keeps its zero fill. The live count is data-dependent and reading it would
+    need a device sync, which is illegal inside graph capture — callers must
+    therefore tolerate the zero tail rather than slice on it (see the caller in
+    ``ascend_dsv4_backend._low_ratio_compress_torch``).
     """
     N, D = kv.shape
     device = kv.device
@@ -404,9 +411,13 @@ def low_ratio_compress_triton(
     block_offsets = torch.zeros(num_blocks + 1, dtype=torch.int32, device=device)
     block_offsets[1:] = odd_per_block.cumsum(0)
 
-    pooled = torch.empty((max_odd, D), dtype=torch.float32, device=device)
-    compacted_out_loc = torch.empty(max_odd, dtype=torch.int64, device=device)
-    compacted_group_pos = torch.empty(max_odd, dtype=torch.int64, device=device)
+    # Zero-filled, not empty: the kernel stores only odd rows, so the tail past
+    # the last odd token keeps these zeros. Slot 0 is the compress pool's
+    # placeholder row, so the tail's dummy writes land there harmlessly — this is
+    # what lets the whole path stay free of a device sync (graph-capturable).
+    pooled = torch.zeros((max_odd, D), dtype=torch.float32, device=device)
+    compacted_out_loc = torch.zeros(max_odd, dtype=torch.int64, device=device)
+    compacted_group_pos = torch.zeros(max_odd, dtype=torch.int64, device=device)
 
     BLOCK_D = triton.next_power_of_2(D)
     grid = (num_blocks,)
@@ -442,11 +453,14 @@ def low_ratio_compress_triton(
         BLOCK_D=BLOCK_D,
     )
 
-    num_odd = block_offsets[-1].item()
+    # No `.item()` on block_offsets[-1]: the live odd count is data-dependent and
+    # the D2H sync it needs is illegal under NPU graph capture (EE1016, "stream
+    # is captured"). The zero tail past the last odd row is the padded-out part
+    # and is harmless to write (slot 0 is the compress pool's placeholder).
     return (
-        pooled[:num_odd],
-        compacted_out_loc[:num_odd],
-        compacted_group_pos[:num_odd],
+        pooled,
+        compacted_out_loc,
+        compacted_group_pos,
     )
 
 

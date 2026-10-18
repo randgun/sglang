@@ -2854,6 +2854,11 @@ class DeepseekV4AscendAttnBackend(
                     )
                 )
                 if pooled.shape[0] == 0:
+                    # Shape read only (no sync): the kernel returns the padded
+                    # width max_odd, which is 0 exactly for an empty batch. Rows
+                    # past the last odd token are zero-filled and carry slot 0
+                    # (the compress pool's placeholder row), so they are safe to
+                    # write — that is what keeps this path graph-capturable.
                     return
                 self._low_ratio_write_group(
                     layer, pooled, compacted_out_loc, compacted_group_pos
