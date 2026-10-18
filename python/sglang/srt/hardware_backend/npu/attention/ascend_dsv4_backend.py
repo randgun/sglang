@@ -2840,6 +2840,12 @@ class DeepseekV4AscendAttnBackend(
         else:
             use_triton = (
                 os.environ.get("SGLANG_COMPRESSOR_PREFILL_USE_TRITON", "0") == "1"
+                # The torch fallback below is host-dynamic (`nonzero`, boolean-mask
+                # indexing, `bool(...any())`) and cannot be captured; the decode
+                # graph is recorded in TARGET_VERIFY mode when DSpark is on, so it
+                # always reaches this prefill-shaped branch. Force the triton
+                # kernel there regardless of the env default.
+                or self._dsv4_in_graph_ctx
             )
             if use_triton:
                 pooled, compacted_out_loc, compacted_group_pos = (
@@ -2892,6 +2898,19 @@ class DeepseekV4AscendAttnBackend(
                 torch.stack([kv_partner[odd], kv[odd]], dim=1),
                 torch.stack([score_partner[odd], score[odd]], dim=1),
             )
+        if ratio == 1:
+            # group_mask is torch.ones_like(pos) here — a constant all-True mask,
+            # so both the `.any()` and the mask index below are no-ops, and the
+            # device sync the `.any()` needs is illegal under graph capture.
+            # Gate on the host-side token count instead, and index out_loc
+            # directly (identical to out_loc[all-True mask]).
+            if pos.shape[0] == 0:
+                return
+            self._low_ratio_write_group(layer, pooled, out_loc, group_pos)
+            return
+        # ratio != 1: this route is eager-only — the graph path returns from the
+        # triton branch above, because the fallback that sets group_mask here is
+        # host-dynamic (nonzero / boolean-mask indexing) and not capturable.
         if not bool(group_mask.any()):
             return
         self._low_ratio_write_group(layer, pooled, out_loc[group_mask], group_pos)
