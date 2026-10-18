@@ -27,6 +27,7 @@ import os
 import torch
 
 _ENABLED = os.environ.get("SGLANG_DSV4_OP_TRACE", "0") == "1"
+_ACCEPT_ENABLED = os.environ.get("SGLANG_DSPARK_ACCEPT_TRACE", "0") == "1"
 _MAX_RANGE_ELEMS = 1 << 22  # skip min/max on huge tensors (3D KV pages etc.)
 
 _seq = 0
@@ -100,6 +101,27 @@ def trace_op(tag: str, **tensors) -> None:
     for name, value in tensors.items():
         print(f"    {name}: {_fmt(value)}", flush=True)
     _last = tag
+
+
+def trace_accept(tag: str, **info) -> None:
+    """Accept-rate forensics for DSpark (``SGLANG_DSPARK_ACCEPT_TRACE=1``).
+
+    Separate from the op trace on purpose: this one is per-step, not per-op, so
+    it is cheap enough to leave on for a whole run. Values are pulled to the host
+    (``.tolist()``) by the caller, which also drains the stream, so a run with
+    zero acceptance still ends cleanly instead of hiding a device fault.
+
+    Read it row by row: ``target_argmax[i]`` is what the target would pick after
+    the i-th verify token, so acceptance needs ``target_argmax[i] ==
+    verify_ids[i+1]``. All-zero acceptance with plausible ids means the
+    comparison/target side is broken; ids that look like noise means the draft
+    side is.
+    """
+    if not _ACCEPT_ENABLED:
+        return
+    print(f"[accept-trace] {tag}", flush=True)
+    for name, value in info.items():
+        print(f"    {name} = {value}", flush=True)
 
 
 def trace_stage(tag: str, **info) -> None:

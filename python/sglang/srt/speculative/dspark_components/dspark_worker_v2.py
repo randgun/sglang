@@ -87,11 +87,17 @@ from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 try:  # NPU device-fault attribution probe; no-op unless SGLANG_DSV4_OP_TRACE=1
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
+        trace_accept as _trace_accept,
+    )
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
         trace_stage as _trace_stage,
     )
 except Exception:  # pragma: no cover - trace module is NPU-debug only
 
     def _trace_stage(*args, **kwargs):
+        return
+
+    def _trace_accept(*args, **kwargs):
         return
 
 logger = logging.getLogger(__name__)
@@ -849,6 +855,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        _trace_accept(
+            "dspark.accept",
+            bs=bs,
+            logits_shape=tuple(logits_output.next_token_logits.shape),
+            target_argmax=logits_output.next_token_logits.argmax(dim=-1)
+            .reshape(-1)[:10]
+            .tolist(),
+            verify_ids=verify_ids_2d.reshape(-1)[:10].tolist(),
+            draft_tokens=draft_block.draft_tokens.reshape(-1)[:10].tolist(),
+            commit_lens=accept.commit_lens.tolist(),
+            correct_len=accept.correct_len.tolist(),
         )
         if batch.return_logprob:
             compute_spec_logprobs(
