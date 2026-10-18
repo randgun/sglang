@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -25,9 +27,15 @@ try:  # NPU device-fault attribution probe; no-op unless SGLANG_DSV4_OP_TRACE=1
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
         trace_op as _trace_op,
     )
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
+        trace_stage as _trace_stage,
+    )
 except Exception:  # pragma: no cover - trace module is NPU-debug only
 
     def _trace_op(*args, **kwargs):
+        return
+
+    def _trace_stage(*args, **kwargs):
         return
 
 if _is_cpu:
@@ -438,6 +446,52 @@ def assign_extend_cache_locs_uniform_func(
     )
 
 
+def _assign_extend_cache_locs_npu_torch(
+    *,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    device,
+) -> torch.Tensor:
+    """Torch reference for the NPU ``cache_loc_update`` op (escape hatch).
+
+    Same semantics as the triton kernel above: for every request ``i``, copy
+    ``req_to_token[req_pool_indices[i], start_offset[i]:end_offset[i]]`` into the
+    output, packing the rows back to back. Row lengths may vary per request; the
+    output is sized ``batch_size * draft_token_num``, which is where the packed
+    data always fits.
+
+    Static shapes only (no ``nonzero`` / boolean indexing / D2H), so unlike the
+    op it replaces this stays graph-capturable. Enable with
+    ``SGLANG_NPU_CACHE_LOC_TORCH=1`` when the op itself faults — that is the
+    AI Core / vector-core failure observed on dsv4.1 with an odd
+    ``req_to_token`` row width.
+    """
+    total = batch_size * draft_token_num
+    rows = req_pool_indices.to(torch.int64)
+    starts = start_offset.to(torch.int64)
+    lengths = end_offset.to(torch.int64) - starts
+
+    ar = torch.arange(draft_token_num, device=device, dtype=torch.int64)
+    valid = ar.unsqueeze(0) < lengths.unsqueeze(1)  # [bs, W]
+    cols = starts.unsqueeze(1) + ar.unsqueeze(0)  # [bs, W]
+    cols = torch.where(valid, cols, torch.zeros_like(cols))  # parked lane, unused
+    gathered = req_to_token[rows.unsqueeze(1), cols]  # [bs, W]
+
+    # Packed destination: exclusive prefix sum of the per-request lengths. Lanes
+    # past a row's length are parked in a scratch slot appended to the output so
+    # they can never clobber a real entry.
+    dest = (torch.cumsum(lengths, dim=0) - lengths).unsqueeze(1) + ar.unsqueeze(0)
+    dest = torch.where(valid, dest, torch.full_like(dest, total))
+
+    out = torch.zeros(total + 1, dtype=torch.int32, device=device)
+    out.scatter_(0, dest.reshape(-1), gathered.reshape(-1))
+    return out[:total]
+
+
 def assign_extend_cache_locs_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -466,6 +520,17 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_npu:
+        if os.environ.get("SGLANG_NPU_CACHE_LOC_TORCH", "0") == "1":
+            _trace_stage("npu.cache_loc_update_torch_fallback")
+            return _assign_extend_cache_locs_npu_torch(
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                batch_size=batch_size,
+                draft_token_num=draft_token_num,
+                device=device,
+            )
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int32,
