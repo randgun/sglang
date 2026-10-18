@@ -45,6 +45,21 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 
+try:  # NPU device-fault attribution probe; no-op unless SGLANG_DSV4_OP_TRACE=1
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
+        trace_op as _trace_op,
+    )
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
+        trace_stage as _trace_stage,
+    )
+except Exception:  # pragma: no cover - trace module is NPU-debug only
+
+    def _trace_op(*args, **kwargs):
+        return
+
+    def _trace_stage(*args, **kwargs):
+        return
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -2847,6 +2862,14 @@ class DeepseekV4AscendAttnBackend(
                 # kernel there regardless of the env default.
                 or self._dsv4_in_graph_ctx
             )
+            _trace_op(
+                f"low_ratio_compress(r{ratio}, triton={use_triton})",
+                kv=kv,
+                score=score,
+                pos=pos,
+                req=req,
+                out_loc=out_loc,
+            )
             if use_triton:
                 pooled, compacted_out_loc, compacted_group_pos = (
                     low_ratio_compress_triton(
@@ -2996,6 +3019,12 @@ class DeepseekV4AscendAttnBackend(
     def _low_ratio_write_group(self, layer, pooled, slots, group_pos, already_normed=False) -> None:
         pool = self.token_to_kv_pool
         ratio = layer.compress_ratio
+        _trace_op(
+            f"low_ratio_write_group(r{ratio}, layer={layer.layer_id})",
+            pooled=pooled,
+            slots=slots,
+            group_pos=group_pos,
+        )
         latent = pooled if already_normed else layer.compressor.finish(pooled)
 
         if layer.indexer is not None and layer.indexer.owns_k:
@@ -3029,6 +3058,7 @@ class DeepseekV4AscendAttnBackend(
             kv_scale=None,
             from_indexer=False,
         )
+        _trace_stage(f"low_ratio_write_group_done(r{ratio}, layer={layer.layer_id})")
 
     def _low_ratio_index_topk_torch_a3(
         self, layer, x, q_lora, req, pos
@@ -3159,6 +3189,12 @@ class DeepseekV4AscendAttnBackend(
         Set SGLANG_DSV4_INDEX_TOPK_TORCH=1 for the eager per-request loop
         fallback (debug only — it syncs and cannot be captured).
         """
+        _trace_op(
+            f"index_topk_a5(layer={layer.layer_id}, max_lc={max_lc})",
+            x=x,
+            req=req,
+            pos=pos,
+        )
         if os.environ.get("SGLANG_DSV4_INDEX_TOPK_TORCH", "0") == "1":
             self._low_ratio_index_topk_loop_a5(layer, x, q_lora, req, pos, fm)
             return

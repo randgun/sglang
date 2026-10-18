@@ -32,6 +32,15 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
+try:  # NPU device-fault attribution probe; no-op unless SGLANG_DSV4_OP_TRACE=1
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
+        trace_stage as _trace_stage,
+    )
+except Exception:  # pragma: no cover - trace module is NPU-debug only
+
+    def _trace_stage(*args, **kwargs):
+        return
+
 logger = logging.getLogger(__name__)
 
 
@@ -433,14 +442,23 @@ class DraftBlockProposer:
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
-        if (
+        stage_sampler = (
             draft_sampler is not None
             and graph_runner is not None
             and graph_runner.can_run_graph(draft_forward_batch)
-        ):
+        )
+        if stage_sampler:
             draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        _trace_stage(
+            "dspark.draft_forward_begin",
+            bs=bs,
+            tokens=draft_num_tokens,
+            sampler_graph=stage_sampler,
+            draft_graph=graph_runner is not None,
+        )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        _trace_stage("dspark.draft_forward_end")
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:

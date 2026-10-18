@@ -21,6 +21,15 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
+try:  # NPU device-fault attribution probe; no-op unless SGLANG_DSV4_OP_TRACE=1
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
+        trace_op as _trace_op,
+    )
+except Exception:  # pragma: no cover - trace module is NPU-debug only
+
+    def _trace_op(*args, **kwargs):
+        return
+
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
 
@@ -461,6 +470,16 @@ def assign_extend_cache_locs_func(
             (batch_size * draft_token_num,),
             dtype=torch.int32,
             device=device,
+        )
+        _trace_op(
+            "npu.cache_loc_update",
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            out_cache_loc=out_cache_loc,
+            batch_size=batch_size,
+            draft_token_num=draft_token_num,
         )
         torch.ops.npu.cache_loc_update(
             req_pool_indices,

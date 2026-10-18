@@ -85,6 +85,15 @@ from sglang.srt.utils import (
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
+try:  # NPU device-fault attribution probe; no-op unless SGLANG_DSV4_OP_TRACE=1
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_op_trace import (
+        trace_stage as _trace_stage,
+    )
+except Exception:  # pragma: no cover - trace module is NPU-debug only
+
+    def _trace_stage(*args, **kwargs):
+        return
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -607,6 +616,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+        _trace_stage("dspark.target_hidden_injected")
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -691,6 +701,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
 
         self._observers.begin_step()
+        # Drains the stream first: if the previous step's device work (target
+        # verify replay, draft replay, compress/indexer writes) faulted
+        # asynchronously, it raises HERE and points back at that stage.
+        _trace_stage("dspark.dp_step_begin", bs=bs)
 
         target_model = self.target_worker.model_runner.model
         verify_window = alloc_verify_window(
@@ -701,8 +715,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
         )
+        _trace_stage(
+            "dspark.verify_window_ready", W=self.verify_num_draft_tokens
+        )
 
         sampling_info = batch.sampling_info
+        _trace_stage("dspark.propose_begin")
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -713,6 +731,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_model=target_model,
                 sampling_info=sampling_info,
             )
+        _trace_stage("dspark.propose_end", folded=proposal.folded)
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
@@ -774,6 +793,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
+        _trace_stage(
+            "dspark.target_verify_begin", compact=run_compact, folded_accept=fold_eligible
+        )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -795,6 +817,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                     sampling_info=sampling_info,
                 )
                 hidden_strided = None
+        _trace_stage(
+            "dspark.target_verify_end",
+            ran_graph=target_verify.can_run_cuda_graph,
+        )
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
         if batch.has_grammar:
@@ -858,6 +884,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 run_compact=run_compact,
             )
         logits_output.hidden_states = None
+        _trace_stage("dspark.dp_step_end", commit_lens=accept.commit_lens.tolist())
 
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
