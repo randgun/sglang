@@ -388,7 +388,14 @@ class EngramHasher(nn.Module):
                 )
             )
         req = forward_batch.req_pool_indices.to(torch.int64)
-        if not forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_target_verify():
+            # Verify (and the DSpark-decorated decode graph capture, which runs
+            # in TARGET_VERIFY mode) has a fixed token count per request; the
+            # capture dummy batch carries no extend_seq_lens to expand with.
+            block = int(forward_batch.spec_info.draft_token_num)
+            t = torch.arange(req.shape[0] * block, device=req.device)
+            req = req[t // block]
+        elif not forward_batch.forward_mode.is_decode():
             req = torch.repeat_interleave(
                 req, forward_batch.extend_seq_lens.to(torch.int64)
             )
