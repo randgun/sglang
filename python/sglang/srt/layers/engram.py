@@ -565,8 +565,11 @@ class EngramEmbedding(nn.Module):
                 "fp8 weight + scale device-resident" if self._is_arch35 else "bf16 weight, no scale",
             )
             return
-        assert num_embeddings % self.tp_size == 0, (num_embeddings, self.tp_size)
-        self.rows = num_embeddings // self.tp_size
+        # Ceil sharding, as in the offload path: the last rank's tail extends
+        # past the table and is never addressed (hash ids stay below
+        # num_embeddings), so a table size that the TP world size does not
+        # divide still shards.
+        self.rows = -(-num_embeddings // self.tp_size)
         self.row_start = get_tensor_model_parallel_rank() * self.rows
         if not is_npu_arch35():
             self.weight = nn.Parameter(
@@ -587,7 +590,13 @@ class EngramEmbedding(nn.Module):
             self.scale.weight_loader = self._load_rows
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight[self.row_start : self.row_start + self.rows])
+        rows = loaded_weight[self.row_start : self.row_start + self.rows]
+        # Under ceil sharding the last rank's chunk can stop short of
+        # self.rows; the unbacked tail is never addressed, but zero it so the
+        # table holds no uninitialized memory.
+        param.data[: rows.shape[0]].copy_(rows)
+        if rows.shape[0] < self.rows:
+            param.data[rows.shape[0] :].zero_()
 
     def _load_weight_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = loaded_weight[self.row_start : self.row_start + self.rows]
