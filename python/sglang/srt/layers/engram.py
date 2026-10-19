@@ -593,10 +593,11 @@ class EngramEmbedding(nn.Module):
         rows = loaded_weight[self.row_start : self.row_start + self.rows]
         # Under ceil sharding the last rank's chunk can stop short of
         # self.rows; the unbacked tail is never addressed, but zero it so the
-        # table holds no uninitialized memory.
+        # table holds no uninitialized memory. The bytes view keeps this
+        # working for the fp8 dtypes (aclnn in-place zero has no fp8 support).
         param.data[: rows.shape[0]].copy_(rows)
         if rows.shape[0] < self.rows:
-            param.data[rows.shape[0] :].zero_()
+            param.data[rows.shape[0] :].view(torch.uint8).zero_()
 
     def _load_weight_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = loaded_weight[self.row_start : self.row_start + self.rows]
