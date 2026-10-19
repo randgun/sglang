@@ -936,7 +936,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         low_ratio_kv_bytes = self._get_dsv4_kv_bytes_per_token()
         self.low_ratio_bytes_per_full_token = sum(
             (low_ratio_kv_bytes + 2 * self.indexer_head_dim) / cfg.compress_ratios[l]
-            for l in cfg.hf_config.kv_source_layers
+            for l in cfg.hf_config.kv_source_layer_ids
             if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
             and cfg.compress_ratios[l] in (1, 2)
         )

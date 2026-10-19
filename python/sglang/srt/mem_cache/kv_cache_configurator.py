@@ -1311,7 +1311,7 @@ class KVCacheConfigurator:
             kv_source_layers = []
         else:
             compression_ratios = self.model_config.compress_ratios
-            kv_source_layers = list(self.model_config.hf_config.kv_source_layers)
+            kv_source_layers = list(self.model_config.hf_config.kv_source_layer_ids)
 
         # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
         # follows the same fixed ring ownership as GPU. Do not replace the

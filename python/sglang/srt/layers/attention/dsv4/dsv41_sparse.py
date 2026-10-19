@@ -142,9 +142,9 @@ class DeepseekV41Indexer(nn.Module):
         self.index_head_dim = config.index_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
-        self.owns_k = layer_id in config.kv_source_layers
-        self.is_candidate_source = layer_id == config.candidate_source_layer
-        self.uses_candidates = 0 <= config.candidate_source_layer < layer_id
+        self.owns_k = layer_id in config.kv_source_layer_ids
+        self.is_candidate_source = layer_id == config.candidate_source_layer_id
+        self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_id
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5

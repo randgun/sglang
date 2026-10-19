@@ -103,9 +103,9 @@ class DeepSeekV4Config(PretrainedConfig):
 
     compress_rope_theta: int = 40000
     compress_ratios: List[int] = field(default_factory=list)
-    kv_source_layers: List[int] = field(default_factory=list)
-    index_source_layers: List[int] = field(default_factory=list)
-    candidate_source_layer: int = -1
+    kv_source_layer_ids: List[int] = field(default_factory=list)
+    index_source_layer_ids: List[int] = field(default_factory=list)
+    candidate_source_layer_id: int = -1
     candidate_topk_blocks: int = 0
     candidate_block_size: int = 0
 

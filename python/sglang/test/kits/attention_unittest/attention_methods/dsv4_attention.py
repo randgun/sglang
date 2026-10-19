@@ -283,7 +283,7 @@ class TinyDSV4ModelConfig:
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
             # Ratio 1/2 layers are their own kv_source (one-layer fixtures).
-            kv_source_layers=[
+            kv_source_layer_ids=[
                 i for i, ratio in enumerate(compression_ratios) if ratio in (1, 2)
             ],
         )
@@ -415,7 +415,7 @@ class MockDSV4ModelRunner:
             device=device,
             enable_memory_saver=False,
             compression_ratios=list(compression_ratios),
-            kv_source_layers=model_config.hf_config.kv_source_layers,
+            kv_source_layers=model_config.hf_config.kv_source_layer_ids,
             # Full locs are the identity-mapped SWA locs below, so the c1/c2
             # latent pools (slot = loc // ratio) only need to span swa_size.
             full_size=swa_size,

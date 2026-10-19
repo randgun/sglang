@@ -179,9 +179,9 @@ try:
         hc_pre_from_prev_sublayer = False
         # V4 normalizes each attention query head (weightless rmsnorm) before RoPE.
         q_head_norm = True
-        kv_source_layers = ()
-        index_source_layers = ()
-        candidate_source_layer = -1
+        kv_source_layer_ids = ()
+        index_source_layer_ids = ()
+        candidate_source_layer_id = -1
         candidate_topk_blocks = 0
         candidate_block_size = 0
         engram_layer_ids = ()

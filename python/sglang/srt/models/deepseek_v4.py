@@ -1040,14 +1040,14 @@ class MQALayer(MqaAttentionBase):
         elif self.compress_ratio in (1, 2):
             # V4.1: only kv_source layers compress and only index_source layers
             # score; the layers in between read both through the attention backend.
-            if self.layer_id in config.kv_source_layers:
+            if self.layer_id in config.kv_source_layer_ids:
                 self.compressor = DeepseekV41Compressor(
                     hidden_size=config.hidden_size,
                     head_dim=self.head_dim,
                     compress_ratio=self.compress_ratio,
                     eps=config.rms_norm_eps,
                 )
-            if self.layer_id in config.index_source_layers:
+            if self.layer_id in config.index_source_layer_ids:
                 self.indexer = DeepseekV41Indexer(
                     config,
                     layer_id=self.layer_id,
