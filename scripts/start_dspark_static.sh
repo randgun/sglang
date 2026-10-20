@@ -104,7 +104,7 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 6 \
     --speculative-dspark-block-size 5 \
     --speculative-dspark-sps-table-path /home/l00993641/sglang/scripts/dspark_graph_additive.json \
-    --cuda-graph-bs 1 2 4 8 10 \
+    --cuda-graph-bs-decode 1 2 4 8 10 \
 
 
 #    --speculative-algorithm EAGLE \

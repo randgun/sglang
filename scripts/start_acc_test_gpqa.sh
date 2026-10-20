@@ -5,6 +5,9 @@ export no_proxy=127.0.0.1,localhost
 
 export PYTHONPATH=/home/l00993641/sglang/python:$PYTHONPATH
 
+export HF_DATASETS_CACHE=/home/l00993641/eval_cache/hf_datasets
+mkdir -p "$HF_DATASETS_CACHE"
+
 evalscope eval \
     --model /home/weights/DeepSeek-V4-Flash-0731-w8a8 \
     --api-url http://127.0.0.1:30100/v1 \
