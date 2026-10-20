@@ -763,7 +763,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             validate_npu_dspark_compact,
         )
 
-        validate_npu_dspark_compact(cfg, ragged_mode.value)
+        # validate_npu_dspark_compact(cfg, ragged_mode.value) 00993641
+        prefill_backend, decode_backend = attention_backends_of(cfg)
+        target_backend = decode_backend or prefill_backend
+        validate_npu_dspark_compact(cfg, ragged_mode.value, allow_dsv4_dp=target_backend == "dsv4", )
+
     if (
         cfg.speculative_dspark_align_verify_tokens_to_graph_tier
         and ragged_mode is not RaggedVerifyMode.COMPACT

@@ -239,6 +239,18 @@ class DSparkVerifyPlanner:
             return None
         return self._budget_planner.lag_steps
 
+    # 00993641
+    def _sync_npu_verify_budget(self, budget: Optional[int]) -> Optional[int]:
+        parallel = get_parallel()
+        group = (
+            parallel.attn_tp_group
+            if parallel.enable_dp_attention
+            else parallel.tp_group
+        )
+        if group.world_size == 1:
+            return budget
+        return group.broadcast_object(budget, src=0)
+
     def take_budget_decision(self) -> Optional[VerifyBudgetDecision]:
         if self._budget_planner is None:
             return None
@@ -303,9 +315,13 @@ class DSparkVerifyPlanner:
         if _is_npu:
             # Ring event readiness can differ across ranks. Never let that
             # choose different token tiers / HCCL collective shapes.
-            draft_input.verify_token_budget = get_parallel().tp_group.broadcast_object(
-                draft_input.verify_token_budget, src=0
-            )
+            # draft_input.verify_token_budget = get_parallel().tp_group.broadcast_object(
+            #     draft_input.verify_token_budget, src=0
+            # )
+            draft_input.verify_token_budget = self._sync_npu_verify_budget(
+                draft_input.verify_token_budget
+            ) #00993641
+
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
             verify_token_budget=draft_input.verify_token_budget,
@@ -372,7 +388,8 @@ class DSparkVerifyPlanner:
             resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
         )
         if _is_npu:
-            budget = get_parallel().tp_group.broadcast_object(budget, src=0)
+            # budget = get_parallel().tp_group.broadcast_object(budget, src=0) #00993641
+            budget = self._sync_npu_verify_budget(budget)
         return budget
 
     def resolve_verify_token_budget(

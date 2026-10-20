@@ -12,15 +12,19 @@ from typing import NamedTuple
 import torch
 
 
-def validate_npu_dspark_compact(cfg, mode: str) -> None:
+def validate_npu_dspark_compact(cfg, mode: str, *, allow_dsv4_dp: bool = False,) -> None:
     """Fail before model loading for execution paths not covered by this port."""
     if not cfg.device.startswith("npu") or mode != "compact":
         return
     unsupported = []
     if cfg.cuda_graph_config.decode.backend not in ("disabled", "full"):
         unsupported.append("decode graph backend full or disabled")
-    if cfg.enable_dp_attention or cfg.dp_size != 1:
-        unsupported.append("DP size 1 without --enable-dp-attention")
+    # if cfg.enable_dp_attention or cfg.dp_size != 1: 00993641
+    #     unsupported.append("DP size 1 without --enable-dp-attention")
+    uses_dp = cfg.enable_dp_attention or cfg.dp_size != 1
+    dsv4_dp_allowed = (allow_dsv4_dp and cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size)
+    if uses_dp and not dsv4_dp_allowed:
+        unsupported.append("DP size 1 without --enable-dp-attention, or ported DSV4 " "with --enable-dp-attention and dp_size == tp_size" )
     if cfg.attn_cp_size != 1 or cfg.pp_size != 1:
         unsupported.append("attention CP size 1 and PP size 1")
     if cfg.dcp_size != 1:
