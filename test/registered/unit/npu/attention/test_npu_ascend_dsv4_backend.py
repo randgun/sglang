@@ -75,9 +75,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
-from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-    initialize_dspark_a5_sparse_attn_ops,
-)
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -706,26 +703,6 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
             {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
         )
 
-    @patch(_ARCH35_PATCH_TARGET, return_value=True)
-    def test_arch35_dspark_uses_sgl_kernel_npu_host_pair(self, _):
-        with patch("torch.ops.npu", MagicMock(), create=True) as npu_ops:
-            metadata_op, attention_op = _sparse_attn_ops(is_dspark=True)
-        self.assertIs(metadata_op, npu_ops.kv_quant_sparse_attn_sharedkv_metadata_host)
-        self.assertIs(attention_op, npu_ops.kv_quant_sparse_attn_sharedkv)
-
-    def test_dspark_loader_checks_installed_wheel_ops(self):
-        registered = SimpleNamespace(
-            kv_quant_sparse_attn_sharedkv_metadata_host=object(),
-            kv_quant_sparse_attn_sharedkv=object(),
-        )
-        with patch.object(torch.ops, "npu", registered, create=True):
-            initialize_dspark_a5_sparse_attn_ops()
-
-        del registered.kv_quant_sparse_attn_sharedkv_metadata_host
-        with patch.object(torch.ops, "npu", registered, create=True):
-            with self.assertRaisesRegex(RuntimeError, "Rebuild and reinstall"):
-                initialize_dspark_a5_sparse_attn_ops()
-
     @patch(_ARCH35_PATCH_TARGET, return_value=False)
     def test_pre_arch35_keeps_legacy_ops_without_quant_kwargs(self, _):
         with (
@@ -796,7 +773,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         seqused_kv_cpu = seqused_kv.clone()
 
         with (
-            patch(self._ARCH35_PATCH_TARGET, return_value=False),
             patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
             patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
@@ -833,145 +809,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         torch.testing.assert_close(actual_seqused_kv, seqused_kv_cpu[:2])
         self.assertEqual(actual_seqused_kv.dtype, torch.int32)
         self.assertEqual(actual_seqused_kv.device.type, "cpu")
-
-    @patch(_ARCH35_PATCH_TARGET, return_value=True)
-    def test_arch35_dspark_host_lengths_do_not_leak_into_compressed_ops(self, _):
-        cu_q = torch.tensor([0, 2, 3], dtype=torch.int32)
-        seq_kv = torch.tensor([8, 12], dtype=torch.int32)
-        cu_q_cpu = cu_q.clone()
-        seq_kv_cpu = seq_kv.clone()
-        with (
-            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
-            patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
-        ):
-            backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-            backend.forward_metadata = SimpleNamespace(
-                actual_seq_lengths_q_pa_cpu=cu_q_cpu,
-                seq_lens_cpu_int=seq_kv_cpu,
-            )
-            backend._is_dspark_draft_worker = True
-            backend._dsv4_sliding_window_size = 128
-            backend._dsv4_q_head_num = 64
-            backend._dsv4_kv_head_num = 1
-            backend._dsv4_head_dim = 512
-            backend._dsv4_has_c4 = True
-            backend._dsv4_has_c128 = True
-            backend._dsv4_index_topk = 512
-            backend._dsv4_index_n_heads = 16
-            backend._dsv4_index_head_dim = 128
-
-            result = backend._kernel_metadata_from_parts(
-                bs=2,
-                actual_seq_lengths_q_pa=cu_q,
-                actual_seq_lengths_kv=seq_kv,
-                block_tables=torch.zeros((2, 1), dtype=torch.int32),
-                max_seqlen_q=2,
-                is_nextn=False,
-            )
-
-        host_op = npu_ops.kv_quant_sparse_attn_sharedkv_metadata_host
-        host_op.assert_called_once()
-        self.assertIs(result["c1a_metadata"], host_op.return_value)
-        self.assertIs(host_op.call_args.kwargs["cu_seqlens_q"], cu_q_cpu)
-        self.assertEqual(host_op.call_args.kwargs["seqused_kv"].device.type, "cpu")
-        torch.testing.assert_close(host_op.call_args.kwargs["seqused_kv"], seq_kv_cpu)
-        self.assertEqual(host_op.call_args.kwargs["kv_quant_mode"], 1)
-        self.assertEqual(host_op.call_args.kwargs["tile_size"], 64)
-        self.assertEqual(host_op.call_args.kwargs["rope_head_dim"], 64)
-
-        device_op = custom_ops.npu_kv_quant_sparse_attn_sharedkv_metadata
-        self.assertEqual(device_op.call_count, 2)
-        for call in device_op.call_args_list:
-            self.assertIs(call.kwargs["cu_seqlens_q"], cu_q)
-            self.assertIs(call.kwargs["seqused_kv"], seq_kv)
-
-    @patch(_ARCH35_PATCH_TARGET, return_value=True)
-    def test_arch35_dspark_graph_refresh_reuses_metadata_buffer(self, _):
-        stable = torch.zeros(1024, dtype=torch.int32)
-        generated = torch.arange(1024, dtype=torch.int32)
-        host_op = MagicMock(return_value=generated)
-        cu_q_cpu = torch.tensor([0, 2], dtype=torch.int32)
-        seq_kv_cpu = torch.tensor([128], dtype=torch.int32)
-        fm = SimpleNamespace(
-            actual_seq_lengths_q_pa=torch.tensor([0, 2], dtype=torch.int32),
-            actual_seq_lengths_kv=torch.tensor([128], dtype=torch.int32),
-            actual_seq_lengths_q_pa_cpu=cu_q_cpu,
-            seq_lens_cpu_int=seq_kv_cpu,
-            block_tables=torch.zeros((1, 8), dtype=torch.int32),
-            kernel_metadata={"c1a_metadata": stable},
-            c4_topk_indices=torch.zeros((2, 1), dtype=torch.int32),
-        )
-        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        backend.forward_metadata = fm
-        backend._is_dspark_draft_worker = True
-        backend._dsv4_sliding_window_size = 128
-        backend._dsv4_q_head_num = 64
-        backend._dsv4_kv_head_num = 1
-        backend._dsv4_head_dim = 512
-        backend._dsv4_has_c4 = False
-        backend._dsv4_has_c128 = False
-        ctx = SimpleNamespace(fm=fm, bs=1, tokens_per_bs=2)
-        npu_ops = SimpleNamespace(
-            kv_quant_sparse_attn_sharedkv_metadata_host=host_op,
-            kv_quant_sparse_attn_sharedkv=MagicMock(),
-        )
-
-        with patch.object(torch.ops, "npu", npu_ops, create=True):
-            backend._refresh_graph_kernel_metadata(ctx)
-
-        self.assertIs(fm.kernel_metadata["c1a_metadata"], stable)
-        torch.testing.assert_close(stable, generated)
-        self.assertIs(host_op.call_args.kwargs["cu_seqlens_q"], cu_q_cpu)
-        torch.testing.assert_close(host_op.call_args.kwargs["seqused_kv"], seq_kv_cpu)
-
-
-class TestDsparkA5SparseAttentionInputs(unittest.TestCase):
-    @patch(
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
-        return_value=True,
-    )
-    def test_main_op_receives_supported_inputs_and_contiguous_query(self, _):
-        q = torch.zeros((4, 64, 512), dtype=torch.bfloat16)[::2]
-        kv = torch.empty((2, 16, 1, 640), dtype=torch.float8_e4m3fn)
-        cu_q = torch.tensor([0, 2], dtype=torch.int32)
-        seq_kv = torch.tensor([128], dtype=torch.int32)
-        page_table = torch.zeros((1, 8), dtype=torch.int32)
-        sparse_indices = torch.full((2, 1, 128), -1, dtype=torch.int32)
-        metadata = torch.zeros(1024, dtype=torch.int32)
-        sinks = torch.zeros(64, dtype=torch.float32)
-        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        backend._is_dspark_draft_worker = True
-        backend._dsv4_sliding_window_size = 128
-        backend.forward_metadata = SimpleNamespace(
-            actual_seq_lengths_q_pa=cu_q,
-            actual_seq_lengths_kv=seq_kv,
-            swa_page_table=page_table,
-            kernel_metadata={"c1a_metadata": metadata},
-            ori_sparse_indices=sparse_indices,
-        )
-        backend.token_to_kv_pool = SimpleNamespace(get_swa_buffer=lambda _: kv)
-        layer = SimpleNamespace(layer_id=0, scaling=0.5)
-        main_op = MagicMock(return_value=(q, torch.empty(0)))
-
-        with patch(
-            "sglang.srt.hardware_backend.npu.attention."
-            "ascend_dsv4_backend._sparse_attn_ops",
-            return_value=(MagicMock(), main_op),
-        ):
-            backend._forward_swa(q, layer, None, sinks)
-            bad_q = q.to(torch.float16)
-            with self.assertRaisesRegex(RuntimeError, "BF16 TND queries"):
-                backend._forward_swa(bad_q, layer, None, sinks)
-
-        main_op.assert_called_once()
-        passed_q = main_op.call_args.args[0]
-        self.assertEqual(passed_q.dtype, torch.bfloat16)
-        self.assertTrue(passed_q.is_contiguous())
-        self.assertIs(main_op.call_args.kwargs["ori_kv"], kv)
-        self.assertIs(main_op.call_args.kwargs["ori_sparse_indices"], sparse_indices)
-        self.assertIs(main_op.call_args.kwargs["seqused_kv"], seq_kv)
-        self.assertIs(main_op.call_args.kwargs["metadata"], metadata)
-        self.assertIs(main_op.call_args.kwargs["sinks"], sinks)
 
 
 class TestGetKvIndices(unittest.TestCase):
