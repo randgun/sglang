@@ -3015,6 +3015,13 @@ class DeepseekV4AscendAttnBackend(
             self._build_npu_compress_metadata(forward_batch)
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
+        fm = self.forward_metadata
+        # The V4.1 builders below reuse the previous step's graph-allocated
+        # buffers, matched by key and shape, instead of rebinding them; the
+        # attribute therefore has to exist before they read it, while
+        # ``init_forward_metadata`` assigns the result only afterwards.
+        if getattr(fm, "kernel_metadata", None) is None:
+            fm.kernel_metadata = {}
         if self._dsv4_has_low_ratio:
             # V4.1 metadata comes from the ds41 operators only: MQSMLA drives the
             # attention and QLI drives the indexer. The V4 entries (built from
@@ -3022,7 +3029,6 @@ class DeepseekV4AscendAttnBackend(
             return self._dsv41_attention_kernel_metadata(
                 forward_batch
             ) | self._dsv41_index_kernel_metadata(forward_batch)
-        fm = self.forward_metadata
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
