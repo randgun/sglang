@@ -70,6 +70,14 @@ def _cuda_kernels(t: torch.Tensor) -> bool:
     return t.is_cuda and (is_cuda() or is_gfx95_supported())
 
 
+def _needs_fp8_byte_view() -> bool:
+    """True on Ascend A5, whose index kernel implements no fp8 dtype: the engram
+    tables there are gathered through a uint8 view; elsewhere they index directly."""
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    return is_npu_arch35()
+
+
 def _is_prime(n: int) -> bool:
     """Deterministic Miller-Rabin; exact for n < 3.3e24 with these witnesses."""
     if n < 2:
@@ -936,8 +944,17 @@ class EngramEmbedding(nn.Module):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
-            rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-            values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
+            weight, scale = self.weight, self.scale
+            if _needs_fp8_byte_view():
+                # Same payload, gathered through a view the A5 index kernel accepts.
+                weight = weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
+                scale = scale.view(torch.uint8)[local].view(torch.float8_e8m0fnu)
+            else:
+                weight, scale = weight[local], scale[local]
+            values = (
+                weight.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
+                * scale.float().unsqueeze(-1)
+            ).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
