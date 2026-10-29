@@ -53,7 +53,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -1061,7 +1061,14 @@ def engram_gate(
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
+    magnitude = dot.abs().clamp_min(clamp_value).sqrt()
+    if is_npu():
+        # Ascend has no copysign kernel and its fallback copies through the host,
+        # which aclgraph rejects while capturing (GLOBAL mode); `where` is
+        # elementwise.  Only a negative-zero dot picks the other sign.
+        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
+    else:
+        gate = torch.sigmoid(torch.copysign(magnitude, dot))
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 
