@@ -2520,9 +2520,19 @@ class LowRatioCompressAscendBackendMixin:
         fm = ctx.fm
         n = int(ctx.bs)
         live = ctx.live_seq_lens[:n].to(torch.int64)
-        out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)[:n]
+        out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
+        if out_loc.numel() < n:
+            # DP-idle replay carries an empty out_cache_loc (the V4 branch never
+            # reads it, so only the V4.1 path sees this).  No token is written
+            # this step, so nothing compresses: keep the shapes equal to `live`
+            # and let the mask below come out all-False instead of broadcasting
+            # against an empty tensor.
+            out_loc = torch.zeros_like(live)
+            completes = torch.zeros_like(live, dtype=torch.bool)
+        else:
+            out_loc = out_loc[:n]
+            completes = (live > 0) & (out_loc >= int(self.page_size))
         positions = torch.clamp(live - 1, min=0)
-        completes = (live > 0) & (out_loc >= int(self.page_size))
         for ratio in self._dsv41_low_ratios():
             keep = completes & ((positions % ratio) == (ratio - 1))
             pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
