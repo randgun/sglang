@@ -2213,6 +2213,99 @@ class LowRatioCompressAscendBackendMixin:
             tail = torch.arange(dst.numel(), device=dst.device) >= kept
             dst.masked_fill_(tail, fill)
 
+    def _dsv41_debug_dump_cmp_rows(
+        self, prefix: str, loc: torch.Tensor, ratio: int
+    ) -> None:
+        """Read back the compressed rows this step claims to have written."""
+        pool = self.token_to_kv_pool
+        layer_id = None
+        for lid, r in enumerate(self._dsv4_compress_ratios):
+            if r == ratio:
+                layer_id = lid
+                break
+        if layer_id is None:
+            return
+        try:
+            buf = pool.get_compress_buffer(layer_id)
+        except Exception as exc:  # debug path: never break the run
+            print(f"{prefix} cmp_buf_unavailable={exc!r}", flush=True)
+            return
+        slots = loc.reshape(-1).to(torch.int64)
+        total = int(buf.shape[0]) * int(buf.shape[1])
+        rows = slots[(slots >= 0) & (slots < total)]
+        if rows.numel() == 0:
+            print(f"{prefix} cmp_rows=0 (nothing written)", flush=True)
+            return
+        flat = buf.reshape(-1, buf.shape[-1])
+        sample = flat[rows[:4]].to(torch.float32)
+        print(
+            f"{prefix} cmp_rows={int(rows.numel())} slots={rows[:4].tolist()} "
+            f"payload_abs_sum={float(sample.abs().sum()):.1f}",
+            flush=True,
+        )
+
+    def _dsv41_debug_dump_1d(
+        self,
+        tag: str,
+        positions: torch.Tensor,
+        out_loc: torch.Tensor,
+        forward_batch: ForwardBatch,
+        ratio: int,
+        *,
+        short_out_loc: bool = False,
+    ) -> None:
+        """Env-gated per-step dump of the low-ratio 1-D metadata.
+
+        ``SGLANG_DSV41_DEBUG_REPLAY=1`` prints the first five steps in each mode
+        so the eager and graph-replay values can be diffed field by field.  It
+        also counts rows where the eager ``positions`` disagree with the replay's
+        ``seq_len - 1`` derivation, and reads the compressed rows back, so one
+        run separates "wrong metadata" from "wrong write".
+        """
+        if not os.environ.get("SGLANG_DSV41_DEBUG_REPLAY"):
+            return
+        # Per-(mode, ratio) counter: with two ratios each "step" fires twice, and
+        # eager/replay run in separate processes anyway.
+        key = (tag, ratio)
+        counters = getattr(self, "_dsv41_dump_steps", None)
+        if counters is None:
+            counters = {}
+            self._dsv41_dump_steps = counters
+        counter = counters.get(key, 0)
+        if counter >= 5:
+            return
+        counters[key] = counter + 1
+        fm = self.forward_metadata
+        prefix = f"[dsv41-rp][{self._dsv41_rank_tag()}][{tag}] r{ratio}"
+        pos = positions.reshape(-1).to(torch.int64)
+        oloc = out_loc.reshape(-1).to(torch.int64)
+        live = forward_batch.seq_lens.reshape(-1).to(torch.int64)
+        if pos.numel() == live.numel():
+            derived = torch.clamp(live - 1, min=0)
+            mismatch = int((pos != derived).sum())
+        else:
+            mismatch = -1
+        n = int(pos.numel())
+        print(
+            f"{prefix} step={counter} n={n} short_out_loc={int(short_out_loc)} "
+            f"pos_ne_live-1={mismatch} live={live[:4].tolist()} "
+            f"out_loc={oloc[:4].tolist()} pos={pos[:4].tolist()}",
+            flush=True,
+        )
+        loc = getattr(fm, f"c{ratio}_loc", None)
+        pad = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
+        topk = getattr(fm, f"dsv41_cmp_topk_length_c{ratio}", None)
+        print(
+            f"{prefix} start_pos={fm.start_pos[:4].tolist()} "
+            f"seqused={fm.seqused[:4].tolist()} "
+            f"loc={None if loc is None else loc[:8].tolist()} "
+            f"pad={None if pad is None else pad[:8].tolist()} "
+            f"cmp_topk={None if topk is None else topk[:4].tolist()}",
+            flush=True,
+        )
+        if loc is not None:
+            self._dsv41_debug_dump_cmp_rows(prefix, loc, ratio)
+
     def _build_low_ratio_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         """Eager half of the V4.1 metadata contract (V4 ``_compute_compress_locs``
         counterpart).  aclgraph allocates these buffers at capture
@@ -2270,6 +2363,7 @@ class LowRatioCompressAscendBackendMixin:
             )
         setattr(fm, f"positions_cmp_padding_c{ratio}", pos_row)
         setattr(fm, f"c{ratio}_loc", slot_row)
+        self._dsv41_debug_dump_1d("eager", positions, out_loc, forward_batch, ratio)
         # Compressed pages carry the full pool's page ids (compressed page j is
         # full page j), so the full page table doubles as the compressed page
         # table read with page_size // ratio.
@@ -2520,8 +2614,10 @@ class LowRatioCompressAscendBackendMixin:
         fm = ctx.fm
         n = int(ctx.bs)
         live = ctx.live_seq_lens[:n].to(torch.int64)
-        out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
-        if out_loc.numel() < n:
+        raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
+        short_out_loc = raw_out_loc.numel() < n
+        out_loc = raw_out_loc
+        if short_out_loc:
             # DP-idle replay carries an empty out_cache_loc (the V4 branch never
             # reads it, so only the V4.1 path sees this).  No token is written
             # this step, so nothing compresses: keep the shapes equal to `live`
@@ -2529,6 +2625,15 @@ class LowRatioCompressAscendBackendMixin:
             # against an empty tensor.
             out_loc = torch.zeros_like(live)
             completes = torch.zeros_like(live, dtype=torch.bool)
+            if os.environ.get("SGLANG_DSV41_DEBUG_REPLAY") and bool((live > 0).any()):
+                # Live rows with no slot vector would silently skip compression:
+                # legal only for the all-idle batch, so shout otherwise.
+                print(
+                    f"[dsv41-rp][{self._dsv41_rank_tag()}] WARN short out_cache_loc "
+                    f"({raw_out_loc.numel()} < {n}) with live rows "
+                    f"live={live[:4].tolist()}",
+                    flush=True,
+                )
         else:
             out_loc = out_loc[:n]
             completes = (live > 0) & (out_loc >= int(self.page_size))
@@ -2547,18 +2652,26 @@ class LowRatioCompressAscendBackendMixin:
                         torch.full_like(out_loc, self._DSV41_SLOT_SKIP),
                     ).to(slot_dst.dtype)
                 )
-                continue
-            self._dsv41_compact_1d(
-                pos_dst,
-                (positions // ratio) * ratio,
-                keep,
-                fill=0,
-            )
-            self._dsv41_compact_1d(
-                slot_dst,
-                out_loc // ratio,
-                keep,
-                fill=self._DSV41_SLOT_SKIP,
+            else:
+                self._dsv41_compact_1d(
+                    pos_dst,
+                    (positions // ratio) * ratio,
+                    keep,
+                    fill=0,
+                )
+                self._dsv41_compact_1d(
+                    slot_dst,
+                    out_loc // ratio,
+                    keep,
+                    fill=self._DSV41_SLOT_SKIP,
+                )
+            self._dsv41_debug_dump_1d(
+                "replay",
+                positions,
+                out_loc,
+                ctx.forward_batch,
+                ratio,
+                short_out_loc=short_out_loc,
             )
 
         # The indexer-K block table is the FULL page table expanded to the index
