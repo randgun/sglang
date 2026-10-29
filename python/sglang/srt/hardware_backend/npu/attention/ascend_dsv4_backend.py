@@ -2409,6 +2409,79 @@ class LowRatioCompressAscendBackendMixin:
                 self.graph_metadata[key] = buf
             metadata.kernel_metadata[f"c{ratio}a_qli_metadata"] = buf
 
+        # The candidate table and the QSLI table are separate metadata instances
+        # (see _dsv41_index_kernel_metadata): a capture that only seeds the plain
+        # per-ratio tables makes the candidate source layer fail on its first
+        # forward, because the in-graph builder never runs.  Probe and cache both
+        # here as well; replay refreshes them in place by the same key match.
+        candidate_ratio = self._dsv41_candidate_ratio()
+        if candidate_ratio is None:
+            return
+        block = int(self._dsv41_candidate_block_size)
+        if block <= 0 or self._dsv41_candidate_topk_blocks <= 0:
+            raise RuntimeError(
+                "DeepSeek-V4.1 has a candidate source layer but no "
+                f"candidate_topk_blocks/candidate_block_size "
+                f"({self._dsv41_candidate_topk_blocks}/{block})."
+            )
+        local_cmp_lens = torch.zeros(bs, dtype=torch.int32, device=device)
+        probe = ds41.quant_lightning_indexer_metadata(
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_q=None,
+            seqused_k=local_cmp_lens,
+            cmp_residual_k=(
+                None
+                if candidate_ratio == 1
+                else torch.zeros(bs, dtype=torch.int32, device=device)
+            ),
+            batch_size=bs,
+            num_heads_q=int(self._dsv4_index_n_heads),
+            num_heads_k=1,
+            head_dim=int(self._dsv4_index_head_dim),
+            topk=int(self._dsv4_index_topk),
+            mask_mode=3,
+            cmp_ratio=candidate_ratio,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            candidate_topk_blocks=int(self._dsv41_candidate_topk_blocks),
+            candidate_block_size=block,
+        )
+        key = f"kernel_metadata_c{candidate_ratio}a_qli_candidate"
+        buf = self.graph_metadata.get(key)
+        if buf is None or buf.shape != probe.shape:
+            buf = torch.zeros_like(probe)
+            self.graph_metadata[key] = buf
+        metadata.kernel_metadata[f"c{candidate_ratio}a_qli_candidate_metadata"] = buf
+
+        if self._dsv41_has_candidate_consumers():
+            # Only the record count matters for the capture probe; replay rewrites
+            # it from positions.  1 block per row is inside the documented range.
+            visible_blocks = torch.ones((bs, 1), dtype=torch.int32, device=device)
+            probe = ds41.quant_sparse_lightning_indexer_metadata(
+                visible_blocks,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_q=None,
+                seqused_k=local_cmp_lens,
+                cmp_residual_k=None,
+                batch_size=bs,
+                num_heads_q=int(self._dsv4_index_n_heads),
+                num_heads_k=1,
+                head_dim=int(self._dsv4_index_head_dim),
+                topk=int(self._dsv4_index_topk),
+                quant_mode=1,
+                candidate_block_size=block,
+                mask_mode=3,
+                cmp_ratio=candidate_ratio,
+                layout_q="TND",
+                layout_k="PA_BBND",
+            )
+            key = f"kernel_metadata_c{candidate_ratio}a_qsli"
+            buf = self.graph_metadata.get(key)
+            if buf is None or buf.shape != probe.shape:
+                buf = torch.zeros_like(probe)
+                self.graph_metadata[key] = buf
+            metadata.kernel_metadata[f"c{candidate_ratio}a_qsli_metadata"] = buf
+
     def _dsv41_graph_index_page_table(self, metadata, ratio: int):
         """Captured buffer for one ratio's indexer-K block table.
 

@@ -138,6 +138,7 @@ def dsv41_row_layout(head_dim: int, *, compressed: bool):
         math.ceil((data_bytes + scale_bytes) / _DSV41_ROW_ALIGNMENT)
         * _DSV41_ROW_ALIGNMENT
     )
+    # Compack two fp4_e2m1 as uint8
     dtype = torch.uint8 if compressed else torch.float8_e4m3fn
     return row_bytes, dtype
 
