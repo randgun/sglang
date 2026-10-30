@@ -107,6 +107,11 @@ def _low_ratio_backend(*, ratios=(1, 2), window=128):
     backend._dsv4_index_n_heads = 32
     backend._dsv4_index_head_dim = 128
     backend.page_size = 128
+    # No candidate source by default: ``_init_dsv41_graph_metadata`` reads the
+    # candidate layer id right after seeding the plain per-ratio tables, so the
+    # stub needs the attribute even though these tests never run the QSLI path
+    # (-1 makes ``_dsv41_candidate_ratio`` return None and the seeding skip).
+    backend._dsv41_candidate_source_layer = -1
     backend.forward_metadata = SimpleNamespace()
     backend.graph_metadata = {}
     # The real pool (DSV4NPUTokenToKVPool) exposes qk_nope_head_dim /
@@ -1466,6 +1471,32 @@ class TestEagerGraphMetadataParity(unittest.TestCase):
         self.assertEqual(
             graph.c1_loc[:1].tolist(), eager_backend.forward_metadata.c1_loc.tolist()
         )
+
+    def test_padded_live_replay_keeps_real_slots(self):
+        # A padded replay (raw_bs < bucket bs) hands the backend the RAW,
+        # unpadded out_cache_loc (``build_replay_fb_view`` passes the original
+        # batch's).  The live rows still wrote tokens this step, so their
+        # compression rows must refresh; only the padding row skips.  The
+        # pre-fix guard treated any short vector as DP-idle and silently
+        # dropped the whole step's compression / index-K writes.
+        batch = _batch(
+            positions=[3, 4], out_cache_loc=[205, 208], seq_lens=[4, 5], batch_size=2
+        )
+        graph = self._graph_side(_low_ratio_backend(), batch, live=[4, 5, 0])
+        self.assertEqual(graph.c1_loc.tolist(), [205, 208, -1])
+        self.assertEqual(graph.positions_cmp_padding_c1.tolist(), [3, 4, 0])
+        self.assertEqual(graph.c2_loc.tolist(), [102, -1, -1])
+        self.assertEqual(graph.positions_cmp_padding_c2.tolist(), [2, 0, 0])
+        # The eager prefix (the two live rows alone) matches the graph rows.
+        eager_backend = _low_ratio_backend()
+        eager_backend.forward_metadata = SimpleNamespace(
+            block_tables=torch.zeros((2, 1), dtype=torch.int32)
+        )
+        for ratio in (1, 2):
+            eager_backend._build_dsv41_ratio_metadata(batch, ratio)
+        eager = eager_backend.forward_metadata
+        self.assertEqual(graph.c1_loc[:2].tolist(), eager.c1_loc.tolist())
+        self.assertEqual(graph.c2_loc[:2].tolist(), eager.c2_loc.tolist())
 
 
 class TestVerifyGraphGuard(unittest.TestCase):

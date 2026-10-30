@@ -2615,28 +2615,21 @@ class LowRatioCompressAscendBackendMixin:
         n = int(ctx.bs)
         live = ctx.live_seq_lens[:n].to(torch.int64)
         raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
+        # The replay view's out_cache_loc is deliberately UNPADDED (raw_bs
+        # entries; ``build_replay_fb_view`` passes the raw batch's), while
+        # live/n span the padded bucket.  Only a truly empty vector is the
+        # DP-idle case: a short-but-nonempty one is a padded live replay whose
+        # first raw_bs entries are real slots, so scatter them into a padded
+        # vector and let the mask below skip only the tail rows (out_loc 0 <
+        # page_size).  Broadcasting the raw vector against `live` (the pre-fix
+        # behavior) treats every padded replay as idle and silently drops the
+        # whole step's compression / index-K writes.
         short_out_loc = raw_out_loc.numel() < n
-        out_loc = raw_out_loc
-        if short_out_loc:
-            # DP-idle replay carries an empty out_cache_loc (the V4 branch never
-            # reads it, so only the V4.1 path sees this).  No token is written
-            # this step, so nothing compresses: keep the shapes equal to `live`
-            # and let the mask below come out all-False instead of broadcasting
-            # against an empty tensor.
-            out_loc = torch.zeros_like(live)
-            completes = torch.zeros_like(live, dtype=torch.bool)
-            if os.environ.get("SGLANG_DSV41_DEBUG_REPLAY") and bool((live > 0).any()):
-                # Live rows with no slot vector would silently skip compression:
-                # legal only for the all-idle batch, so shout otherwise.
-                print(
-                    f"[dsv41-rp][{self._dsv41_rank_tag()}] WARN short out_cache_loc "
-                    f"({raw_out_loc.numel()} < {n}) with live rows "
-                    f"live={live[:4].tolist()}",
-                    flush=True,
-                )
-        else:
-            out_loc = out_loc[:n]
-            completes = (live > 0) & (out_loc >= int(self.page_size))
+        out_loc = torch.zeros_like(live)
+        if raw_out_loc.numel() > 0:
+            m = min(int(raw_out_loc.numel()), n)
+            out_loc[:m] = raw_out_loc[:m]
+        completes = (live > 0) & (out_loc >= int(self.page_size))
         positions = torch.clamp(live - 1, min=0)
         for ratio in self._dsv41_low_ratios():
             keep = completes & ((positions % ratio) == (ratio - 1))
