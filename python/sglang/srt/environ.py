@@ -1983,17 +1983,26 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     # Deprecated for --engram-config "placement". The deprecated engram variables
-    # are read only by _resolve_engram_config.
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # are read only by _resolve_engram_config. On NPU arch35 the request takes
+    # the acc_offload backend instead of the UVA host table; the dsv41-dev
+    # spelling SGLANG_OPT_ENGRAM_HOST_OFFLOAD is kept as a deprecated alias.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_ENGRAM_HOST_OFFLOAD"
+    )
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
-    # Deprecated for --engram-config "replication".
+    # Deprecated for --engram-config "replication". NPU ignores this: the
+    # acc_offload pool is always node-shared.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
+    # Explicit config store address for the NPU SHARED acc_offload pool
+    # (OffloadConfig.store_url); empty lets memfabric derive one. Every rank of
+    # a node must agree — set it when PD's ASCEND_MF_STORE_URL shares the node.
+    SGLANG_ENGRAM_OFFLOAD_STORE_URL = EnvStr("")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

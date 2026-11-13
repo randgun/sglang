@@ -16,7 +16,7 @@ import mmap
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Protocol
 
 import msgspec
 import numpy as np
@@ -119,6 +119,23 @@ def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
     exps = raw.to(torch.int32)
     # E == 0 is 2**-127, a subnormal, not what zero exponent bits bitcast to.
     return (exps << 23).view(torch.float32).masked_fill(exps == 0, 2.0**-127)
+
+
+def _npu_offload_supported() -> bool:
+    """Whether this NPU takes the acc_offload engram backend.
+
+    NPU arch35 (A5) has the host pool; pre-arch35 has none, so a cpu
+    placement degrades to device-resident tables with a warning instead of
+    failing at weight-load time.
+    """
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    if is_npu_arch35():
+        return True
+    logger.warning(
+        "engram host offload needs arch35 (A5); keeping device-resident tables"
+    )
+    return False
 
 
 def _is_prime(n: int) -> bool:
@@ -1104,6 +1121,30 @@ def _engram_table_is_mxfp4(config) -> bool:
     return quant == "mxfp4"
 
 
+class EngramTableBackend(Protocol):
+    """Contract for full-replica engram table residency (the GPU UVA host
+    table's `shared` mode, the NPU acc_offload pool): one table copy serves
+    every rank, so lookup gathers whole rows locally with no collective and
+    DP attention's differing per-rank token counts never meet an all-reduce.
+
+    Sharded residencies (device params, per-rank host tables) stay inline in
+    EngramEmbedding: they need the owned-row mask and the lookup all-reduce,
+    which is not this contract.
+    """
+
+    full_replica: bool
+
+    def install_params(self, embed: EngramEmbedding) -> None:
+        """Create the parameter surface on `embed`: meta weight with a staging
+        weight_loader, device-resident scale, before checkpoint loading."""
+
+    def finish_load(self, label: str) -> None:
+        """Post-load finalization: flush staged rows, freeze forward buffers."""
+
+    def gather(self, indices: torch.Tensor) -> torch.Tensor:
+        """indices [..., n_hash_cols] -> bf16 [..., n_hash_cols, head_dim]."""
+
+
 class EngramEmbedding(nn.Module):
     """One layer's hash table with e8m0 block scales, dequantized on lookup: fp8
     e4m3 rows, or with `mxfp4` E2M1 pairs [rows, dim // 2] as the checkpoint
@@ -1112,8 +1153,10 @@ class EngramEmbedding(nn.Module):
     Rows are sharded over the TP group in device memory, aligned to the hash
     columns where they divide evenly (`shard_range`); --engram-config can read
     the peers' shards in place or keep the rows in host memory instead, as one
-    shard per rank or one copy per node (see _HostTable). Loading is sharded
-    in every layout: a rank writes only its own row range.
+    shard per rank or one copy per node on CUDA/HIP (see _HostTable), or
+    behind the node-shared acc_offload pool (EngramTableBackend) on NPU
+    arch35. Loading is sharded in every layout: a rank writes only its own row
+    range.
     """
 
     def __init__(
@@ -1124,22 +1167,29 @@ class EngramEmbedding(nn.Module):
         column_bounds: tuple[int, ...],
         *,
         mxfp4: bool = False,
+        layout: Optional[EngramLayout] = None,
     ):
         super().__init__()
         self.dim = dim
         self.mxfp4 = mxfp4
         self.row_bytes = _table_row_bytes(dim, mxfp4)
         self.tp_size = get_parallel().tp_size
+        self.host_table: Optional[_HostTable] = None
+        self._offload_backend: Optional[EngramTableBackend] = None
+        config = resolve_engram_config(len(column_bounds) - 1)
+        if config.placement == EngramPlacement.CPU and is_npu():
+            if _npu_offload_supported():
+                self._init_offload_backend(config, layout, dim, layer_id)
+                return
+            # pre-arch35: no host pool; fall through to device-resident tables
         tp_rank = get_parallel().tp_rank
         self.row_start, row_end = shard_range(
             num_embeddings, column_bounds, tp_rank, self.tp_size
         )
         self.rows = row_end - self.row_start
-        self.host_table: Optional[_HostTable] = None
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
-        config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
         if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
@@ -1164,6 +1214,32 @@ class EngramEmbedding(nn.Module):
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
+
+    def _init_offload_backend(
+        self,
+        config: EngramConfig,
+        layout: Optional[EngramLayout],
+        dim: int,
+        layer_id: int,
+    ) -> None:
+        """NPU arch35: rows live in the node's acc_offload GVA pool; the
+        backend owns the parameter surface (meta weight + staging loader) and
+        the graph-safe lookup."""
+        assert layout is not None, (
+            "the NPU engram host offload needs the layer's EngramLayout; "
+            "Engram must pass layout= to EngramEmbedding"
+        )
+        if config.replication != EngramReplication.PER_NODE:
+            logger.warning(
+                "--engram-config replication 'none' has no per-rank form on "
+                "NPU; the acc_offload pool is always node-shared"
+            )
+        from sglang.srt.hardware_backend.npu.modules.engram_offload import (
+            NpuEngramOffloadBackend,
+        )
+
+        self._offload_backend = NpuEngramOffloadBackend(layout, dim, layer_id)
+        self._offload_backend.install_params(self)
 
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
@@ -1226,6 +1302,9 @@ class EngramEmbedding(nn.Module):
     def finish_load(self, label: str):
         """Collective in the shared layout and with peer shards: every rank calls
         it after loading."""
+        if self._offload_backend is not None:
+            self._offload_backend.finish_load(label)
+            return
         if self.peer is not None:
             self.peer.connect(self.row_start, label)
         if self.host_table is not None:
@@ -1238,6 +1317,10 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        if self._offload_backend is not None:
+            # Full-replica host offload: the lookup carries no collective, so
+            # the CP/DP sharding below never applies.
+            return self._offload_backend.gather(indices)
         if self.peer is not None:
             assert self.peer.ready, "engram peer shards are mapped in finish_load"
             # Every shard is mapped here: read this rank's own tokens only, which
@@ -1569,6 +1652,7 @@ class Engram(nn.Module):
             layer_id,
             column_bounds=layout.column_bounds(self.layer_hash_index),
             mxfp4=_engram_table_is_mxfp4(config),
+            layout=layout,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
